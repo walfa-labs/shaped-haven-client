@@ -115,6 +115,7 @@ private:
     std::optional<LevelUpOffer> pending_offer_;
     GameOverStats game_over_{};
     uint32_t run_time_ms_ = 0;
+    std::array<uint8_t, 4> last_evolved_{};
 
     /// Remote player ids drawn on the previous frame, so a player who left
     /// has its SceneNode destroyed.

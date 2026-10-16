@@ -13,9 +13,12 @@
 
 #include <array>
 #include <cstdint>
+#include <optional>
 #include <string>
 
 namespace haven {
+
+class MeshFactory;
 
 /// The 2D overlay: XP bar, item tray, level-up modal, evolution banner and the
 /// game-over scoreboard. Everything is drawn from the same immediate-mode
@@ -28,7 +31,7 @@ namespace haven {
 /// so screen space and world space coincide.
 class Hud {
 public:
-    Hud(Ogre::SceneManager* scene_manager, class MeshFactory* meshes);
+    Hud(Ogre::SceneManager* scene_manager, MeshFactory* meshes, Ogre::SceneNode* camera_node);
     ~Hud();
 
     Hud(const Hud&) = delete;
@@ -42,6 +45,11 @@ public:
     /// evolution visible when it happens: a weapon slot whose `evolved` byte
     /// just became 1 raises the banner.
     void set_loadout(const Loadout& loadout);
+
+    /// A copy of the newest S2C_LOADOUT. The wire struct arrives by const
+    /// reference to a caller-owned local, so the HUD keeps its own copy
+    /// rather than a pointer that dangles the moment the handler returns.
+    std::optional<Loadout> loadout_;
 
     // Level-up modal.
     void show_offer(const LevelUpOffer& offer);
@@ -60,6 +68,11 @@ public:
     /// C2S_RESTART goes out, so the next snapshot starts from a clean HUD.
     void reset();
 
+    /// Destroys every HUD scene object while Ogre is still alive. Must be
+    /// called before renderer.closeApp(); the destructor has nothing left to
+    /// do afterwards.
+    void shutdown();
+
     /// Advances the banner countdown; call once per rendered frame.
     void tick(float dt_seconds);
 
@@ -73,9 +86,12 @@ private:
     };
 
     /// One Manual Object of text quads, one section per line, sized to the
-    /// exact lit-pixel count and rebuilt only when a line changes.
+    /// exact lit-pixel count and rebuilt only when a line changes. `name` keeps
+    /// the per-layer objects distinct: Ogre resources are keyed by name.
     struct TextLayer {
         Ogre::ManualObject* object = nullptr;
+        Ogre::SceneNode* node = nullptr;
+        std::string name;
         std::vector<TextLine> lines;
     };
 
@@ -84,6 +100,8 @@ private:
     /// wholesale whenever it changes, sectioned per colour like the batches.
     struct QuadBatch {
         Ogre::ManualObject* object = nullptr;
+        Ogre::SceneNode* node = nullptr;
+        std::string name;
         struct Section {
             Rgba colour;
             uint32_t verts = 0;
@@ -119,6 +137,12 @@ private:
 
     Ogre::SceneManager* scene_ = nullptr;
     MeshFactory* meshes_ = nullptr;
+    Ogre::SceneNode* camera_node_ = nullptr;
+
+    /// Child of the camera node that cancels its z (kCameraZ), so every HUD
+    /// element parented under it lands at the z the combat layers use while
+    /// still following the camera's x/y.
+    Ogre::SceneNode* attach_node_ = nullptr;
 
     Ogre::Entity* xp_bg_ = nullptr;
     Ogre::Entity* xp_fill_ = nullptr;
@@ -138,14 +162,17 @@ private:
     TextLayer* banner_tag_ = nullptr;
     TextLayer* banner_name_ = nullptr;
 
-    const Loadout* loadout_ = nullptr;
-    std::array<uint8_t, 4> last_evolved_{};
     uint32_t last_run_second_ = 0xFFFFFFFFu;
     bool banner_visible_ = false;
     float banner_timer_ = 0.0f;
     bool offer_visible_ = false;
     bool game_over_visible_ = false;
     bool initialised_ = false;
+
+    struct ColourLess {
+        bool operator()(const std::array<float, 4>& a, const std::array<float, 4>& b) const { return a < b; }
+    };
+    std::map<std::array<float, 4>, Ogre::MaterialPtr, ColourLess> material_cache_;
 
     static constexpr float kBannerSeconds = 2.5f;
 };

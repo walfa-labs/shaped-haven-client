@@ -188,6 +188,7 @@ void GameSession::handle_levelup_offer(const uint8_t* payload, size_t len)
     // modal goes up now and input freezes until the run resumes.
     pending_offer_ = offer;
     run_state_ = RunState::LevelUp;
+    hud_.show_offer(offer);
     std::printf("haven: level-up offer event=%u level=%u options=[%u %u %u] [%u %u %u] [%u %u %u]\n",
                 static_cast<unsigned>(offer.event_id), static_cast<unsigned>(offer.new_level),
                 static_cast<unsigned>(offer.options[0].item_id), static_cast<unsigned>(offer.options[0].next_level),
@@ -226,6 +227,20 @@ void GameSession::handle_loadout(const uint8_t* payload, size_t len)
     stats_.level = loadout.level;
     stats_.xp = loadout.xp;
     stats_.xp_next = loadout.xp_next;
+
+    // An evolution is visible when it happens: a weapon slot whose `evolved`
+    // byte just became 1 raises the banner.
+    for (size_t i = 0; i < 4 && i < loadout.weapon_count; ++i)
+    {
+        const bool evolved = loadout.weapons[i].evolved != 0;
+        if (evolved && !last_evolved_[i])
+        {
+            hud_.show_evolution(loadout.weapons[i].item_id);
+            ++stats_.evolutions_seen;
+        }
+        last_evolved_[i] = evolved ? 1 : 0;
+    }
+
     hud_.set_loadout(loadout);
 }
 

@@ -1,0 +1,5 @@
+# Pick card 0 at each level-up; restart at the game over.
+0
+0
+0
+restart

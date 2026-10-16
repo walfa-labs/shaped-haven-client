@@ -56,6 +56,7 @@ public:
 
     Ogre::RenderWindow* render_window() const { return mWindows.empty() ? nullptr : mWindows[0].render; }
     Ogre::SceneManager* scene_manager() const { return scene_manager_; }
+    Ogre::SceneNode* camera_node() const { return camera_node_; }
     MeshFactory* mesh_factory() const { return meshes_.get(); }
 
     /// Local player square, driven by the prediction state.

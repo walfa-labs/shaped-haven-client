@@ -130,7 +130,7 @@ int main(int argc, char** argv)
     }
 
     haven::NetClient net;
-    haven::Hud hud(renderer.scene_manager(), renderer.mesh_factory());
+    haven::Hud hud(renderer.scene_manager(), renderer.mesh_factory(), renderer.camera_node());
     haven::GameSession session(renderer, net, input, hud);
     if (!session.connect(host, port, name))
     {
@@ -176,6 +176,7 @@ int main(int argc, char** argv)
     });
 
     session.shutdown();
+    hud.shutdown();
     renderer.closeApp();
 
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

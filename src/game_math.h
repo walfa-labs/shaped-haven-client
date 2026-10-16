@@ -19,6 +19,11 @@ constexpr float kSnapshotSeconds = 1.0f / kSnapshotHz;
 constexpr float kPlayerMoveSpeed = 12.0f;
 constexpr float kArenaHalfSize = 1000.0f;
 
+/// The orthographic camera's distance above the XY plane. HUD elements are
+/// parented to the camera's node so they follow it, and this constant lets
+/// them cancel the camera's own z and sit at the z the combat layers use.
+constexpr float kCameraZ = 10.0f;
+
 /// Remote entities are rendered this far behind the newest snapshot, i.e. two
 /// 20 Hz snapshot intervals (DESIGN.md section 2).
 constexpr float kInterpolationDelaySeconds = 0.1f;

@@ -15,6 +15,7 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
+#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -119,9 +120,13 @@ std::vector<std::string> split_name(const std::string& name, size_t max_chars)
 // Construction and the persistent full-screen quads.
 // ---------------------------------------------------------------------------
 
-Hud::Hud(Ogre::SceneManager* scene_manager, MeshFactory* meshes)
-    : scene_(scene_manager), meshes_(meshes)
+Hud::Hud(Ogre::SceneManager* scene_manager, MeshFactory* meshes, Ogre::SceneNode* camera_node)
+    : scene_(scene_manager), meshes_(meshes), camera_node_(camera_node)
 {
+    tray_.name = "haven/hud_tray";
+    modal_.name = "haven/hud_modal";
+    attach_node_ = camera_node_->createChildSceneNode();
+    attach_node_->setPosition(0.0f, 0.0f, -kCameraZ);
     build_persistent_elements();
 }
 
@@ -145,13 +150,12 @@ Ogre::MaterialPtr Hud::material_for(Rgba colour)
     struct ColourLess {
         bool operator()(const std::array<float, 4>& a, const std::array<float, 4>& b) const { return a < b; }
     };
-    static std::map<std::array<float, 4>, Ogre::MaterialPtr, ColourLess> cache;
     const std::array<float, 4> key{colour.r, colour.g, colour.b, colour.a};
-    const auto it = cache.find(key);
-    if (it != cache.end()) return it->second;
+    const auto it = material_cache_.find(key);
+    if (it != material_cache_.end()) return it->second;
 
     char name[32];
-    std::snprintf(name, sizeof(name), "haven/hud_colour_%zu", cache.size());
+    std::snprintf(name, sizeof(name), "haven/hud_colour_%zu", material_cache_.size());
     Ogre::MaterialPtr material = Ogre::MaterialManager::getSingleton().create(name, kResourceGroup);
     Ogre::Pass* pass = material->getTechnique(0)->getPass(0);
     pass->setAmbient(Ogre::ColourValue(colour.r, colour.g, colour.b, colour.a));
@@ -160,7 +164,7 @@ Ogre::MaterialPtr Hud::material_for(Rgba colour)
     if (colour.a < 0.999f) pass->setSceneBlending(Ogre::SBT_TRANSPARENT_ALPHA);
     material->load();
 
-    cache.emplace(key, material);
+    material_cache_.emplace(key, material);
     return material;
 }
 
@@ -169,7 +173,9 @@ void Hud::build_persistent_elements()
     auto make_quad = [this](const char* name, Rgba colour, float z) {
         Ogre::Entity* entity = scene_->createEntity(name, kQuadMesh, kResourceGroup);
         entity->setMaterialName(material_for(colour)->getName(), kResourceGroup);
-        Ogre::SceneNode* node = scene_->getRootSceneNode()->createChildSceneNode();
+        // The HUD lives in camera-local space: the camera node translates
+        // with the player, so a quad at local (0, 0, z) is always centred.
+        Ogre::SceneNode* node = attach_node_->createChildSceneNode();
         node->attachObject(entity);
         node->setPosition(0.0f, 0.0f, z);
         entity->setVisible(false);
@@ -180,6 +186,12 @@ void Hud::build_persistent_elements()
     xp_fill_ = make_quad("haven/xp_bar_fill", Rgba{0.35f, 0.85f, 0.55f, 0.95f}, 0.07f);
     dim_ = make_quad("haven/hud_dim", Rgba{0.01f, 0.01f, 0.02f, 0.72f}, 0.48f);
     panel_ = make_quad("haven/hud_panel", Rgba{0.06f, 0.07f, 0.11f, 0.90f}, 0.485f);
+
+    // The quad mesh is 1x1 unit; the persistent elements are sized once here.
+    xp_bg_->getParentNode()->setScale(kXpBarWidth, kXpBarHeight, 1.0f);
+    xp_bg_->getParentNode()->setPosition(kXpBarX + kXpBarWidth * 0.5f, kXpBarY, 0.06f);
+    dim_->getParentNode()->setScale(82.0f, 47.0f, 1.0f);
+    panel_->getParentNode()->setScale(48.0f, 24.0f, 1.0f);
 
     xp_bg_->setVisible(true);
     initialised_ = true;
@@ -193,10 +205,12 @@ void Hud::set_run_time(uint32_t run_time_ms)
 {
     if (!initialised_) return;
 
-    if (loadout_ != nullptr && loadout_->xp_next > 0)
+    const Loadout& loadout = *loadout_;
+
+    if (loadout_.has_value() && loadout.xp_next > 0)
     {
-        const float fraction = std::max(0.0f, std::min(1.0f, static_cast<float>(loadout_->xp) /
-                                                                  static_cast<float>(loadout_->xp_next)));
+        const float fraction = std::max(0.0f, std::min(1.0f, static_cast<float>(loadout.xp) /
+                                                                  static_cast<float>(loadout.xp_next)));
         const float width = kXpBarWidth * fraction;
         if (width > 0.01f)
         {
@@ -204,6 +218,10 @@ void Hud::set_run_time(uint32_t run_time_ms)
             Ogre::Node* node = xp_fill_->getParentNode();
             node->setScale(width, kXpBarHeight, 1.0f);
             node->setPosition(kXpBarX + width * 0.5f, kXpBarY, 0.07f);
+            if (getenv("HUD_DEBUG"))
+                std::printf("haven: xp_fill visible=%d scale=%.1f pos=(%.1f,%.1f) mat=%s\n",
+                            xp_fill_->getVisible(), width, kXpBarX + width * 0.5f, kXpBarY,
+                            material_for(Rgba{0.35f, 0.85f, 0.55f, 0.95f})->getName().c_str());
         }
         else
         {
@@ -230,17 +248,7 @@ void Hud::set_run_time(uint32_t run_time_ms)
 void Hud::set_loadout(const Loadout& loadout)
 {
     if (!initialised_) return;
-
-    // An evolution is visible when it happens: a weapon slot whose `evolved`
-    // byte just became 1 raises the banner.
-    for (size_t i = 0; i < 4 && i < loadout.weapon_count; ++i)
-    {
-        const bool evolved = loadout.weapons[i].evolved != 0;
-        if (evolved && !last_evolved_[i]) show_evolution(loadout.weapons[i].item_id);
-        last_evolved_[i] = evolved ? 1 : 0;
-    }
-
-    loadout_ = &loadout;
+    loadout_ = loadout;
     layout_tray(loadout);
     rebuild_hud_lines();
 }
@@ -304,8 +312,7 @@ void Hud::hide_game_over()
 void Hud::reset()
 {
     if (!initialised_) return;
-    loadout_ = nullptr;
-    last_evolved_ = {};
+    loadout_.reset();
     hide_offer();
     hide_game_over();
     xp_fill_->setVisible(false);
@@ -315,6 +322,22 @@ void Hud::reset()
     last_run_second_ = 0xFFFFFFFFu;
     banner_visible_ = false;
     banner_timer_ = 0.0f;
+}
+
+void Hud::shutdown()
+{
+    if (!initialised_) return;
+    loadout_.reset();
+    hide_offer();
+    hide_game_over();
+    clear_batch(tray_);
+    destroy_layer(tray_text_);
+    destroy_layer(hud_lines_);
+    destroy_layer(banner_tag_);
+    destroy_layer(banner_name_);
+    banner_visible_ = false;
+    material_cache_.clear();
+    initialised_ = false;
 }
 
 void Hud::tick(float dt_seconds)
@@ -335,7 +358,11 @@ void Hud::tick(float dt_seconds)
 
 Hud::TextLayer* Hud::ensure_layer(TextLayer*& ptr)
 {
-    if (ptr == nullptr) ptr = new TextLayer();
+    if (ptr == nullptr)
+    {
+        ptr = new TextLayer();
+        ptr->name = "haven/hud_text_" + std::to_string(reinterpret_cast<uintptr_t>(ptr));
+    }
     return ptr;
 }
 
@@ -348,8 +375,20 @@ void Hud::rebuild_layer(TextLayer& layer)
     }
     if (layer.lines.empty()) return;
 
-    Ogre::ManualObject* object = scene_->createManualObject("haven/hud_text");
+    if (layer.node == nullptr)
+    {
+        layer.node = attach_node_->createChildSceneNode();
+        layer.node->setPosition(0.0f, 0.0f, 0.0f);
+    }
+    if (layer.object != nullptr)
+    {
+        scene_->destroyManualObject(layer.object);
+        layer.object = nullptr;
+    }
+
+    Ogre::ManualObject* object = scene_->createManualObject(layer.name);
     object->setDynamic(true);
+    layer.node->attachObject(object);
     ManualPrimitiveSink sink(*object);
 
     for (const TextLine& line : layer.lines)
@@ -383,6 +422,11 @@ void Hud::destroy_layer(TextLayer*& ptr)
 {
     if (ptr == nullptr) return;
     clear_layer(*ptr);
+    if (ptr->node != nullptr)
+    {
+        scene_->destroySceneNode(ptr->node);
+        ptr->node = nullptr;
+    }
     delete ptr;
     ptr = nullptr;
 }
@@ -429,8 +473,20 @@ void Hud::rebuild_batch(QuadBatch& batch)
     }
     if (batch.sections.empty()) return;
 
-    Ogre::ManualObject* object = scene_->createManualObject("haven/hud_quads");
+    if (batch.node == nullptr)
+    {
+        batch.node = attach_node_->createChildSceneNode();
+        batch.node->setPosition(0.0f, 0.0f, 0.0f);
+    }
+    if (batch.object != nullptr)
+    {
+        scene_->destroyManualObject(batch.object);
+        batch.object = nullptr;
+    }
+
+    Ogre::ManualObject* object = scene_->createManualObject(batch.name);
     object->setDynamic(true);
+    batch.node->attachObject(object);
 
     for (const QuadBatch::Section& section : batch.sections)
     {
@@ -459,6 +515,14 @@ void Hud::rebuild_batch(QuadBatch& batch)
     object->setBoundingBox(Ogre::AxisAlignedBox(-kViewportHalfWidth, -kViewportHalfHeight, 0.4f,
                                                 kViewportHalfWidth, kViewportHalfHeight, 0.6f));
     batch.object = object;
+
+    if (getenv("HUD_DEBUG"))
+    {
+        uint32_t quads = 0;
+        for (const QuadBatch::Section& s : batch.sections) quads += s.verts / 4;
+        std::printf("haven: hud batch %s: %zu sections, %u quads\n", batch.name.c_str(),
+                    batch.sections.size(), quads);
+    }
 }
 
 void Hud::clear_batch(QuadBatch& batch)
@@ -588,8 +652,10 @@ void Hud::rebuild_hud_lines()
     TextLayer* layer = ensure_layer(hud_lines_);
     layer->lines.clear();
 
+    const Loadout& loadout = loadout_.has_value() ? *loadout_ : Loadout{};
+
     TextLine level;
-    level.text = loadout_ != nullptr ? "LV " + std::to_string(loadout_->level) : "LV 1";
+    level.text = loadout_.has_value() ? "LV " + std::to_string(loadout.level) : "LV 1";
     level.pixel = 0.19f;
     level.x = kXpBarX + 1.0f;
     level.y = kXpBarY;
@@ -597,7 +663,7 @@ void Hud::rebuild_hud_lines()
     layer->lines.push_back(level);
 
     TextLine xp;
-    xp.text = loadout_ != nullptr ? std::to_string(loadout_->xp) + "/" + std::to_string(loadout_->xp_next) : "";
+    xp.text = loadout_.has_value() ? std::to_string(loadout.xp) + "/" + std::to_string(loadout.xp_next) : "";
     xp.pixel = 0.19f;
     xp.x = kXpBarX + kXpBarWidth - 1.0f -
            static_cast<float>(text_pixel_width(xp.text)) * xp.pixel;

@@ -1,0 +1,5 @@
+# Run in a 24-unit square so the player sweeps up gems and outruns enemies.
+1 0 120
+0 1 120
+-1 0 120
+0 -1 120

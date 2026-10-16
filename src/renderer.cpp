@@ -179,7 +179,7 @@ void HavenRenderer::build_camera()
     camera_->setFarClipDistance(100.0f);
 
     camera_node_ = scene_manager_->getRootSceneNode()->createChildSceneNode("haven/camera_node");
-    camera_node_->setPosition(0.0f, 0.0f, 10.0f);
+    camera_node_->setPosition(0.0f, 0.0f, kCameraZ);
     camera_node_->setOrientation(Ogre::Quaternion::IDENTITY);
     camera_node_->attachObject(camera_);
 
@@ -515,7 +515,7 @@ bool HavenRenderer::frameRenderingQueued(const Ogre::FrameEvent& evt)
 
 void HavenRenderer::follow_camera(const Vec2& pos)
 {
-    if (camera_node_ != nullptr) camera_node_->setPosition(pos.x, pos.y, 10.0f);
+    if (camera_node_ != nullptr) camera_node_->setPosition(pos.x, pos.y, kCameraZ);
 }
 
 void HavenRenderer::set_local_player(const Vec2& pos)
