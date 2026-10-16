@@ -1,0 +1,4 @@
+# Pick card 2 (the evolution) at the first offer, card 2 after.
+2
+2
+restart

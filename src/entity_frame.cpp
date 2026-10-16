@@ -193,6 +193,14 @@ ColourSlot slot_for_projectile(const EntityDrawItem& item)
     return slot;
 }
 
+ColourSlot slot_for_gem(const EntityDrawItem& item)
+{
+    ColourSlot slot;
+    slot.pool = ColourPool::Gem;
+    slot.slot = item.style < kGemSlots ? item.style : 0;
+    return slot;
+}
+
 Rgba slot_colour(const ColourSlot& slot)
 {
     switch (slot.pool)
@@ -209,6 +217,8 @@ Rgba slot_colour(const ColourSlot& slot)
             }
         case ColourPool::Projectile:
             return weapon_visual(slot.slot).colour;
+        case ColourPool::Gem:
+            return gem_colour(slot.slot);
     }
     return Rgba{1.0f, 1.0f, 1.0f, 1.0f};
 }
@@ -283,6 +293,46 @@ void append_projectile(PrimitiveSink& sink, const EntityDrawItem& item)
     // — their reach lives in `reach` — so the fallback needs a floor of its own.
     const float radius = weapon.radius > 0.0f ? weapon.radius : kUnknownShapeRadius;
     append_circle(sink, item.pos, radius, kZProjectile, 10);
+}
+
+uint8_t gem_bucket(uint16_t xp_value)
+{
+    // DESIGN.md section 1 gem values: Small = 2, Medium = 10, Large = 50,
+    // Boss Cache = 250. An elite drop is 5x the base, so a value between the
+    // named steps still lands in the bucket below it.
+    if (xp_value <= 2) return 0;
+    if (xp_value <= 10) return 1;
+    if (xp_value <= 50) return 2;
+    return 3;
+}
+
+float gem_radius(uint8_t bucket)
+{
+    // A gem has to read at the 80 x 45 viewport without hiding the enemy
+    // swarm under it, so even the boss cache stays under half a unit.
+    static const float kRadius[kGemSlots] = {0.22f, 0.27f, 0.33f, 0.42f};
+    return kRadius[bucket < kGemSlots ? bucket : 0];
+}
+
+Rgba gem_colour(uint8_t bucket)
+{
+    // The four gem tiers of DESIGN.md section 1: small cyan, medium green,
+    // large violet, boss cache gold. Value reads at a glance across a swarm.
+    static const Rgba kColour[kGemSlots] = {Rgba{0.35f, 0.85f, 0.95f, 1.0f},
+                                            Rgba{0.35f, 0.90f, 0.45f, 1.0f},
+                                            Rgba{0.65f, 0.45f, 1.00f, 1.0f},
+                                            Rgba{1.00f, 0.80f, 0.25f, 1.0f}};
+    return kColour[bucket < kGemSlots ? bucket : 0];
+}
+
+void append_gem(PrimitiveSink& sink, const EntityDrawItem& item)
+{
+    const uint8_t bucket = item.style < kGemSlots ? item.style : 0;
+    const float radius = gem_radius(bucket);
+    // A diamond is a square rotated 45 degrees: `quad` takes the half extent
+    // of the unrotated square, so the circumradius is extent * sqrt(2).
+    constexpr float kSqrt2 = 1.41421356237f;
+    sink.quad(item.pos.x, item.pos.y, radius / kSqrt2, radius / kSqrt2, kZGem, kPi * 0.25f);
 }
 
 std::vector<EntityDrawItem> collect_draw_items(const InterpolationBuffer& buffer)

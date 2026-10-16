@@ -138,6 +138,21 @@ std::vector<uint8_t> encode_input(uint32_t input_seq, uint32_t client_tick, Vec2
     return encode_packet(static_cast<uint8_t>(MsgType::C2S_INPUT), input_seq, payload);
 }
 
+std::vector<uint8_t> encode_levelup_choice(uint16_t event_id, uint8_t choice_idx)
+{
+    ByteWriter w;
+    w.u16(event_id);
+    w.u8(choice_idx);
+
+    std::vector<uint8_t> payload(w.data(), w.data() + w.size());
+    return encode_packet(static_cast<uint8_t>(MsgType::C2S_LEVELUP_CHOICE), 0, payload);
+}
+
+std::vector<uint8_t> encode_restart()
+{
+    return encode_packet(static_cast<uint8_t>(MsgType::C2S_RESTART), 0, {});
+}
+
 bool decode_header(const uint8_t* data, size_t len, PacketHeader& out)
 {
     ByteReader r(data, len);
@@ -236,6 +251,65 @@ bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out)
     // something to silently ignore: accepting it would hide a header/record
     // mismatch and leave the reader out of step on the next packet.
     return r.remaining() == 0;
+}
+
+bool decode_levelup_offer(const uint8_t* payload, size_t len, LevelUpOffer& out)
+{
+    // player_id(1) + event_id(2) + new_level(2) + 3 x option(3) = 14, exactly
+    // as PROTOCOL.md fixes it; the arrays are fixed length, so the length is
+    // part of the format.
+    if (len != 14) return false;
+
+    ByteReader r(payload, len);
+    if (!r.u8(out.player_id) || !r.u16(out.event_id) || !r.u16(out.new_level)) return false;
+    for (UpgradeOptionNet& option : out.options)
+    {
+        if (!r.u8(option.item_id) || !r.u8(option.next_level) || !r.u8(option.is_evo)) return false;
+    }
+    return true;
+}
+
+bool decode_game_over(const uint8_t* payload, size_t len, GameOverStats& out)
+{
+    // 4 x u32 = 16, exactly as PROTOCOL.md fixes it.
+    if (len != 16) return false;
+
+    ByteReader r(payload, len);
+    return r.u32(out.final_tick) && r.u32(out.seconds_survived) && r.u32(out.score) &&
+           r.u32(out.kills);
+}
+
+bool decode_loadout(const uint8_t* payload, size_t len, Loadout& out)
+{
+    // player_id(1) + level(2) + xp(4) + xp_next(4) + weapon_count(1) +
+    // 4 x weapon(3) + passive_count(1) + 10 x passive(2) = 45, always the full
+    // slots with 0xFF filling the unused ones.
+    if (len != 45) return false;
+
+    ByteReader r(payload, len);
+    if (!r.u8(out.player_id) || !r.u16(out.level) || !r.u32(out.xp) || !r.u32(out.xp_next) ||
+        !r.u8(out.weapon_count))
+        return false;
+
+    // The payload always carries all four weapon slots and all ten passive
+    // slots, so a count past the array it indexes is a payload the sender got
+    // wrong. Accepting it would have the HUD walk past the slots it was given
+    // and build a tray that does not match the game.
+    if (static_cast<size_t>(out.weapon_count) > out.weapons.size()) return false;
+
+    for (LoadoutSlot& slot : out.weapons)
+    {
+        if (!r.u8(slot.item_id) || !r.u8(slot.level) || !r.u8(slot.evolved)) return false;
+    }
+
+    if (!r.u8(out.passive_count)) return false;
+    if (static_cast<size_t>(out.passive_count) > out.passives.size()) return false;
+
+    for (LoadoutSlot& slot : out.passives)
+    {
+        if (!r.u8(slot.item_id) || !r.u8(slot.level)) return false;
+    }
+    return true;
 }
 
 bool seq_at_or_before(uint32_t a, uint32_t b)

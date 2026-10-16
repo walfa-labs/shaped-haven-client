@@ -17,13 +17,14 @@ struct Rgba {
     float a = 1.0f;
 };
 
-/// Which simulation stream an entity belongs to. Players, enemies and
-/// projectiles all live in one interpolation buffer, so their ids have to be
-/// told apart.
+/// Which simulation stream an entity belongs to. Players, enemies,
+/// projectiles and gems all live in one interpolation buffer, so their ids
+/// have to be told apart.
 enum class EntityKind : uint8_t {
     Player = 0,
     Enemy = 1,
     Projectile = 2,
+    Gem = 3,
 };
 
 /// Key an entity is stored under in the interpolation buffer: the entity kind
@@ -54,7 +55,7 @@ struct EntityDrawItem {
     EntityKind kind = EntityKind::Player;
     Vec2 pos;
     float angle = 0.0f;  // facing, in radians (vel_angle decoded)
-    uint8_t style = 0;   // enemy archetype, or projectile weapon_id
+    uint8_t style = 0;   // enemy archetype, projectile weapon_id, or gem size bucket
     uint8_t hp_pct = 0;  // enemies only; 0..100, 100 being full health
     uint8_t shape = 0;   // projectiles only; ProjNet shape byte
 };
@@ -103,9 +104,11 @@ public:
 
 /// Draw layers. Everything is flat in the XY plane under a top-down
 /// orthographic camera, so a distinct z per layer is the draw order.
+constexpr float kZGem = 0.02f;
 constexpr float kZEnemy = 0.03f;
 constexpr float kZProjectile = 0.04f;
 constexpr float kZHpBar = 0.05f;
+constexpr float kZHudText = 0.5f;
 
 // ---------------------------------------------------------------------------
 // Primitive builders. All of them are pure functions of their arguments.
@@ -128,12 +131,13 @@ void append_arc(PrimitiveSink& sink, Vec2 centre, float radius, float direction,
 /// A rectangle rotated by `angle`, for the RAY projectile fallback.
 void append_quad(PrimitiveSink& sink, Vec2 centre, Vec2 half_extents, float angle, float z);
 
-/// The three draw layers the renderer keeps. Each is a separate Manual Object,
+/// The four draw layers the renderer keeps. Each is a separate Manual Object,
 /// so an entity's z never has to change to be drawn in the right order.
 enum class ColourPool : uint8_t {
     EnemyBody = 0,
     EnemyBar = 1,
     Projectile = 2,
+    Gem = 3,
 };
 
 /// One material colour inside one pool. The renderer builds one Manual Object
@@ -146,11 +150,12 @@ struct ColourSlot {
 };
 
 /// Slots per pool. The bar pool holds a background colour plus one fill colour
-/// per HP bucket.
+/// per HP bucket. The gem pool holds one colour per XP value bucket.
 constexpr uint8_t kEnemyBodySlots = 7;                  // one per archetype
 constexpr uint8_t kHpFillBuckets = 8;
 constexpr uint8_t kEnemyBarSlots = 1 + kHpFillBuckets;  // background + fills
 constexpr uint8_t kProjectileSlots = 4;                 // one per weapon
+constexpr uint8_t kGemSlots = 4;                       // Small/Medium/Large/Boss Cache
 
 /// The widest pool, in colour slots.
 constexpr uint8_t kMaxSlotsPerPool = kEnemyBarSlots;
@@ -158,6 +163,7 @@ constexpr uint8_t kMaxSlotsPerPool = kEnemyBarSlots;
 ColourSlot slot_for_body(const EntityDrawItem& item);
 ColourSlot slot_for_bar(const EntityDrawItem& item);
 ColourSlot slot_for_projectile(const EntityDrawItem& item);
+ColourSlot slot_for_gem(const EntityDrawItem& item);
 
 /// The colour a slot is created for.
 Rgba slot_colour(const ColourSlot& slot);
@@ -173,6 +179,20 @@ void append_enemy_bar(PrimitiveSink& sink, const EntityDrawItem& item);
 
 /// One projectile, shaped by its ProjNet shape byte, in its weapon's pool.
 void append_projectile(PrimitiveSink& sink, const EntityDrawItem& item);
+
+/// One XP gem: a diamond sized and coloured by its XP bucket, in the gem
+/// pool. The bucket rides in `item.style` (see gem_bucket).
+void append_gem(PrimitiveSink& sink, const EntityDrawItem& item);
+
+/// Which gem bucket an XP value falls into, matching DESIGN.md section 1:
+/// Small = 2, Medium = 10, Large = 50, Boss Cache = 250 and up.
+uint8_t gem_bucket(uint16_t xp_value);
+
+/// Gem diamond circumradius per bucket.
+float gem_radius(uint8_t bucket);
+
+/// Gem colour per bucket: small cyan, medium green, large violet, cache gold.
+Rgba gem_colour(uint8_t bucket);
 
 // ---------------------------------------------------------------------------
 // Wire-derived visual tables. The protocol carries ids only, so the client

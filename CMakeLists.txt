@@ -16,13 +16,18 @@ find_package(OGRE 14.6.1 REQUIRED CONFIG PATHS "${OGRE_SDK_DIR}/CMake" NO_DEFAUL
 set(HAVEN_SOURCES
   src/entity_frame.cpp
   src/game_session.cpp
+  src/hud.cpp
+  src/hud_model.cpp
+  src/hud_text.cpp
   src/input_state.cpp
   src/interpolation.cpp
+  src/item_catalog.cpp
   src/mesh_factory.cpp
   src/net_client.cpp
   src/prediction.cpp
   src/protocol.cpp
-  src/renderer.cpp)
+  src/renderer.cpp
+  src/run_events.cpp)
 
 add_executable(shaped-haven-client src/main.cpp ${HAVEN_SOURCES})
 
@@ -53,11 +58,20 @@ enable_testing()
 
 add_executable(shaped-haven-client-tests tests/test_logic.cpp
   src/entity_frame.cpp
+  src/hud_model.cpp
+  src/hud_text.cpp
   src/input_state.cpp
   src/interpolation.cpp
+  src/item_catalog.cpp
   src/prediction.cpp
-  src/protocol.cpp)
+  src/protocol.cpp
+  src/run_events.cpp)
 
 target_include_directories(shaped-haven-client-tests PRIVATE src)
 
 add_test(NAME logic COMMAND shaped-haven-client-tests)
+
+# The tests load their fixtures from `tests/data/` by relative path, so they have
+# to run from the source directory rather than from the build tree ctest
+# defaults to.
+set_tests_properties(logic PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
