@@ -28,24 +28,27 @@ constexpr float kViewportHeight = 45.0f;
 
 constexpr float kGridCell = 5.0f;
 
-/// How many enemies and projectiles the per-frame batches are sized for. These
-/// are the DESIGN.md section 2 pool caps, so even a pool where every entity
-/// lands in one colour never makes a slot grow mid-frame; ManualObject writes
-/// no further than its estimate, so exceeding it would corrupt the buffer
-/// rather than extend it.
+/// How many enemies, projectiles and gems the per-frame batches are sized for.
+/// These are the DESIGN.md section 2 pool caps, so even a pool where every
+/// entity lands in one colour never makes a slot grow mid-frame; ManualObject
+/// writes no further than its estimate, so exceeding it would corrupt the
+/// buffer rather than extend it.
 constexpr uint32_t kMaxEnemies = 4096;
 constexpr uint32_t kMaxProjectiles = 2048;
+constexpr uint32_t kMaxGems = 4096;
 
 /// Vertices and indices per entity: a 16 segment circle fan is the worst case
-/// for a body, two quads make up an HP bar, and a projectile is worst as an arc
+/// for a body, two quads make up an HP bar, a projectile is worst as an arc
 /// at the 24 segment cap `arc_segments()` applies — a centre vertex plus
-/// `segments + 1` ring vertices, i.e. 26.
+/// `segments + 1` ring vertices, i.e. 26 — and a gem is one diamond quad.
 constexpr uint32_t kVertsPerEnemyBody = 17;
 constexpr uint32_t kVertsPerEnemyBar = 8;
 constexpr uint32_t kIndicesPerEnemyBody = 48;
 constexpr uint32_t kIndicesPerEnemyBar = 12;
 constexpr uint32_t kVertsPerProjectile = 26;
 constexpr uint32_t kIndicesPerProjectile = 72;
+constexpr uint32_t kVertsPerGem = 4;
+constexpr uint32_t kIndicesPerGem = 6;
 
 Ogre::ColourValue colour(float r, float g, float b)
 {
@@ -251,6 +254,8 @@ void append_to_pool(ColourPool pool, PrimitiveSink& sink, const EntityDrawItem& 
 {
     if (pool == ColourPool::EnemyBody)
         append_enemy_body(sink, item);
+    else if (pool == ColourPool::Gem)
+        append_gem(sink, item);
     else
         append_projectile(sink, item);
 }
@@ -292,6 +297,10 @@ void HavenRenderer::slot_capacity(ColourPool pool, uint32_t& verts, uint32_t& in
             verts = kMaxProjectiles * kVertsPerProjectile;
             indices = kMaxProjectiles * kIndicesPerProjectile;
             break;
+        case ColourPool::Gem:
+            verts = kMaxGems * kVertsPerGem;
+            indices = kMaxGems * kIndicesPerGem;
+            break;
     }
 }
 
@@ -302,6 +311,7 @@ Ogre::ManualObject* HavenRenderer::pool_object(ColourPool pool)
         case ColourPool::EnemyBody: return enemy_bodies_;
         case ColourPool::EnemyBar: return enemy_bars_;
         case ColourPool::Projectile: return projectiles_;
+        case ColourPool::Gem: return gem_bodies_;
     }
     return nullptr;
 }
@@ -357,6 +367,7 @@ void HavenRenderer::build_combat_batches()
         {"haven/enemy_bodies", &enemy_bodies_},
         {"haven/enemy_bars", &enemy_bars_},
         {"haven/projectiles", &projectiles_},
+        {"haven/gem_bodies", &gem_bodies_},
     };
 
     for (const Pool& pool : pools)
@@ -394,6 +405,11 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items)
             const ColourSlot proj = slot_for_projectile(item);
             slot_items_[slot_index(proj)].push_back(&item);
         }
+        else if (item.kind == EntityKind::Gem)
+        {
+            const ColourSlot gem = slot_for_gem(item);
+            slot_items_[slot_index(gem)].push_back(&item);
+        }
     }
 
     // The geometry is rebuilt from scratch every frame, so the batches are
@@ -404,7 +420,7 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items)
     if (camera_node_ != nullptr)
     {
         const Ogre::Vector3 cam = camera_node_->getPosition();
-        for (uint8_t pool = 0; pool < 3; ++pool)
+        for (uint8_t pool = 0; pool < 4; ++pool)
         {
             Ogre::ManualObject* object = pool_object(static_cast<ColourPool>(pool));
             if (object != nullptr)
@@ -416,7 +432,7 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items)
         }
     }
 
-    for (uint8_t pool = 0; pool < 3; ++pool)
+    for (uint8_t pool = 0; pool < 4; ++pool)
     {
         const ColourPool colour_pool = static_cast<ColourPool>(pool);
         Ogre::ManualObject* object = pool_object(colour_pool);

@@ -46,10 +46,14 @@ void print_usage(const char* argv0)
 {
     std::printf("usage: %s [--host 127.0.0.1] [--port 7777] [--name <name>]\n"
                 "          [--frames <n>] [--screenshot <path>] [--verbose]\n"
-                "          [--input-script <path>]\n"
+                "          [--input-script <path>] [--choice-script <path>]\n"
                 "\n"
                 "  --input-script feeds move vectors from a file, one per 60 Hz tick,\n"
-                "  instead of the keyboard. Each line is \"<move_x> <move_y> <ticks>\".\n",
+                "  instead of the keyboard. Each line is \"<move_x> <move_y> <ticks>\".\n"
+                "  --choice-script answers level-ups from a file, one line per run\n"
+                "  event in chronological order: a choice index 0..2 for each level-up\n"
+                "  offer, or \"restart\" at each game over. The keyboard (1/2/3 to\n"
+                "  pick a card, R to restart) always works and wins over the script.\n",
                 argv0);
 }
 
@@ -67,6 +71,7 @@ int main(int argc, char** argv)
     std::string name = "haven";
     std::string screenshot;
     std::string input_script;
+    std::string choice_script;
     int frame_limit = 0;
     bool verbose = false;
 
@@ -80,6 +85,7 @@ int main(int argc, char** argv)
         else if (arg == "--frames") frame_limit = std::atoi(next().c_str());
         else if (arg == "--screenshot") screenshot = next();
         else if (arg == "--input-script") input_script = next();
+        else if (arg == "--choice-script") choice_script = next();
         else if (arg == "--verbose") verbose = true;
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); return 0; }
         else { print_usage(argv[0]); return 1; }
@@ -98,6 +104,10 @@ int main(int argc, char** argv)
     if (!input_script.empty() && !haven::load_input_script(input_script, scripted_moves))
         return 1;
 
+    std::vector<int8_t> scripted_choices;
+    if (!choice_script.empty() && !haven::load_choice_script(choice_script, scripted_choices))
+        return 1;
+
     haven::HavenRenderer renderer;
     if (!renderer.initialise())
     {
@@ -112,9 +122,16 @@ int main(int argc, char** argv)
         input.set_script(scripted_moves);
         std::printf("haven: scripted input from %s (%zu ticks)\n", input_script.c_str(), scripted_moves.size());
     }
+    if (!scripted_choices.empty())
+    {
+        input.set_choice_script(scripted_choices);
+        std::printf("haven: scripted choices from %s (%zu events)\n", choice_script.c_str(),
+                    scripted_choices.size());
+    }
 
     haven::NetClient net;
-    haven::GameSession session(renderer, net, input);
+    haven::Hud hud(renderer.scene_manager(), renderer.mesh_factory());
+    haven::GameSession session(renderer, net, input, hud);
     if (!session.connect(host, port, name))
     {
         std::fprintf(stderr, "haven: could not connect to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
@@ -132,15 +149,18 @@ int main(int argc, char** argv)
         {
             const haven::SessionStats& s = session.stats();
             std::printf("haven: frame=%d tick=%u srv_tick=%u acked=%u pred=(%.2f,%.2f) err=%.3f "
-                        "interp=%zu remotes=%zu enemies=%zu projs=%zu snaps=%u stale=%u malformed=%u inputs=%u "
+                        "interp=%zu remotes=%zu enemies=%zu projs=%zu gems=%zu snaps=%u stale=%u malformed=%u inputs=%u "
                         "qdropped=%u prewelcome=%u disconnected=%u sendfail=%u reconciles=%u key=%d "
-                        "move=(%.2f,%.2f) upd_ms=%.3f\n",
+                        "move=(%.2f,%.2f) state=%u level=%u xp=%u/%u choices=%u evos=%u restarts=%u upd_ms=%.3f\n",
                         frames, s.client_tick, s.server_tick, s.last_acked_seq, s.predicted.x, s.predicted.y,
                         s.last_prediction_error, s.interpolation_depth, s.remote_player_count, s.enemy_count,
-                        s.projectile_count, s.snapshots_received, s.stale_snapshots, s.malformed_packets,
+                        s.projectile_count, s.gem_count, s.snapshots_received, s.stale_snapshots, s.malformed_packets,
                         s.inputs_sent, net.send_dropped(), s.pre_welcome_steps, s.disconnected_steps,
                         s.send_failures, s.reconcile_count, input.last_key(), s.last_move.x, s.last_move.y,
-                        s.update_ms_ema);
+                        static_cast<unsigned>(s.game_state), static_cast<unsigned>(s.level),
+                        static_cast<unsigned>(s.xp), static_cast<unsigned>(s.xp_next),
+                        static_cast<unsigned>(s.choices_made), static_cast<unsigned>(s.evolutions_seen),
+                        static_cast<unsigned>(s.restarts_sent), s.update_ms_ema);
         }
 
         if (frame_limit > 0 && frames >= frame_limit)

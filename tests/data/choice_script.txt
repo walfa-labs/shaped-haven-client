@@ -1,0 +1,7 @@
+# One line per run event, in chronological order: a choice index 0..2 for
+# each level-up offer, "restart" at each game over.
+0        # first level-up: pick card 0
+2        # second level-up: pick card 2
+1        # third level-up: pick card 1
+restart  # game over: send C2S_RESTART
+1        # after the restart: pick card 1

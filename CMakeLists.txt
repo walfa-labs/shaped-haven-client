@@ -16,8 +16,11 @@ find_package(OGRE 14.6.1 REQUIRED CONFIG PATHS "${OGRE_SDK_DIR}/CMake" NO_DEFAUL
 set(HAVEN_SOURCES
   src/entity_frame.cpp
   src/game_session.cpp
+  src/hud.cpp
+  src/hud_text.cpp
   src/input_state.cpp
   src/interpolation.cpp
+  src/item_catalog.cpp
   src/mesh_factory.cpp
   src/net_client.cpp
   src/prediction.cpp
@@ -53,8 +56,10 @@ enable_testing()
 
 add_executable(shaped-haven-client-tests tests/test_logic.cpp
   src/entity_frame.cpp
+  src/hud_text.cpp
   src/input_state.cpp
   src/interpolation.cpp
+  src/item_catalog.cpp
   src/prediction.cpp
   src/protocol.cpp)
 

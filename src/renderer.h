@@ -56,6 +56,7 @@ public:
 
     Ogre::RenderWindow* render_window() const { return mWindows.empty() ? nullptr : mWindows[0].render; }
     Ogre::SceneManager* scene_manager() const { return scene_manager_; }
+    MeshFactory* mesh_factory() const { return meshes_.get(); }
 
     /// Local player square, driven by the prediction state.
     void set_local_player(const Vec2& pos);
@@ -126,10 +127,11 @@ private:
     Ogre::ManualObject* enemy_bodies_ = nullptr;
     Ogre::ManualObject* enemy_bars_ = nullptr;
     Ogre::ManualObject* projectiles_ = nullptr;
+    Ogre::ManualObject* gem_bodies_ = nullptr;
 
     /// Scratch storage grouping the frame's entities by colour slot, and the
     /// slots that exist. Both are indexed pool * kMaxSlotsPerPool + slot.
-    static constexpr size_t kSlotItemCount = 3 * kMaxSlotsPerPool;
+    static constexpr size_t kSlotItemCount = 4 * kMaxSlotsPerPool;
     std::vector<const EntityDrawItem*> slot_items_[kSlotItemCount];
     ColourBatch batches_[kSlotItemCount];
 

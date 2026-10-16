@@ -5,8 +5,10 @@
 
 #include "entity_frame.h"
 #include "game_math.h"
+#include "hud_text.h"
 #include "input_state.h"
 #include "interpolation.h"
+#include "item_catalog.h"
 #include "prediction.h"
 #include "protocol.h"
 
@@ -875,7 +877,7 @@ void test_colour_slots()
     expect(empty.pool == haven::ColourPool::EnemyBar, "the bar slot is in the bar pool");
 
     // Every slot has a colour, and the bar background is darker than any fill.
-    for (uint8_t pool = 0; pool < 3; ++pool)
+    for (uint8_t pool = 0; pool < 4; ++pool)
     {
         for (uint8_t slot = 0; slot < haven::kMaxSlotsPerPool; ++slot)
         {
@@ -885,6 +887,11 @@ void test_colour_slots()
             expect(colour.a == 1.0f, "a slot colour is opaque");
         }
     }
+    // The gem pool has one colour per XP tier, and they are told apart.
+    const haven::Rgba small = haven::slot_colour(haven::ColourSlot{haven::ColourPool::Gem, 0});
+    const haven::Rgba cache = haven::slot_colour(haven::ColourSlot{haven::ColourPool::Gem, 3});
+    expect(small.r != cache.r || small.g != cache.g || small.b != cache.b,
+           "small gems and boss caches are different colours");
     const haven::Rgba background = haven::slot_colour(haven::ColourSlot{haven::ColourPool::EnemyBar, 0});
     const haven::Rgba full_fill = haven::slot_colour(haven::ColourSlot{haven::ColourPool::EnemyBar, 9});
     expect(full_fill.g > background.g, "a full bar is brighter than its background");
@@ -1206,6 +1213,321 @@ void test_input_script()
     expect(!haven::load_input_script("tests/data/input_script_bad.txt", moves), "malformed script is rejected");
 }
 
+void test_gem_geometry()
+{
+    std::printf("gem geometry\n");
+    // A gem is one diamond quad: four vertices, two counter-clockwise
+    // triangles, sized by its XP bucket.
+    for (uint8_t bucket = 0; bucket < haven::kGemSlots; ++bucket)
+    {
+        RecordingSink sink;
+        haven::EntityDrawItem item;
+        item.kind = haven::EntityKind::Gem;
+        item.style = bucket;
+        item.pos = {3.0f, -4.0f};
+        haven::append_gem(sink, item);
+        expect_near(static_cast<float>(sink.vertices.size()), 4 * 3, 0.0f, "a gem emits one quad");
+        expect_near(static_cast<float>(sink.indices.size()), 6, 0.0f, "a gem emits two triangles");
+
+        // The diamond's vertices sit one circumradius out along the diagonals.
+        const float radius = haven::gem_radius(bucket);
+        float max_distance = 0.0f;
+        for (size_t i = 0; i < sink.vertices.size(); i += 3)
+            max_distance = std::max(max_distance,
+                                    std::sqrt((sink.vertices[i] - item.pos.x) * (sink.vertices[i] - item.pos.x) +
+                                              (sink.vertices[i + 1] - item.pos.y) * (sink.vertices[i + 1] - item.pos.y)));
+        expect_near(max_distance, radius, 1e-4f, "the diamond reaches its circumradius");
+    }
+
+    // DESIGN.md section 1 gem values: Small = 2, Medium = 10, Large = 50,
+    // Boss Cache = 250. Elite drops are 5x, so the value between two tiers
+    // lands in the lower bucket.
+    expect(haven::gem_bucket(2) == 0, "2 xp is a small gem");
+    expect(haven::gem_bucket(10) == 1, "10 xp is a medium gem");
+    expect(haven::gem_bucket(50) == 2, "50 xp is a large gem");
+    expect(haven::gem_bucket(250) == 3, "250 xp is a boss cache");
+    expect(haven::gem_bucket(5) == 1, "an elite small (5 xp) lands in the medium bucket");
+    expect(haven::gem_bucket(0) == 0, "zero xp is a small gem");
+    expect(haven::gem_bucket(65535) == 3, "a huge value lands in the cache bucket");
+
+    // Bigger tiers draw bigger gems, and every bucket has a colour.
+    for (uint8_t bucket = 1; bucket < haven::kGemSlots; ++bucket)
+        expect(haven::gem_radius(bucket) > haven::gem_radius(bucket - 1), "a bigger tier draws a bigger gem");
+    for (uint8_t bucket = 0; bucket < haven::kGemSlots; ++bucket)
+        expect(haven::gem_colour(bucket).a == 1.0f, "a gem bucket colour is opaque");
+
+    // Each gem bucket gets its own slot in the gem pool.
+    for (uint8_t bucket = 0; bucket < haven::kGemSlots; ++bucket)
+    {
+        haven::EntityDrawItem item;
+        item.kind = haven::EntityKind::Gem;
+        item.style = bucket;
+        const haven::ColourSlot slot = haven::slot_for_gem(item);
+        expect(slot.pool == haven::ColourPool::Gem, "a gem draws in the gem pool");
+        expect(static_cast<uint8_t>(slot.slot) == bucket, "each gem bucket has its own slot");
+    }
+}
+
+void test_levelup_packets()
+{
+    std::printf("C2S_LEVELUP_CHOICE / C2S_RESTART\n");
+    // event_id u16 + choice_idx u8 = 3 byte payload.
+    std::vector<uint8_t> packet = haven::encode_levelup_choice(0x1234, 2);
+    expect(packet.size() == haven::kHeaderSize + 3, "a level-up choice is 7 byte header + 3 byte payload");
+    haven::PacketHeader header{};
+    expect(haven::decode_header(packet.data(), packet.size(), header), "header decodes");
+    expect(header.msg_type == 0x03, "msg_type is C2S_LEVELUP_CHOICE");
+    expect(header.payload_len == 3, "payload_len is 3");
+    expect(packet[7] == 0x34 && packet[8] == 0x12, "event_id is little-endian");
+    expect(packet[9] == 2, "choice_idx is the third payload byte");
+
+    // C2S_RESTART has an empty payload.
+    std::vector<uint8_t> restart = haven::encode_restart();
+    expect(restart.size() == haven::kHeaderSize, "a restart is a bare 7 byte header");
+    haven::PacketHeader restart_header{};
+    expect(haven::decode_header(restart.data(), restart.size(), restart_header), "restart header decodes");
+    expect(restart_header.msg_type == 0x05, "msg_type is C2S_RESTART");
+    expect(restart_header.payload_len == 0, "payload_len is 0");
+}
+
+void test_levelup_offer_packet()
+{
+    std::printf("S2C_LEVELUP_OFFER\n");
+    std::vector<uint8_t> payload;
+    auto append_u8 = [&](uint8_t v) { payload.push_back(v); };
+    auto append_u16 = [&](uint16_t v) { payload.push_back(v & 0xFF); payload.push_back((v >> 8) & 0xFF); };
+    append_u8(0);        // player_id
+    append_u16(0x1020);  // event_id
+    append_u16(7);       // new_level
+    for (int i = 0; i < 3; ++i)
+    {
+        append_u8(i);        // item_id
+        append_u8(i + 1);    // next_level
+        append_u8(i == 2);   // is_evo
+    }
+
+    haven::LevelUpOffer offer{};
+    expect(haven::decode_levelup_offer(payload.data(), payload.size(), offer), "offer decodes");
+    expect(offer.player_id == 0, "player_id");
+    expect(offer.event_id == 0x1020, "event_id");
+    expect(offer.new_level == 7, "new_level");
+    expect(offer.options[0].item_id == 0 && offer.options[0].next_level == 1 && offer.options[0].is_evo == 0,
+           "option 0");
+    expect(offer.options[2].item_id == 2 && offer.options[2].next_level == 3 && offer.options[2].is_evo == 1,
+           "option 2 is the evolution");
+
+    expect(!haven::decode_levelup_offer(payload.data(), payload.size() - 1, offer), "truncated offer is rejected");
+    expect(!haven::decode_levelup_offer(payload.data(), payload.size() + 1, offer), "a padded offer is rejected");
+}
+
+void test_game_over_packet()
+{
+    std::printf("S2C_GAME_OVER\n");
+    std::vector<uint8_t> payload;
+    auto append_u32 = [&](uint32_t v) {
+        for (int s = 0; s < 32; s += 8) payload.push_back(static_cast<uint8_t>((v >> s) & 0xFF));
+    };
+    append_u32(72000);   // final_tick
+    append_u32(1234);    // seconds_survived
+    append_u32(98765);   // score
+    append_u32(4321);    // kills
+
+    haven::GameOverStats stats{};
+    expect(haven::decode_game_over(payload.data(), payload.size(), stats), "game over decodes");
+    expect(stats.final_tick == 72000, "final_tick");
+    expect(stats.seconds_survived == 1234, "seconds_survived");
+    expect(stats.score == 98765, "score");
+    expect(stats.kills == 4321, "kills");
+    expect(!haven::decode_game_over(payload.data(), payload.size() - 1, stats), "truncated game over is rejected");
+    expect(!haven::decode_game_over(payload.data(), payload.size() + 1, stats), "a padded game over is rejected");
+}
+
+void test_loadout_packet()
+{
+    std::printf("S2C_LOADOUT\n");
+    std::vector<uint8_t> payload;
+    auto append_u8 = [&](uint8_t v) { payload.push_back(v); };
+    auto append_u16 = [&](uint16_t v) { payload.push_back(v & 0xFF); payload.push_back((v >> 8) & 0xFF); };
+    auto append_u32 = [&](uint32_t v) {
+        for (int s = 0; s < 32; s += 8) payload.push_back(static_cast<uint8_t>((v >> s) & 0xFF));
+    };
+    append_u8(0);        // player_id
+    append_u16(12);      // level
+    append_u32(685);     // xp
+    append_u32(690);     // xp_next
+    append_u8(2);        // weapon_count
+    append_u8(0); append_u8(3); append_u8(0);  // sword level 3
+    append_u8(32); append_u8(1); append_u8(1);  // Vorpal Blender, evolved
+    append_u8(0xFF); append_u8(0); append_u8(0);  // empty slot
+    append_u8(0xFF); append_u8(0); append_u8(0);  // empty slot
+    append_u8(2);        // passive_count
+    append_u8(21); append_u8(3);  // Prism Splitter level 3
+    append_u8(16); append_u8(5);  // Spinach Core level 5
+    for (int i = 0; i < 8; ++i) { append_u8(0xFF); append_u8(0); }  // empty passives
+
+    expect(payload.size() == 45, "a loadout is always 45 bytes");
+    haven::Loadout loadout{};
+    expect(haven::decode_loadout(payload.data(), payload.size(), loadout), "loadout decodes");
+    expect(loadout.player_id == 0, "player_id");
+    expect(loadout.level == 12, "level");
+    expect(loadout.xp == 685 && loadout.xp_next == 690, "xp and xp_next");
+    expect(loadout.weapon_count == 2, "weapon_count");
+    expect(loadout.weapons[0].item_id == 0 && loadout.weapons[0].level == 3 && loadout.weapons[0].evolved == 0,
+           "sword slot");
+    expect(loadout.weapons[1].item_id == 32 && loadout.weapons[1].level == 1 && loadout.weapons[1].evolved == 1,
+           "evolved weapon slot");
+    expect(loadout.weapons[2].item_id == 0xFF && loadout.weapons[3].item_id == 0xFF, "unused weapon slots are 0xFF");
+    expect(loadout.passive_count == 2, "passive_count");
+    expect(loadout.passives[0].item_id == 21 && loadout.passives[0].level == 3, "prism slot");
+    expect(loadout.passives[1].item_id == 16 && loadout.passives[1].level == 5, "spinach slot");
+    expect(loadout.passives[2].item_id == 0xFF && loadout.passives[9].item_id == 0xFF, "unused passive slots are 0xFF");
+
+    expect(!haven::decode_loadout(payload.data(), payload.size() - 1, loadout), "truncated loadout is rejected");
+    expect(!haven::decode_loadout(payload.data(), payload.size() + 1, loadout), "a padded loadout is rejected");
+}
+
+void test_item_catalog()
+{
+    std::printf("item catalog\n");
+    // The PROTOCOL.md id space: weapons 0-3, passives 16-25, evolutions 32-39,
+    // Overclock 48-50, 0xFF none.
+    expect(haven::item_kind(0) == haven::ItemKind::Weapon, "0 is a weapon");
+    expect(haven::item_kind(3) == haven::ItemKind::Weapon, "3 is a weapon");
+    expect(haven::item_kind(16) == haven::ItemKind::Passive, "16 is passive P0");
+    expect(haven::item_kind(25) == haven::ItemKind::Passive, "25 is passive P9");
+    expect(haven::item_kind(32) == haven::ItemKind::Evolution, "32 is an evolution");
+    expect(haven::item_kind(39) == haven::ItemKind::Evolution, "39 is an evolution");
+    expect(haven::item_kind(48) == haven::ItemKind::Overclock, "48 is Overclock");
+    expect(haven::item_kind(50) == haven::ItemKind::Overclock, "50 is Overclock");
+    expect(haven::item_kind(0xFF) == haven::ItemKind::None, "0xFF is no item");
+    expect(haven::item_kind(7) == haven::ItemKind::None, "7 is not in the id space");
+    expect(haven::item_kind(30) == haven::ItemKind::None, "30 is not in the id space");
+
+    // DESIGN.md section 3 names and max levels.
+    expect(std::string(haven::item_name(0)) == "SWORD", "sword name");
+    expect(std::string(haven::item_name(18)) == "CLOCKWORK GEAR", "P2 name");
+    expect(std::string(haven::item_name(34)) == "GRAVITY CLEAVER", "evolution name");
+    expect(std::string(haven::item_short_name(35)) == "JUGGER", "halberd short name");
+    expect(haven::item_max_level(0) == 8, "weapons cap at 8");
+    expect(haven::item_max_level(16) == 5, "passives cap at 5");
+    expect(haven::item_max_level(21) == 3, "Prism Splitter caps at 3");
+    expect(haven::item_max_level(48) == 0, "Overclock is uncapped");
+
+    // Every item in the space has a name, a short name, and a colour.
+    for (uint8_t id : {0, 1, 2, 3, 16, 17, 18, 19, 20, 21, 22, 23, 24, 25, 32, 33, 34, 35, 36, 37, 38, 39, 48, 49, 50})
+    {
+        expect(haven::item_name(id)[0] != '\0', "the item has a name");
+        expect(haven::item_short_name(id)[0] != '\0', "the item has a short name");
+        expect(haven::item_colour(id).a == 1.0f, "the item has a colour");
+    }
+
+    // The eight evolutions pair one weapon with one named passive.
+    const uint8_t expected[8][2] = {{0, 18}, {0, 23}, {1, 17}, {1, 24}, {2, 19}, {2, 21}, {3, 16}, {3, 20}};
+    for (uint8_t evo = 0; evo < 8; ++evo)
+    {
+        uint8_t weapon = 0xFF;
+        uint8_t passive = 0xFF;
+        expect(haven::evo_components(32 + evo, weapon, passive), "evolution has components");
+        expect(weapon == expected[evo][0] && passive == expected[evo][1], "the pairing matches DESIGN.md");
+    }
+    uint8_t weapon = 0;
+    uint8_t passive = 0;
+    expect(!haven::evo_components(0, weapon, passive), "a weapon has no evolution components");
+    expect(!haven::evo_components(0xFF, weapon, passive), "0xFF has no evolution components");
+
+    // Blurbs: an evolution names its components; a plain upgrade names a level.
+    expect(haven::item_blurb(34, 1) == "AXE + LENS", "a cleaver blurb names its components");
+    expect(haven::item_blurb(18, 4) == "LEVEL 4", "a passive blurb names a level");
+}
+
+void test_hud_text()
+{
+    std::printf("bitmap font\n");
+    // 5x7 glyphs on a 6 pixel advance: n characters span 6n - 1 pixels.
+    expect(haven::text_pixel_width("") == 0, "an empty string has no width");
+    expect(haven::text_pixel_width("A") == haven::kGlyphWidth, "one character is a glyph wide");
+    expect(haven::text_pixel_width("AB") == 2 * haven::kGlyphAdvance - 1, "two characters gain one step");
+    expect(haven::text_pixel_width("LEVEL UP!") == 9 * haven::kGlyphAdvance - 1, "a card title");
+
+    expect(haven::font_has_glyph('A'), "A has a glyph");
+    expect(haven::font_has_glyph('7'), "7 has a glyph");
+    expect(haven::font_has_glyph('!'), "! has a glyph");
+    expect(haven::font_has_glyph(' '), "space has a glyph");
+    expect(!haven::font_has_glyph('@'), "@ has no glyph");
+
+    // Each lit pixel is one quad: 4 vertices and 6 indices.
+    for (const std::string& text : {std::string("SWORD"), std::string("LEVEL 7"), std::string("01:23")})
+    {
+        RecordingSink sink;
+        haven::append_text(sink, text, {0.0f, 0.0f}, 0.25f);
+        expect_near(static_cast<float>(sink.vertices.size()), haven::text_lit_pixels(text) * 4 * 3, 0.0f,
+                    "one quad per lit pixel");
+        expect_near(static_cast<float>(sink.indices.size()), haven::text_lit_pixels(text) * 6, 0.0f,
+                    "two triangles per lit pixel");
+    }
+
+    // Text starts at the top-left corner it is given.
+    RecordingSink sink;
+    haven::append_text(sink, "0", {10.0f, -5.0f}, 0.5f);
+    expect_near(sink.vertices[0], 10.0f, 1e-6f, "the first pixel starts at top_left.x");
+    expect_near(sink.vertices[1], -5.0f, 1e-6f, "the first pixel starts at top_left.y");
+
+    // The digit 0 has a hole in the middle: its lit pixel count is below the
+    // full glyph area, and its first quad is the top bar.
+    expect(haven::text_lit_pixels("0") < 5 * 7, "the 0 glyph is not a full block");
+
+    // Auto-fit: a long name shrinks to the width it is given.
+    const float fit = haven::fit_text_pixel("JUGGERNAUT HALBERD", 10.0f, 0.0f, 0.05f);
+    expect(fit < 0.34f, "a long name is shrunk to fit");
+    expect(fit >= 0.05f, "the fit never goes below the floor");
+    const float short_fit = haven::fit_text_pixel("AXE", 20.0f, 0.0f, 0.05f);
+    expect_near(short_fit, 0.34f, 1e-6f, "a short name keeps the default size");
+}
+
+void test_choice_input()
+{
+    std::printf("choice input\n");
+    haven::InputState input;
+    expect(input.pending_choice() == -1, "no choice is pending at rest");
+    expect(!input.restart_requested(), "no restart is pending at rest");
+
+    input.key_down(haven::InputState::kKey2);
+    expect(input.pending_choice() == 1, "key 2 offers choice 1");
+    input.consume_choice();
+    expect(input.pending_choice() == -1, "consume clears the pending choice");
+
+    // The card keys must not disturb the movement keys.
+    input.key_down(haven::InputState::kKey1);
+    input.key_down(haven::InputState::kKeyD);
+    expect(input.pending_choice() == 0, "key 1 offers choice 0");
+    expect_vec(input.move_vector(), {1.0f, 0.0f}, 0.0f, "D still moves right with a choice pending");
+    input.consume_choice();
+
+    input.key_down(haven::InputState::kKeyR);
+    expect(input.restart_requested(), "R requests a restart");
+    input.consume_restart();
+    expect(!input.restart_requested(), "consume clears the pending restart");
+
+    // The choice script: one line per run event, chronological.
+    std::vector<int8_t> script;
+    expect(haven::load_choice_script("tests/data/choice_script.txt", script), "choice script loads");
+    expect(script.size() == 5, "1+2+1+1 lines expand in order");
+    expect(script[0] == 0 && script[1] == 2 && script[3] == -1, "picks and the restart marker decode");
+
+    haven::InputState scripted;
+    scripted.set_choice_script(script);
+    expect(scripted.has_choice_script(), "the script is armed");
+    expect(scripted.consume_scripted_line() == 0, "the first event is choice 0");
+    expect(scripted.consume_scripted_line() == 2, "the second event is choice 2");
+    expect(scripted.consume_scripted_line() == 1, "the third event is choice 1");
+    expect(scripted.consume_scripted_line() == -1, "the fourth event is a restart");
+    expect(scripted.consume_scripted_line() == 1, "the fifth event is choice 1");
+    expect(scripted.consume_scripted_line() == -3, "an exhausted script reports empty");
+
+    expect(!haven::load_choice_script("tests/data/does_not_exist.txt", script), "missing script is rejected");
+    expect(!haven::load_choice_script("tests/data/choice_script_bad.txt", script), "malformed script is rejected");
+}
+
 }  // namespace
 
 int main()
@@ -1231,6 +1553,7 @@ int main()
     test_reconcile_tolerates_a_stale_ack();
     test_input_state();
     test_input_script();
+    test_choice_input();
     test_entity_keys();
     test_circle_and_triangle_primitives();
     test_arc_and_hp_bar();
@@ -1238,6 +1561,12 @@ int main()
     test_enemy_body_and_hp_bar();
     test_enemy_radius_and_shape_tables();
     test_colour_slots();
+    test_gem_geometry();
+    test_levelup_packets();
+    test_levelup_offer_packet();
+    test_game_over_packet();
+    test_loadout_packet();
+    test_item_catalog();
     test_projectile_shapes();
     test_collect_draw_items();
     test_empty_buffer_collects_nothing();

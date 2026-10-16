@@ -24,6 +24,10 @@ void InputState::key_down(int key_code)
     last_key_ = key_code;
     held_[key_code] = true;
     if (key_code == kKeyEscape) quit_ = true;
+    if (key_code == kKey1) pending_choice_ = 0;
+    if (key_code == kKey2) pending_choice_ = 1;
+    if (key_code == kKey3) pending_choice_ = 2;
+    if (key_code == kKeyR) restart_ = true;
 }
 
 void InputState::key_up(int key_code)
@@ -35,6 +39,18 @@ void InputState::set_script(const std::vector<Vec2>& script)
 {
     script_ = &script;
     script_index_ = 0;
+}
+
+void InputState::set_choice_script(const std::vector<int8_t>& picks)
+{
+    choice_script_ = &picks;
+    choice_index_ = 0;
+}
+
+int8_t InputState::consume_scripted_line()
+{
+    if (choice_script_ == nullptr || choice_index_ >= choice_script_->size()) return -3;
+    return (*choice_script_)[choice_index_++];
 }
 
 bool load_input_script(const std::string& path, std::vector<Vec2>& out)
@@ -74,6 +90,52 @@ bool load_input_script(const std::string& path, std::vector<Vec2>& out)
             return false;
         }
         out.insert(out.end(), static_cast<size_t>(ticks), Vec2{x, y});
+    }
+    return !out.empty();
+}
+
+bool load_choice_script(const std::string& path, std::vector<int8_t>& out)
+{
+    std::ifstream file(path);
+    if (!file.is_open())
+    {
+        std::fprintf(stderr, "haven: cannot open choice script %s\n", path.c_str());
+        return false;
+    }
+
+    const auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
+
+    std::string line;
+    int line_number = 0;
+    while (std::getline(file, line))
+    {
+        ++line_number;
+        const size_t comment = line.find('#');
+        if (comment != std::string::npos) line = line.substr(0, comment);
+
+        size_t begin = 0;
+        size_t end = line.size();
+        while (begin < end && is_space(line[begin])) ++begin;
+        while (end > begin && is_space(line[end - 1])) --end;
+        if (begin == end) continue;  // blank line or comment only
+
+        line = line.substr(begin, end - begin);
+        if (line == "restart")
+        {
+            out.push_back(-1);
+            continue;
+        }
+
+        std::istringstream fields(line);
+        int value = -1;
+        std::string trailing;
+        if (!(fields >> value) || (fields >> trailing) || value < 0 || value > 2)
+        {
+            std::fprintf(stderr, "haven: %s:%d is not \"<choice_idx>\" or \"restart\"\n", path.c_str(),
+                         line_number);
+            return false;
+        }
+        out.push_back(static_cast<int8_t>(value));
     }
     return !out.empty();
 }

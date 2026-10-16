@@ -1,6 +1,7 @@
 #pragma once
 
 #include "game_math.h"
+#include "hud.h"
 #include "input_state.h"
 #include "interpolation.h"
 #include "net_client.h"
@@ -8,11 +9,22 @@
 #include "renderer.h"
 
 #include <cstdint>
+#include <optional>
 #include <string>
 #include <unordered_set>
 #include <vector>
 
 namespace haven {
+
+/// Where the client believes the run is. The snapshot header's game_state is
+/// the authority; this mirrors it for input gating and HUD visibility, and is
+/// driven by the S2C_LEVELUP_OFFER / S2C_GAME_OVER packets first.
+enum class RunState : uint8_t {
+    Connecting,
+    Running,
+    LevelUp,
+    GameOver,
+};
 
 struct SessionStats {
     bool welcomed = false;
@@ -38,16 +50,25 @@ struct SessionStats {
     size_t remote_player_count = 0;
     size_t enemy_count = 0;
     size_t projectile_count = 0;
+    size_t gem_count = 0;
     /// Wall-clock cost of one GameSession::update(), exponentially averaged.
     /// The frame rate main() prints at exit also includes the GL render.
     float update_ms_ema = 0.0f;
+    /// Phase 3 progression, mirrored from S2C_LOADOUT for the verbose log.
+    uint16_t level = 1;
+    uint32_t xp = 0;
+    uint32_t xp_next = 0;
+    uint16_t choices_made = 0;
+    uint16_t restarts_sent = 0;
+    uint16_t evolutions_seen = 0;
+    GameState game_state = GameState::Running;
 };
 
 /// One frame of the client: predict, send input, ingest snapshots, reconcile,
 /// interpolate the remote players and hand the result to the renderer.
 class GameSession {
 public:
-    GameSession(HavenRenderer& renderer, NetClient& net, InputState& input);
+    GameSession(HavenRenderer& renderer, NetClient& net, InputState& input, Hud& hud);
 
     /// Connects, sends C2S_HELLO and starts the socket thread. Retries a few
     /// times so a server that is still starting up does not kill the client.
@@ -63,18 +84,37 @@ private:
     void drain_packets();
     void handle_welcome(const uint8_t* payload, size_t len);
     void handle_snapshot(const uint8_t* payload, size_t len);
+    void handle_levelup_offer(const uint8_t* payload, size_t len);
+    void handle_game_over(const uint8_t* payload, size_t len);
+    void handle_loadout(const uint8_t* payload, size_t len);
 
     /// Draws the interpolated remote players, enemies and projectiles. Remote
     /// players are keyed to SceneNodes; enemies and projectiles go into the
     /// per-frame combat batches.
     void update_entities();
 
+    /// Input gating and HUD visibility, from the snapshot the server last
+    /// told us about.
+    void apply_run_state();
+
+    /// Answers the open level-up offer, from the keyboard or the choice
+    /// script.
+    void resolve_levelup_choice();
+
+    /// Sends C2S_RESTART from the keyboard or the choice script.
+    void maybe_restart();
+
     HavenRenderer& renderer_;
     NetClient& net_;
     InputState& input_;
+    Hud& hud_;
     ClientPredictor predictor_;
     InterpolationBuffer interpolation_;
     SessionStats stats_;
+    RunState run_state_ = RunState::Connecting;
+    std::optional<LevelUpOffer> pending_offer_;
+    GameOverStats game_over_{};
+    uint32_t run_time_ms_ = 0;
 
     /// Remote player ids drawn on the previous frame, so a player who left
     /// has its SceneNode destroyed.

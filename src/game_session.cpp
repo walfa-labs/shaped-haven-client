@@ -18,8 +18,8 @@ constexpr int kConnectAttempts = 10;
 
 }  // namespace
 
-GameSession::GameSession(HavenRenderer& renderer, NetClient& net, InputState& input)
-    : renderer_(renderer), net_(net), input_(input)
+GameSession::GameSession(HavenRenderer& renderer, NetClient& net, InputState& input, Hud& hud)
+    : renderer_(renderer), net_(net), input_(input), hud_(hud)
 {
     // Stable per-process token; phase 1 never reconnects with it.
     session_token_ = 0x53484156454E31ULL;
@@ -64,6 +64,16 @@ void GameSession::update(float dt_seconds)
 
     drain_packets();
 
+    // Input gating and HUD visibility follow the server's game_state, so a
+    // missed S2C_LEVELUP_OFFER or S2C_GAME_OVER cannot leave the client in
+    // the wrong mode.
+    apply_run_state();
+
+    if (run_state_ == RunState::LevelUp)
+        resolve_levelup_choice();
+    else if (run_state_ == RunState::GameOver)
+        maybe_restart();
+
     // The interpolation clock tracks wall time so remote motion stays
     // continuous between snapshot arrivals.
     interpolation_.advance(dt_seconds);
@@ -71,6 +81,8 @@ void GameSession::update(float dt_seconds)
     renderer_.set_local_player(predictor_.position());
     update_entities();
     renderer_.follow_camera(predictor_.position());
+    hud_.set_run_time(run_time_ms_);
+    hud_.tick(dt_seconds);
 
     const float elapsed_ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() -
                                                                        update_started)
@@ -84,6 +96,16 @@ void GameSession::step_fixed()
     if (!stats_.welcomed)
     {
         ++stats_.pre_welcome_steps;
+        return;
+    }
+
+    // The server has paused the simulation for a level-up draft or the run is
+    // over. Input sent now would queue up and dump onto the arena the moment
+    // the run resumes, and the predictor would run away from any state
+    // reconciliation could correct, so hold both instead.
+    if (run_state_ != RunState::Running)
+    {
+        ++stats_.disconnected_steps;
         return;
     }
 
@@ -139,7 +161,152 @@ void GameSession::drain_packets()
             handle_welcome(payload, payload_len);
         else if (static_cast<uint8_t>(MsgType::S2C_SNAPSHOT_FULL) == header.msg_type)
             handle_snapshot(payload, payload_len);
+        else if (static_cast<uint8_t>(MsgType::S2C_LEVELUP_OFFER) == header.msg_type)
+            handle_levelup_offer(payload, payload_len);
+        else if (static_cast<uint8_t>(MsgType::S2C_GAME_OVER) == header.msg_type)
+            handle_game_over(payload, payload_len);
+        else if (static_cast<uint8_t>(MsgType::S2C_LOADOUT) == header.msg_type)
+            handle_loadout(payload, payload_len);
     }
+}
+
+void GameSession::handle_levelup_offer(const uint8_t* payload, size_t len)
+{
+    LevelUpOffer offer{};
+    if (!decode_levelup_offer(payload, len, offer))
+    {
+        ++stats_.malformed_packets;
+        std::fprintf(stderr, "haven: malformed S2C_LEVELUP_OFFER (%zu bytes)\n", len);
+        return;
+    }
+
+    // One client drives one player: an offer for another slot is for the
+    // co-op client of phase 5, not this one.
+    if (offer.player_id != stats_.player_id) return;
+
+    // The server pauses the simulation while it waits for the choice, so the
+    // modal goes up now and input freezes until the run resumes.
+    pending_offer_ = offer;
+    run_state_ = RunState::LevelUp;
+    std::printf("haven: level-up offer event=%u level=%u options=[%u %u %u] [%u %u %u] [%u %u %u]\n",
+                static_cast<unsigned>(offer.event_id), static_cast<unsigned>(offer.new_level),
+                static_cast<unsigned>(offer.options[0].item_id), static_cast<unsigned>(offer.options[0].next_level),
+                static_cast<unsigned>(offer.options[0].is_evo), static_cast<unsigned>(offer.options[1].item_id),
+                static_cast<unsigned>(offer.options[1].next_level), static_cast<unsigned>(offer.options[1].is_evo),
+                static_cast<unsigned>(offer.options[2].item_id), static_cast<unsigned>(offer.options[2].next_level),
+                static_cast<unsigned>(offer.options[2].is_evo));
+}
+
+void GameSession::handle_game_over(const uint8_t* payload, size_t len)
+{
+    GameOverStats stats{};
+    if (!decode_game_over(payload, len, stats))
+    {
+        ++stats_.malformed_packets;
+        std::fprintf(stderr, "haven: malformed S2C_GAME_OVER (%zu bytes)\n", len);
+        return;
+    }
+
+    game_over_ = stats;
+    run_state_ = RunState::GameOver;
+    std::printf("haven: game over after %u s, score %u, kills %u\n", static_cast<unsigned>(stats.seconds_survived),
+                static_cast<unsigned>(stats.score), static_cast<unsigned>(stats.kills));
+}
+
+void GameSession::handle_loadout(const uint8_t* payload, size_t len)
+{
+    Loadout loadout{};
+    if (!decode_loadout(payload, len, loadout))
+    {
+        ++stats_.malformed_packets;
+        std::fprintf(stderr, "haven: malformed S2C_LOADOUT (%zu bytes)\n", len);
+        return;
+    }
+
+    stats_.level = loadout.level;
+    stats_.xp = loadout.xp;
+    stats_.xp_next = loadout.xp_next;
+    hud_.set_loadout(loadout);
+}
+
+void GameSession::apply_run_state()
+{
+    // The snapshot header's game_state outranks the packets above: it is what
+    // the simulation is actually doing right now.
+    if (stats_.game_state == GameState::Running && run_state_ != RunState::Running)
+    {
+        pending_offer_.reset();
+        run_state_ = RunState::Running;
+        hud_.hide_offer();
+        hud_.hide_game_over();
+    }
+    else if (stats_.game_state == GameState::GameOver && run_state_ != RunState::GameOver)
+    {
+        run_state_ = RunState::GameOver;
+        hud_.show_game_over(game_over_);
+    }
+}
+
+void GameSession::resolve_levelup_choice()
+{
+    if (!pending_offer_.has_value()) return;
+
+    // The keyboard wins over the script: a human at the machine is the
+    // manual path, the script is the unattended one.
+    int pick = input_.pending_choice();
+    input_.consume_choice();
+    if (pick < 0 && input_.has_choice_script())
+    {
+        const int8_t scripted = input_.consume_scripted_line();
+        if (scripted >= 0 && scripted <= 2)
+            pick = scripted;
+        else if (scripted == -1)
+            pick = 0;  // a restart marker at an offer: server default is option 0
+    }
+    if (pick < 0 || pick > 2) return;  // wait for a keypress or the script
+
+    if (!net_.send(encode_levelup_choice(pending_offer_->event_id, static_cast<uint8_t>(pick))))
+    {
+        ++stats_.send_failures;
+        return;
+    }
+    ++stats_.choices_made;
+    std::printf("haven: level-up choice event=%u idx=%d\n", static_cast<unsigned>(pending_offer_->event_id),
+                pick);
+    pending_offer_.reset();
+    // The modal comes down when the next snapshot says the run is running
+    // again (apply_run_state), not when the packet goes out.
+}
+
+void GameSession::maybe_restart()
+{
+    bool restart = input_.restart_requested();
+    input_.consume_restart();
+
+    int8_t scripted = -3;
+    if (!restart && input_.has_choice_script())
+    {
+        scripted = input_.consume_scripted_line();
+        restart = scripted == -1;
+    }
+    if (!restart) return;
+
+    if (!net_.send(encode_restart()))
+    {
+        ++stats_.send_failures;
+        return;
+    }
+    ++stats_.restarts_sent;
+    std::printf("haven: restart requested\n");
+    // The old run's entities keep their ids in the pools, so the interpolation
+    // buffer and the HUD start the fresh run clean. Reconciliation snaps the
+    // predictor to the respawn point on the first snapshot.
+    interpolation_.clear();
+    renderer_.clear_remote_players();
+    hud_.reset();
+    stats_.level = 1;
+    stats_.xp = 0;
+    stats_.xp_next = 0;
 }
 
 void GameSession::handle_welcome(const uint8_t* payload, size_t len)
@@ -169,6 +336,9 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
     }
 
     ++stats_.snapshots_received;
+
+    stats_.game_state = snapshot.game_state;
+    run_time_ms_ = snapshot.run_time_ms;
 
     // Snapshots must arrive in order. A stale one carries an older
     // authoritative position, and applying it would drag the prediction
@@ -222,6 +392,16 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
         style.style = proj.weapon_id;
         style.shape = proj.shape;
         style.angle = proj.vel_angle;
+        render.styles.emplace(key, style);
+    }
+
+    for (const GemNet& gem : snapshot.gems)
+    {
+        const uint32_t key = interpolation_key(gem.id, EntityKind::Gem);
+        render.positions.emplace(key, gem.pos);
+        EntityStyle style;
+        style.kind = EntityKind::Gem;
+        style.style = gem_bucket(gem.xp_value);
         render.styles.emplace(key, style);
     }
 
@@ -284,13 +464,16 @@ void GameSession::update_entities()
 
     size_t enemies = 0;
     size_t projectiles = 0;
+    size_t gems = 0;
     for (const EntityDrawItem& item : combat_items_)
     {
         if (item.kind == EntityKind::Enemy) ++enemies;
         else if (item.kind == EntityKind::Projectile) ++projectiles;
+        else if (item.kind == EntityKind::Gem) ++gems;
     }
     stats_.enemy_count = enemies;
     stats_.projectile_count = projectiles;
+    stats_.gem_count = gems;
     stats_.remote_player_count = known_remotes_.size();
 }
 

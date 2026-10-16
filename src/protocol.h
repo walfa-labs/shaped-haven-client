@@ -29,11 +29,13 @@ enum class MsgType : uint8_t {
     C2S_INPUT = 0x02,
     C2S_LEVELUP_CHOICE = 0x03,
     C2S_ACK_SNAPSHOT = 0x04,
+    C2S_RESTART = 0x05,
     S2C_WELCOME = 0x81,
     S2C_SNAPSHOT_FULL = 0x82,
     S2C_SNAPSHOT_DELTA = 0x83,
     S2C_LEVELUP_OFFER = 0x84,
     S2C_GAME_OVER = 0x85,
+    S2C_LOADOUT = 0x86,
 };
 
 constexpr uint8_t kProtocolVersion = 1;
@@ -109,6 +111,13 @@ std::vector<uint8_t> encode_packet(uint8_t msg_type, uint32_t seq, const std::ve
 std::vector<uint8_t> encode_hello(uint64_t session_token, uint8_t requested_slot, const std::string& name);
 std::vector<uint8_t> encode_input(uint32_t input_seq, uint32_t client_tick, Vec2 move, uint16_t aim_angle, uint8_t buttons);
 
+/// C2S_LEVELUP_CHOICE (0x03): event_id u16, choice_idx u8 — 3 byte payload.
+std::vector<uint8_t> encode_levelup_choice(uint16_t event_id, uint8_t choice_idx);
+
+/// C2S_RESTART (0x05): empty payload. Only meaningful while game_state is
+/// game over; the server ignores it otherwise.
+std::vector<uint8_t> encode_restart();
+
 bool decode_header(const uint8_t* data, size_t len, PacketHeader& out);
 
 struct Welcome {
@@ -170,6 +179,56 @@ struct SnapshotFull {
     std::vector<ProjNet> projs;
     std::vector<GemNet> gems;
 };
+
+/// S2C_LEVELUP_OFFER (0x84) — 14 byte payload: player_id u8, event_id u16,
+/// new_level u16, then three UpgradeOptionNet. The run pauses until the client
+/// answers with C2S_LEVELUP_CHOICE carrying the same event_id, or the server's
+/// 15 s timeout auto-selects option 0.
+struct UpgradeOptionNet {
+    uint8_t item_id = 0;
+    uint8_t next_level = 0;
+    uint8_t is_evo = 0;
+};
+
+struct LevelUpOffer {
+    uint8_t player_id = 0;
+    uint16_t event_id = 0;
+    uint16_t new_level = 0;
+    std::array<UpgradeOptionNet, 3> options{};
+};
+
+/// S2C_GAME_OVER (0x85) — 16 byte payload. PROTOCOL.md fixes the layout at
+/// these four scalars; DESIGN.md's summaries array is not on the wire.
+struct GameOverStats {
+    uint32_t final_tick = 0;
+    uint32_t seconds_survived = 0;
+    uint32_t score = 0;
+    uint32_t kills = 0;
+};
+
+/// S2C_LOADOUT (0x86) — 45 byte payload, always the full 4 + 10 slots with
+/// 0xFF filling the unused ones. Sent whenever level, XP or the item set
+/// changes, so the HUD never polls.
+struct LoadoutSlot {
+    uint8_t item_id = 0;
+    uint8_t level = 0;
+    uint8_t evolved = 0;  // weapons only; passives read level then stop
+};
+
+struct Loadout {
+    uint8_t player_id = 0;
+    uint16_t level = 0;
+    uint32_t xp = 0;
+    uint32_t xp_next = 0;
+    uint8_t weapon_count = 0;
+    std::array<LoadoutSlot, 4> weapons{};
+    uint8_t passive_count = 0;
+    std::array<LoadoutSlot, 10> passives{};
+};
+
+bool decode_levelup_offer(const uint8_t* payload, size_t len, LevelUpOffer& out);
+bool decode_game_over(const uint8_t* payload, size_t len, GameOverStats& out);
+bool decode_loadout(const uint8_t* payload, size_t len, Loadout& out);
 
 bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out);
 

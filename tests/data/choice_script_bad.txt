@@ -1,0 +1,4 @@
+# A malformed choice script: the second line is neither an index nor restart.
+0
+pick card 1
+restart
