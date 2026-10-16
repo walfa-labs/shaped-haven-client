@@ -162,8 +162,8 @@ Measured on this machine (Release build, 1280x720) against the real
   again, on the following frame, with `stale=0`. The pre-fix client, run against
   the same server with the same scripts, stayed on the scoreboard with its input
   frozen from frame 1,980 to frame 8,340 while the new run's clock advanced from
-  24 to 1,749, and sent two `C2S_RESTART`s in consecutive frames as it spent the
-  choice script one line per frame.
+  24 to 1,749, and spent the choice script's last two `restart` markers on
+  consecutive frames — the earlier level-ups had already eaten the rest.
 
 An evolution was not reached in these runs: the scripted picks are the ones the
 offer happened to list first, and reaching a level-8 weapon needs both a longer
