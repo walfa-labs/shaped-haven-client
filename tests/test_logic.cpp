@@ -3,6 +3,7 @@
 // keyboard mapping. Everything here is Ogre-free so it builds and runs as a
 // plain console test.
 
+#include "entity_frame.h"
 #include "game_math.h"
 #include "input_state.h"
 #include "interpolation.h"
@@ -16,6 +17,8 @@
 #include <vector>
 
 namespace {
+
+constexpr float kPi = 3.14159265358979323846f;
 
 int g_failures = 0;
 int g_checks = 0;
@@ -452,6 +455,277 @@ void test_reconcile_blends_small_errors()
                 "the blend moves 15% of the way to the server position");
 }
 
+/// Records what a geometry builder emitted so the tests can check vertex and
+/// index counts, winding and colours without an Ogre.
+class RecordingSink : public haven::PrimitiveSink {
+public:
+    uint32_t base_index() const override { return static_cast<uint32_t>(vertices.size() / 3); }
+    void vertex(float x, float y, float z, const haven::Rgba& colour) override
+    {
+        vertices.push_back(x);
+        vertices.push_back(y);
+        vertices.push_back(z);
+        colours.push_back(colour.r);
+        colours.push_back(colour.g);
+        colours.push_back(colour.b);
+        colours.push_back(colour.a);
+    }
+    void index(uint32_t index) override { indices.push_back(index); }
+
+    std::vector<float> vertices;
+    std::vector<float> colours;
+    std::vector<uint32_t> indices;
+};
+
+void test_entity_keys()
+{
+    std::printf("entity keys\n");
+    // An enemy and a projectile from separate server pools can share an id;
+    // the namespaced keys must not collide, and the raw id survives.
+    const uint32_t enemy_key = haven::interpolation_key(5, haven::EntityKind::Enemy);
+    const uint32_t proj_key = haven::interpolation_key(5, haven::EntityKind::Projectile);
+    expect(enemy_key != proj_key, "enemy and projectile id 5 get different keys");
+    expect(haven::key_kind(enemy_key) == haven::EntityKind::Enemy, "enemy key kind survives");
+    expect(haven::key_kind(proj_key) == haven::EntityKind::Projectile, "projectile key kind survives");
+    expect(haven::key_raw_id(enemy_key) == 5 && haven::key_raw_id(proj_key) == 5, "raw id survives");
+    const uint32_t player_key = haven::interpolation_key(2, haven::EntityKind::Player);
+    expect(haven::key_kind(player_key) == haven::EntityKind::Player, "player key kind survives");
+    expect(haven::key_raw_id(player_key) == 2, "player raw id survives");
+    // A large id is not truncated: the pools are far below 2^30 but the mask
+    // must not silently wrap one id onto another.
+    const uint32_t big = (1u << haven::kKindShift) - 1u;
+    expect(haven::key_raw_id(haven::interpolation_key(big, haven::EntityKind::Enemy)) == big,
+           "a 30 bit id is not truncated");
+}
+
+void test_circle_and_triangle_primitives()
+{
+    std::printf("primitive builders\n");
+    RecordingSink sink;
+    haven::append_circle(sink, {10.0f, -4.0f}, 0.5f, {1.0f, 0.5f, 0.25f, 1.0f}, 0.03f, 4);
+    // A 4 segment circle is a centre vertex, 4 ring vertices and 4 triangles.
+    expect(sink.vertices.size() == 5 * 3, "circle emits 5 vertices");
+    expect(sink.indices.size() == 4 * 3, "circle emits 4 triangles");
+    expect_near(sink.vertices[0], 10.0f, 1e-6f, "circle centre vertex x");
+    expect_near(sink.vertices[1], -4.0f, 1e-6f, "circle centre vertex y");
+    // First ring vertex sits at angle 0, i.e. one radius to the right.
+    expect_near(sink.vertices[3], 10.5f, 1e-6f, "ring vertex 0 is at angle 0");
+    expect_near(sink.vertices[4], -4.0f, 1e-6f, "ring vertex 0 keeps the centre y");
+    // Counter-clockwise winding: the cross product of the first two edges is
+    // positive, which Ogre reads as the front face.
+    const float ax = sink.vertices[3] - sink.vertices[0];
+    const float ay = sink.vertices[4] - sink.vertices[1];
+    const float bx = sink.vertices[6] - sink.vertices[0];
+    const float by = sink.vertices[7] - sink.vertices[1];
+    expect(ax * by - ay * bx > 0.0f, "circle is wound counter-clockwise");
+    // Every vertex carries the same colour.
+    expect(sink.colours.size() == 5 * 4, "one colour per vertex");
+    for (size_t i = 0; i < 5; ++i)
+        expect_near(sink.colours[i * 4 + 1], 0.5f, 1e-6f, "vertex colour is passed through");
+
+    RecordingSink triangle;
+    haven::append_triangle(triangle, {0.0f, 0.0f}, 1.0f, kPi * 0.5f, {1.0f, 1.0f, 1.0f, 1.0f}, 0.0f);
+    expect(triangle.vertices.size() == 3 * 3, "triangle emits 3 vertices");
+    expect(triangle.indices.size() == 3, "triangle emits one triangle");
+    // The first vertex is at +angle: pi/2 points up.
+    expect_near(triangle.vertices[0], 0.0f, 1e-5f, "triangle vertex 0 x at angle pi/2");
+    expect_near(triangle.vertices[1], 1.0f, 1e-5f, "triangle vertex 0 points up");
+    const float e1x = triangle.vertices[3] - triangle.vertices[0];
+    const float e1y = triangle.vertices[4] - triangle.vertices[1];
+    const float e2x = triangle.vertices[6] - triangle.vertices[0];
+    const float e2y = triangle.vertices[7] - triangle.vertices[1];
+    expect(e1x * e2y - e1y * e2x > 0.0f, "triangle is wound counter-clockwise");
+}
+
+void test_arc_and_hp_bar()
+{
+    std::printf("arcs and hp bars\n");
+    RecordingSink arc;
+    // A 90 degree arc facing +X: the ring starts at -45 degrees and ends at +45.
+    haven::append_arc(arc, {0.0f, 0.0f}, 3.5f, 0.0f, kPi * 0.5f, {1.0f, 0.0f, 0.0f, 1.0f}, 0.0f, 4);
+    // A 4 interval arc is a centre vertex plus 5 ring vertices, so the last
+    // ring vertex lands exactly on the far edge of the wedge.
+    expect(arc.vertices.size() == 6 * 3, "arc emits a centre and 5 ring vertices");
+    expect_near(arc.vertices[3], 3.5f * std::cos(-kPi * 0.25f), 1e-5f, "arc starts 45 degrees left of aim");
+    expect_near(arc.vertices[4], 3.5f * std::sin(-kPi * 0.25f), 1e-5f, "arc start y");
+    const float last_x = arc.vertices[(6 - 1) * 3];
+    const float last_y = arc.vertices[(6 - 1) * 3 + 1];
+    expect_near(last_x, 3.5f * std::cos(kPi * 0.25f), 1e-5f, "arc ends 45 degrees right of aim");
+    expect_near(last_y, 3.5f * std::sin(kPi * 0.25f), 1e-5f, "arc end y");
+    // The wedge must be symmetric about the aim direction.
+    expect_near(std::fabs(arc.vertices[4]), std::fabs(arc.vertices[(6 - 1) * 3 + 1]), 1e-5f,
+               "arc is symmetric about the aim direction");
+}
+
+void test_enemy_body_and_hp_bar()
+{
+    std::printf("enemy body and hp bar\n");
+    RecordingSink bodies;
+    RecordingSink bars;
+    haven::EntityDrawItem item;
+    item.kind = haven::EntityKind::Enemy;
+    item.style = 3;  // Triangle T1
+    item.pos = {2.0f, 3.0f};
+    item.angle = kPi * 0.5f;
+    item.hp_pct = 40;
+    haven::append_enemy(bodies, bars, item);
+
+    expect(bodies.vertices.size() == 3 * 3, "a triangle archetype emits one triangle");
+    // The triangle points where the enemy is moving: +Y.
+    expect_near(bodies.vertices[1], 3.0f + 0.5f, 1e-5f, "the triangle points along its facing");
+
+    // Two quads: the bar background and the fill.
+    expect(bars.vertices.size() == 8 * 3, "the hp bar emits two quads");
+    expect(bars.indices.size() == 12, "the hp bar emits two triangles pairs");
+    // The bar floats above the body: its lower edge is half a bar height
+    // below the centre it was given.
+    const float bar_low = bars.vertices[1];
+    const float bar_high = bars.vertices[2 * 3 + 1];
+    expect_near(bar_high - bar_low, 0.14f, 1e-5f, "the bar height");
+    expect_near((bar_low + bar_high) * 0.5f, 3.0f + 0.5f + 0.30f, 1e-5f, "the bar sits above the body radius");
+    const float background_width = std::fabs(bars.vertices[3] - bars.vertices[0]);
+    expect_near(background_width, haven::enemy_hp_bar_width(3), 1e-5f, "the background spans the bar width");
+    // The fill is left anchored and shrinks with hp_pct: 40% of the width.
+    const float fill_width = std::fabs(bars.vertices[5 * 3] - bars.vertices[4 * 3]);
+    expect(fill_width < background_width, "the fill is narrower than the background at 40% hp");
+    expect_near(fill_width / background_width, 0.4f, 0.02f, "the fill width tracks hp_pct");
+    // The fill starts at the left edge of the background.
+    expect_near(bars.vertices[4 * 3], bars.vertices[0], 1e-4f, "the fill is left anchored");
+}
+
+void test_enemy_radius_and_shape_tables()
+{
+    std::printf("archetype tables\n");
+    expect_near(haven::enemy_radius(0), 0.5f, 0.0f, "Circle T1 radius");
+    expect_near(haven::enemy_radius(1), 0.9f, 0.0f, "Circle T2 radius");
+    expect_near(haven::enemy_radius(3), 0.5f, 0.0f, "Triangle T1 radius");
+    expect_near(haven::enemy_radius(5), 1.0f, 0.0f, "Triangle T3 radius");
+    expect(haven::archetype_is_circle(0) && !haven::archetype_is_circle(3), "circles and triangles told apart");
+    expect(haven::archetype_colour(0).r > haven::archetype_colour(3).r, "tier 1 circle and triangle differ");
+    expect(haven::enemy_hp_bar_width(0) > 0.5f, "the hp bar is wider than the body");
+    expect(haven::enemy_hp_bar_width(2) < 3.6f, "the hp bar width is bounded for a T3");
+}
+
+void test_projectile_shapes()
+{
+    std::printf("projectile shapes\n");
+    for (uint8_t weapon = 0; weapon < 4; ++weapon)
+    {
+        RecordingSink sink;
+        haven::EntityDrawItem item;
+        item.kind = haven::EntityKind::Projectile;
+        item.style = weapon;
+        item.pos = {0.0f, 0.0f};
+        item.angle = 0.0f;
+        // DESIGN.md section 3 order: sword and axe are arcs, bow and gun are
+        // travelling circles.
+        item.shape = weapon < 2 ? 0 : 1;
+        haven::append_projectile(sink, item);
+        expect(sink.vertices.size() > 0, "every weapon emits geometry");
+        expect(sink.indices.size() % 3 == 0, "geometry is made of whole triangles");
+    }
+
+    // The sword arc is narrower than the axe arc at the same range.
+    RecordingSink sword;
+    haven::EntityDrawItem sword_item;
+    sword_item.kind = haven::EntityKind::Projectile;
+    sword_item.style = 0;
+    sword_item.shape = 0;
+    sword_item.pos = {0.0f, 0.0f};
+    sword_item.angle = 0.0f;
+    haven::append_projectile(sword, sword_item);
+
+    RecordingSink axe;
+    haven::EntityDrawItem axe_item = sword_item;
+    axe_item.style = 1;
+    haven::append_projectile(axe, axe_item);
+
+    const auto span = [](const RecordingSink& sink) {
+        float low = 1e30f;
+        float high = -1e30f;
+        for (size_t i = 1; i < sink.vertices.size(); i += 3)
+        {
+            low = std::min(low, sink.vertices[i]);
+            high = std::max(high, sink.vertices[i]);
+        }
+        return high - low;
+    };
+    expect(span(axe) > span(sword), "the axe arc spans more than the sword arc");
+
+    // A bow arrow is a circle of its projectile radius, not an arc.
+    RecordingSink arrow;
+    haven::EntityDrawItem arrow_item = sword_item;
+    arrow_item.style = 2;
+    arrow_item.shape = 1;
+    haven::append_projectile(arrow, arrow_item);
+    expect_near(arrow.vertices.size(), 11 * 3, 0.0f, "a 10 segment arrow emits 11 vertices");
+}
+
+void test_collect_draw_items()
+{
+    std::printf("collect draw items\n");
+    haven::InterpolationBuffer buffer;
+
+    // An enemy and a projectile that share the raw id 5 must both survive.
+    haven::RenderSnapshot first;
+    first.run_time_ms = 0;
+    first.positions = {{haven::interpolation_key(5, haven::EntityKind::Enemy), {0.0f, 0.0f}},
+                       {haven::interpolation_key(5, haven::EntityKind::Projectile), {10.0f, 0.0f}}};
+    first.styles = {{haven::interpolation_key(5, haven::EntityKind::Enemy),
+                     haven::EntityStyle{haven::EntityKind::Enemy, 0, 100, 0, 0.0f}},
+                    {haven::interpolation_key(5, haven::EntityKind::Projectile),
+                     haven::EntityStyle{haven::EntityKind::Projectile, 2, 0, 1, 1.0f}}};
+
+    // 100 ms of server time between the two snapshots, so the 100 ms
+    // interpolation delay puts the render time exactly halfway between them
+    // once 50 ms of render clock has passed.
+    haven::RenderSnapshot second = first;
+    second.run_time_ms = 100;
+    second.positions = {{haven::interpolation_key(5, haven::EntityKind::Enemy), {20.0f, 0.0f}},
+                        {haven::interpolation_key(5, haven::EntityKind::Projectile), {30.0f, 0.0f}}};
+
+    buffer.push(first);
+    buffer.push(second);
+    buffer.advance(0.050f);
+
+    const std::vector<haven::EntityDrawItem> items = haven::collect_draw_items(buffer);
+    expect(items.size() == 2, "both the enemy and the projectile are drawn");
+    bool found_enemy = false;
+    bool found_projectile = false;
+    for (const haven::EntityDrawItem& item : items)
+    {
+        expect(haven::key_raw_id(item.key) == 5, "the raw id survives round the buffer");
+        if (item.kind == haven::EntityKind::Enemy)
+        {
+            found_enemy = true;
+            expect_near(item.pos.x, 10.0f, 1e-6f, "the enemy is interpolated halfway");
+            expect(item.style == 0 && item.hp_pct == 100, "the enemy style is carried");
+        }
+        else if (item.kind == haven::EntityKind::Projectile)
+        {
+            found_projectile = true;
+            expect_near(item.pos.x, 20.0f, 1e-6f, "the projectile is interpolated halfway");
+            expect(item.style == 2 && item.shape == 1, "the projectile style is carried");
+        }
+    }
+    expect(found_enemy, "the enemy is drawn");
+    expect(found_projectile, "the projectile is drawn");
+}
+
+void test_empty_buffer_collects_nothing()
+{
+    std::printf("empty buffer collects nothing\n");
+    haven::InterpolationBuffer buffer;
+    expect(haven::collect_draw_items(buffer).empty(), "an empty buffer draws nothing");
+
+    // One snapshot alone cannot be interpolated, so nothing is drawn yet.
+    haven::RenderSnapshot only;
+    only.run_time_ms = 0;
+    only.positions = {{haven::interpolation_key(1, haven::EntityKind::Enemy), {1.0f, 1.0f}}};
+    buffer.push(only);
+    expect(haven::collect_draw_items(buffer).empty(), "a single snapshot is not interpolated yet");
+}
+
 void test_interpolation()
 {
     std::printf("interpolation buffer\n");
@@ -627,6 +901,14 @@ int main()
     test_reconcile_tolerates_a_stale_ack();
     test_input_state();
     test_input_script();
+    test_entity_keys();
+    test_circle_and_triangle_primitives();
+    test_arc_and_hp_bar();
+    test_enemy_body_and_hp_bar();
+    test_enemy_radius_and_shape_tables();
+    test_projectile_shapes();
+    test_collect_draw_items();
+    test_empty_buffer_collects_nothing();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;

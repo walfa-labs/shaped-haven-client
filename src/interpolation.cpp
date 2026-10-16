@@ -42,6 +42,12 @@ const std::unordered_map<uint32_t, Vec2>& InterpolationBuffer::latest_positions(
     return snapshots_.empty() ? empty : snapshots_.back().data.positions;
 }
 
+const std::unordered_map<uint32_t, EntityStyle>& InterpolationBuffer::latest_styles() const
+{
+    static const std::unordered_map<uint32_t, EntityStyle> empty;
+    return snapshots_.empty() ? empty : snapshots_.back().data.styles;
+}
+
 int64_t InterpolationBuffer::render_time_ms() const
 {
     if (snapshots_.empty()) return -static_cast<int64_t>(kDelayMs);

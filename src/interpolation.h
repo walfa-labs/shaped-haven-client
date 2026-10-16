@@ -1,5 +1,6 @@
 #pragma once
 
+#include "entity_frame.h"
 #include "game_math.h"
 #include "protocol.h"
 
@@ -10,10 +11,23 @@
 
 namespace haven {
 
-/// A snapshot reduced to what the renderer needs, keyed by entity id.
+/// What the renderer needs to know about an entity besides where it is. Only
+/// the position is interpolated; the style is cosmetic, so the newest
+/// snapshot that carried the entity supplies it.
+struct EntityStyle {
+    EntityKind kind = EntityKind::Player;
+    uint8_t style = 0;   // enemy archetype, or projectile weapon_id
+    uint8_t hp_pct = 0;  // enemies only
+    uint8_t shape = 0;   // projectiles only; ProjNet shape byte
+    float angle = 0.0f;  // facing, in radians
+};
+
+/// A snapshot reduced to what the renderer needs, keyed by the namespaced
+/// entity id (see interpolation_key).
 struct RenderSnapshot {
     uint32_t run_time_ms = 0;
     std::unordered_map<uint32_t, Vec2> positions;
+    std::unordered_map<uint32_t, EntityStyle> styles;
 };
 
 /// Holds the newest snapshots and answers "where should entity `id` be drawn
@@ -43,8 +57,11 @@ public:
     size_t size() const { return snapshots_.size(); }
     void clear();
 
-    /// Positions carried by the newest snapshot, keyed by entity id.
+    /// Positions carried by the newest snapshot, keyed by namespaced entity id.
     const std::unordered_map<uint32_t, Vec2>& latest_positions() const;
+
+    /// Styles carried by the newest snapshot, keyed by the same ids.
+    const std::unordered_map<uint32_t, EntityStyle>& latest_styles() const;
 
     /// Render time expressed in snapshot (server) milliseconds: the newest
     /// snapshot's timestamp plus the wall time elapsed since it arrived, minus

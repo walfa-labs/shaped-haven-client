@@ -9,6 +9,7 @@
 
 #include <cstdint>
 #include <string>
+#include <unordered_set>
 
 namespace haven {
 
@@ -31,6 +32,11 @@ struct SessionStats {
     Vec2 authoritative;
     size_t interpolation_depth = 0;
     size_t remote_player_count = 0;
+    size_t enemy_count = 0;
+    size_t projectile_count = 0;
+    /// Wall-clock cost of one GameSession::update(), exponentially averaged.
+    /// The frame rate main() prints at exit also includes the GL render.
+    float update_ms_ema = 0.0f;
 };
 
 /// One frame of the client: predict, send input, ingest snapshots, reconcile,
@@ -53,7 +59,11 @@ private:
     void drain_packets();
     void handle_welcome(const uint8_t* payload, size_t len);
     void handle_snapshot(const uint8_t* payload, size_t len);
-    void update_remote_players();
+
+    /// Draws the interpolated remote players, enemies and projectiles. Remote
+    /// players are keyed to SceneNodes; enemies and projectiles go into the
+    /// per-frame combat batches.
+    void update_entities();
 
     HavenRenderer& renderer_;
     NetClient& net_;
@@ -61,6 +71,10 @@ private:
     ClientPredictor predictor_;
     InterpolationBuffer interpolation_;
     SessionStats stats_;
+
+    /// Remote player ids drawn on the previous frame, so a player who left
+    /// has its SceneNode destroyed.
+    std::unordered_set<uint32_t> known_remotes_;
 
     float accumulator_ = 0.0f;
     uint64_t session_token_ = 0;

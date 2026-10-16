@@ -1,6 +1,7 @@
 #pragma once
 
 #include "game_math.h"
+#include "entity_frame.h"
 #include "input_state.h"
 #include "mesh_factory.h"
 
@@ -67,6 +68,12 @@ public:
     void remove_player(uint8_t player_id);
     void clear_remote_players();
 
+    /// Enemies and projectiles, rebuilt from scratch every frame out of the
+    /// interpolated draw items the session hands over. One Manual Object per
+    /// draw layer holds the whole batch, so a thousand enemies cost one draw
+    /// call each instead of one entity each.
+    void render_entities(const std::vector<EntityDrawItem>& items);
+
 private:
     void createRoot();
     bool oneTimeConfig();
@@ -77,6 +84,7 @@ private:
     void build_scene();
     void build_grid();
     void build_camera();
+    void build_combat_batches();
 
     /// The orthographic viewport is a fixed 80 x 45 units, so the window is
     /// forced to the matching 16:9 aspect ratio to avoid stretching.
@@ -92,6 +100,13 @@ private:
     Ogre::ManualObject* grid_ = nullptr;
     std::unique_ptr<MeshFactory> meshes_;
     InputState* input_ = nullptr;
+
+    /// The three per-frame combat batches. Each is a single Manual Object
+    /// whose dynamic vertex buffer is rewritten every frame; see
+    /// render_entities().
+    Ogre::ManualObject* enemy_bodies_ = nullptr;
+    Ogre::ManualObject* enemy_bars_ = nullptr;
+    Ogre::ManualObject* projectiles_ = nullptr;
 
     std::function<void(float)> tick_;
     bool quit_ = false;
