@@ -184,6 +184,19 @@ bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out)
     out.proj_count = counts[2];
     out.gem_count = counts[3];
 
+    // The counts come off the wire, so they are attacker-controlled: a header
+    // claiming 65,535 of each record would otherwise make the decoder allocate
+    // megabytes before it discovers the bytes are not there. The records are
+    // fixed size, so a well-formed payload carries exactly this many bytes after
+    // the fixed header — anything else is a header/record mismatch, and nothing
+    // is reserved until that is settled. The arithmetic is in size_t and the
+    // counts are u16, so it cannot overflow.
+    const size_t needed = static_cast<size_t>(out.player_count) * kPlayerRecordSize +
+                          static_cast<size_t>(out.enemy_count) * kEnemyRecordSize +
+                          static_cast<size_t>(out.proj_count) * kProjRecordSize +
+                          static_cast<size_t>(out.gem_count) * kGemRecordSize;
+    if (r.remaining() != needed) return false;
+
     out.players.resize(out.player_count);
     for (PlayerNet& p : out.players)
     {
@@ -219,7 +232,10 @@ bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out)
         if (!r.skip(1)) return false;  // reserved, keeps GemNet 12 bytes like the rest
     }
 
-    return true;
+    // A payload longer than the records it declares is a framing error, not
+    // something to silently ignore: accepting it would hide a header/record
+    // mismatch and leave the reader out of step on the next packet.
+    return r.remaining() == 0;
 }
 
 bool seq_at_or_before(uint32_t a, uint32_t b)

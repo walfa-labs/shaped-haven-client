@@ -41,6 +41,15 @@ constexpr size_t kHeaderSize = 7;
 constexpr size_t kMaxNameLength = 16;
 constexpr size_t kMaxPlayers = 4;
 
+/// PROTOCOL.md fixed sizes: the snapshot's fixed header, and one record of each
+/// trailing array. The decoder uses these to size-check the counts before it
+/// trusts them enough to allocate.
+constexpr size_t kSnapshotHeaderSize = 37;  // 3 x u32 + 4 x u32 + u8 + 4 x u16
+constexpr size_t kPlayerRecordSize = 8;
+constexpr size_t kEnemyRecordSize = 12;
+constexpr size_t kProjRecordSize = 12;
+constexpr size_t kGemRecordSize = 12;
+
 enum class GameState : uint8_t {
     Running = 0,
     LevelUpPause = 1,

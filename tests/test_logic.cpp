@@ -10,6 +10,7 @@
 #include "prediction.h"
 #include "protocol.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -246,6 +247,96 @@ void test_snapshot_packet()
     std::vector<uint8_t> truncated(payload.begin(), payload.end() - 1);
     haven::SnapshotFull broken{};
     expect(!haven::decode_snapshot_full(truncated.data(), truncated.size(), broken), "truncated snapshot is rejected");
+}
+
+/// The counts in a snapshot header come off the wire, so they are
+/// attacker-controlled: the decoder must size-check them against the bytes it
+/// actually received before it reserves anything, and it must not accept a
+/// payload longer than the records it declares.
+void test_snapshot_decoder_validation()
+{
+    std::printf("snapshot decoder validation\n");
+
+    // A minimal but complete payload: one player and one enemy.
+    auto build = []() {
+        std::vector<uint8_t> payload;
+        auto u8 = [&](uint8_t v) { payload.push_back(v); };
+        auto u16 = [&](uint16_t v) { payload.push_back(v & 0xFF); payload.push_back((v >> 8) & 0xFF); };
+        auto i16 = [&](int16_t v) { u16(static_cast<uint16_t>(v)); };
+        auto u32 = [&](uint32_t v) { for (int s = 0; s < 32; s += 8) payload.push_back((v >> s) & 0xFF); };
+
+        u32(600); u32(0); u32(1000);
+        u32(0); u32(0); u32(0); u32(0);
+        u8(0);
+        u16(1);  // players
+        u16(1);  // enemies
+        u16(0);  // projectiles
+        u16(0);  // gems
+        // PlayerNet
+        u8(0); u8(1); i16(0); i16(0); u8(0); u8(100);
+        // EnemyNet
+        u32(7); u8(0); u8(0); i16(0); i16(0); u8(0); u8(100);
+        return payload;
+    };
+    const size_t counts_offset = 29;
+    const size_t enemy_count_offset = counts_offset + 2;
+
+    std::vector<uint8_t> payload = build();
+    expect(payload.size() == haven::kSnapshotHeaderSize + haven::kPlayerRecordSize + haven::kEnemyRecordSize,
+           "the fixture matches the documented record sizes");
+    haven::SnapshotFull good{};
+    expect(haven::decode_snapshot_full(payload.data(), payload.size(), good), "a complete payload decodes");
+    expect(good.players.size() == 1 && good.enemies.size() == 1, "the fixture arrays decode");
+
+    // One extra byte past the last record is a framing error, not padding.
+    std::vector<uint8_t> trailing = payload;
+    trailing.push_back(0);
+    haven::SnapshotFull with_trailing{};
+    expect(!haven::decode_snapshot_full(trailing.data(), trailing.size(), with_trailing),
+           "trailing garbage is rejected");
+    expect(with_trailing.enemies.empty(), "a rejected payload leaves nothing behind");
+
+    // An inflated count must be refused before the vector is resized: the
+    // decoder has to see that 65,535 enemy records are not in the payload.
+    for (uint16_t inflated : {static_cast<uint16_t>(2), static_cast<uint16_t>(1000),
+                              static_cast<uint16_t>(65535)})
+    {
+        std::vector<uint8_t> lying = payload;
+        lying[enemy_count_offset] = static_cast<uint8_t>(inflated & 0xFF);
+        lying[enemy_count_offset + 1] = static_cast<uint8_t>((inflated >> 8) & 0xFF);
+        haven::SnapshotFull rejected{};
+        expect(!haven::decode_snapshot_full(lying.data(), lying.size(), rejected),
+               "a count larger than the payload is rejected");
+        expect(rejected.enemies.capacity() == 0,
+               "the rejected count never reached a resize, so nothing was allocated for it");
+    }
+
+    // Every count is checked, not only the enemy one.
+    for (size_t field = 0; field < 4; ++field)
+    {
+        std::vector<uint8_t> lying = payload;
+        lying[counts_offset + field * 2] = 0xFF;
+        lying[counts_offset + field * 2 + 1] = 0xFF;
+        haven::SnapshotFull rejected{};
+        expect(!haven::decode_snapshot_full(lying.data(), lying.size(), rejected),
+               "an inflated count is rejected for every array");
+    }
+
+    // A header that claims fewer records than the payload carries is just as
+    // wrong as one that claims more.
+    std::vector<uint8_t> short_counts = payload;
+    short_counts[enemy_count_offset] = 0;
+    short_counts[enemy_count_offset + 1] = 0;
+    haven::SnapshotFull understated{};
+    expect(!haven::decode_snapshot_full(short_counts.data(), short_counts.size(), understated),
+           "an understated count leaves unread bytes and is rejected");
+
+    // The declared bytes must be exactly what the header describes: a payload
+    // cut short of its last record is rejected too.
+    std::vector<uint8_t> cut(payload.begin(), payload.end() - 1);
+    haven::SnapshotFull short_payload{};
+    expect(!haven::decode_snapshot_full(cut.data(), cut.size(), short_payload),
+           "a payload one byte short of its records is rejected");
 }
 
 void test_interpolation_is_continuous_between_snapshots()
@@ -549,6 +640,70 @@ void test_arc_and_hp_bar()
                "arc is symmetric about the aim direction");
 }
 
+/// Checks the *triangles*, not just the ring they are built from.
+///
+/// An arc is a fan from the centre into `segments + 1` ring vertices, so the
+/// two ring indices of triangle `i` have to be the consecutive pair `i` and
+/// `i + 1`. The first implementation wrapped the second index with
+/// `% segments` — correct for a closed circle, wrong for an open wedge — which
+/// left the final interval unpainted and drew a stray sliver from the last ring
+/// vertex back to the first. Checking the first and last ring vertices cannot
+/// see either symptom, so this walks the index buffer.
+void test_arc_triangulation()
+{
+    std::printf("arc triangulation\n");
+    const uint32_t segments = 4;
+    const float radius = 3.5f;
+    RecordingSink arc;
+    haven::append_arc(arc, {0.0f, 0.0f}, radius, 0.0f, kPi * 0.5f, 0.0f, segments);
+
+    const uint32_t ring_vertices = segments + 1;
+    expect(arc.vertices.size() == (1 + ring_vertices) * 3, "arc emits a centre and segments+1 ring vertices");
+    expect(arc.indices.size() == segments * 3, "arc emits one triangle per interval");
+
+    // Every triangle is a fan triangle over one consecutive pair of ring
+    // vertices, and those pairs must be exactly the intervals 1..segments.
+    std::vector<uint32_t> interval_starts;
+    for (size_t t = 0; t + 2 < arc.indices.size(); t += 3)
+    {
+        const uint32_t a = arc.indices[t];
+        const uint32_t b = arc.indices[t + 1];
+        const uint32_t c = arc.indices[t + 2];
+        expect(a == 0, "every fan triangle starts at the centre vertex");
+        const uint32_t lo = std::min(b, c);
+        const uint32_t hi = std::max(b, c);
+        expect(hi <= ring_vertices, "no triangle indexes past the ring");
+        expect(hi == lo + 1, "each triangle spans one consecutive pair of ring vertices");
+        interval_starts.push_back(lo);
+    }
+    std::sort(interval_starts.begin(), interval_starts.end());
+    interval_starts.erase(std::unique(interval_starts.begin(), interval_starts.end()), interval_starts.end());
+    expect(interval_starts.size() == segments, "no interval is covered twice");
+    bool covers_every_interval = interval_starts.size() == segments;
+    for (uint32_t i = 0; covers_every_interval && i < segments; ++i)
+        covers_every_interval = interval_starts[i] == 1 + i;
+    expect(covers_every_interval, "the triangles cover ring intervals 1..segments in order");
+    expect(!interval_starts.empty() && interval_starts.back() == segments,
+           "the final interval is covered, not folded back onto the first ring vertex");
+
+    // The fan's area is the sum of its intervals, and every triangle has to turn
+    // the same way: a folded triangle would cancel part of the total out.
+    float signed_area = 0.0f;
+    for (size_t t = 0; t + 2 < arc.indices.size(); t += 3)
+    {
+        const auto vx = [&arc](uint32_t i) { return arc.vertices[static_cast<size_t>(i) * 3]; };
+        const auto vy = [&arc](uint32_t i) { return arc.vertices[static_cast<size_t>(i) * 3 + 1]; };
+        const uint32_t a = arc.indices[t];
+        const uint32_t b = arc.indices[t + 1];
+        const uint32_t c = arc.indices[t + 2];
+        signed_area += (vx(b) - vx(a)) * (vy(c) - vy(a)) - (vy(b) - vy(a)) * (vx(c) - vx(a));
+    }
+    const float step = (kPi * 0.5f) / static_cast<float>(segments);
+    expect_near(signed_area * 0.5f,
+                0.5f * radius * radius * static_cast<float>(segments) * std::sin(step), 1e-3f,
+                "the fan area is the sum of its intervals");
+}
+
 void test_enemy_body_and_hp_bar()
 {
     std::printf("enemy body and hp bar\n");
@@ -704,6 +859,29 @@ void test_projectile_shapes()
     arrow_item.shape = 1;
     haven::append_projectile(arrow, arrow_item);
     expect_near(arrow.vertices.size(), 11 * 3, 0.0f, "a 10 segment arrow emits 11 vertices");
+
+    // A shape byte this client does not know must still draw something: an
+    // invisible live projectile reads as a desync. The fallback is the body
+    // circle, which the arc weapons need a radius floor for.
+    const uint8_t unknown_shapes[] = {3, 7, 200, 255};
+    for (uint8_t shape : unknown_shapes)
+    {
+        RecordingSink fallback;
+        haven::EntityDrawItem unknown_item = sword_item;
+        unknown_item.shape = shape;
+        haven::append_projectile(fallback, unknown_item);
+        expect(fallback.vertices.size() == 11 * 3, "an unknown shape draws the fallback circle");
+        expect_near(fallback.vertices[0], unknown_item.pos.x, 1e-6f, "the fallback is centred on the projectile");
+        expect(fallback.vertices[3] > 0.0f, "the fallback has a visible radius even for a zero radius weapon");
+
+        // A projectile weapon keeps its own radius in the fallback.
+        RecordingSink gun_fallback;
+        haven::EntityDrawItem gun_item = unknown_item;
+        gun_item.style = 3;
+        haven::append_projectile(gun_fallback, gun_item);
+        expect_near(gun_fallback.vertices[3], haven::weapon_visual(3).radius, 1e-6f,
+                    "a projectile weapon keeps its own radius in the fallback");
+    }
 }
 
 void test_collect_draw_items()
@@ -755,6 +933,14 @@ void test_collect_draw_items()
     }
     expect(found_enemy, "the enemy is drawn");
     expect(found_projectile, "the projectile is drawn");
+
+    // The per-frame hot path fills a caller-owned vector instead of returning a
+    // fresh one, and must clear it rather than append across frames.
+    std::vector<haven::EntityDrawItem> reused;
+    haven::collect_draw_items(buffer, reused);
+    expect(reused.size() == 2, "the in-place collector fills the caller's vector");
+    haven::collect_draw_items(buffer, reused);
+    expect(reused.size() == 2, "a second in-place collect clears rather than appends");
 }
 
 void test_empty_buffer_collects_nothing()
@@ -935,6 +1121,7 @@ int main()
     test_input_packet();
     test_welcome_packet();
     test_snapshot_packet();
+    test_snapshot_decoder_validation();
     test_sequence_numbers();
     test_input_history();
     test_prediction();
@@ -949,6 +1136,7 @@ int main()
     test_entity_keys();
     test_circle_and_triangle_primitives();
     test_arc_and_hp_bar();
+    test_arc_triangulation();
     test_enemy_body_and_hp_bar();
     test_enemy_radius_and_shape_tables();
     test_colour_slots();

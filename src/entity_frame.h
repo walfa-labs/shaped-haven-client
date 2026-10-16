@@ -234,4 +234,8 @@ uint8_t hp_fill_bucket(float hp_pct);
 /// style comes from the newest snapshot that carried the entity.
 std::vector<EntityDrawItem> collect_draw_items(const class InterpolationBuffer& buffer);
 
+/// As above, but appends into a caller-owned vector so the per-frame hot path
+/// does not allocate. `items` is cleared first, and its capacity is reused.
+void collect_draw_items(const class InterpolationBuffer& buffer, std::vector<EntityDrawItem>& items);
+
 }  // namespace haven

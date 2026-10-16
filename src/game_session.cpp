@@ -118,14 +118,23 @@ void GameSession::step_fixed()
 
 void GameSession::drain_packets()
 {
-    std::vector<std::vector<uint8_t>> packets;
-    net_.poll(packets);
-    for (const std::vector<uint8_t>& packet : packets)
+    packets_.clear();
+    net_.poll(packets_);
+    for (const std::vector<uint8_t>& packet : packets_)
     {
         PacketHeader header{};
         if (!decode_header(packet.data(), packet.size(), header)) continue;
         const uint8_t* payload = packet.data() + kHeaderSize;
         const size_t payload_len = packet.size() - kHeaderSize;
+        // The framing in net_client hands over exactly header + payload_len
+        // bytes, so a mismatch means one of the two is lying. Decoding it
+        // anyway would mean reading a record stream whose length the header
+        // does not describe.
+        if (header.payload_len != payload_len)
+        {
+            ++stats_.malformed_packets;
+            continue;
+        }
         if (static_cast<uint8_t>(MsgType::S2C_WELCOME) == header.msg_type)
             handle_welcome(payload, payload_len);
         else if (static_cast<uint8_t>(MsgType::S2C_SNAPSHOT_FULL) == header.msg_type)
@@ -154,7 +163,8 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
     SnapshotFull snapshot{};
     if (!decode_snapshot_full(payload, len, snapshot))
     {
-        std::fprintf(stderr, "haven: malformed S2C_SNAPSHOT_FULL\n");
+        ++stats_.malformed_packets;
+        std::fprintf(stderr, "haven: malformed S2C_SNAPSHOT_FULL (%zu bytes)\n", len);
         return;
     }
 
@@ -170,7 +180,12 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
     }
     stats_.server_tick = snapshot.server_tick;
 
-    RenderSnapshot render{};
+    // Reused, not rebuilt: clearing the maps keeps their buckets, so the only
+    // allocation left in this path is the one InterpolationBuffer::push makes
+    // for the copy it stores.
+    RenderSnapshot& render = pending_snapshot_;
+    render.positions.clear();
+    render.styles.clear();
     render.run_time_ms = snapshot.run_time_ms;
 
     // Every stream goes into one interpolation buffer, so each is stored under
@@ -240,39 +255,43 @@ void GameSession::update_entities()
 {
     if (!stats_.welcomed) return;
 
-    const std::vector<EntityDrawItem> items = collect_draw_items(interpolation_);
+    collect_draw_items(interpolation_, draw_items_);
 
-    std::vector<EntityDrawItem> combat;
-    std::unordered_set<uint32_t> present_remotes;
-    for (const EntityDrawItem& item : items)
+    // Two buffers, swapped rather than rebuilt: `present_remotes_` collects the
+    // remote players seen this frame, and after the diff the two sets swap so
+    // both keep the buckets the larger of them needed.
+    present_remotes_.clear();
+    combat_items_.clear();
+    combat_items_.reserve(draw_items_.size());
+    for (const EntityDrawItem& item : draw_items_)
     {
         if (item.kind != EntityKind::Player)
         {
-            combat.push_back(item);
+            combat_items_.push_back(item);
             continue;
         }
         const uint32_t id = key_raw_id(item.key);
         if (id == stats_.player_id) continue;
-        present_remotes.insert(id);
+        present_remotes_.insert(id);
         renderer_.set_remote_player(static_cast<uint8_t>(id), item.pos);
     }
 
     for (uint32_t id : known_remotes_)
-        if (present_remotes.find(id) == present_remotes.end()) renderer_.remove_player(id);
-    known_remotes_ = std::move(present_remotes);
+        if (present_remotes_.find(id) == present_remotes_.end()) renderer_.remove_player(id);
+    known_remotes_.swap(present_remotes_);
 
-    renderer_.render_entities(combat);
+    renderer_.render_entities(combat_items_);
 
     size_t enemies = 0;
     size_t projectiles = 0;
-    for (const EntityDrawItem& item : combat)
+    for (const EntityDrawItem& item : combat_items_)
     {
         if (item.kind == EntityKind::Enemy) ++enemies;
         else if (item.kind == EntityKind::Projectile) ++projectiles;
     }
     stats_.enemy_count = enemies;
     stats_.projectile_count = projectiles;
-    stats_.remote_player_count = present_remotes.size();
+    stats_.remote_player_count = known_remotes_.size();
 }
 
 void GameSession::shutdown()

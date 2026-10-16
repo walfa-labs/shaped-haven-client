@@ -23,6 +23,12 @@ uint32_t arc_segments(float arc)
     return std::max(2u, std::min(segments, 24u));
 }
 
+/// Radius of the marker drawn for a projectile whose `shape` byte this client
+/// does not recognise and whose weapon carries no body radius of its own. The
+/// arc weapons report a radius of zero, so a bare `weapon.radius` fallback would
+/// draw nothing at all.
+constexpr float kUnknownShapeRadius = 0.30f;
+
 /// Ring of `segments` vertices on the unit circle, counter-clockwise starting
 /// at `start`, stepping by `span / segments`. Used for closed circles, where
 /// the last vertex is not repeated.
@@ -46,6 +52,18 @@ void emit_arc_ring(PrimitiveSink& sink, Vec2 centre, float radius, float z, uint
         const float a = start + span * (static_cast<float>(i) / static_cast<float>(segments));
         sink.vertex(centre.x + radius * std::cos(a), centre.y + radius * std::sin(a), z);
     }
+}
+
+/// Fills an open wedge from the centre vertex at `base` into `segments`
+/// triangles. The ring has `segments + 1` vertices, so the two ring indices of
+/// triangle `i` are the consecutive pair `i` and `i + 1`: every interval is
+/// covered exactly once and no triangle folds back onto the first ring vertex.
+/// (Wrapping the second index with `% segments` — correct for a closed ring —
+/// would leave the final interval uncovered and draw a stray sliver instead.)
+void fan_arc(PrimitiveSink& sink, uint32_t base, uint32_t segments)
+{
+    for (uint32_t i = 0; i < segments; ++i)
+        sink.triangle(base, base + 1 + i, base + 2 + i);
 }
 
 }  // namespace
@@ -81,10 +99,7 @@ void append_arc(PrimitiveSink& sink, Vec2 centre, float radius, float direction,
     const uint32_t base = sink.base_index();
     sink.vertex(centre.x, centre.y, z);
     emit_arc_ring(sink, centre, radius, z, segments, direction - arc * 0.5f, arc);
-    for (uint32_t i = 0; i < segments; ++i)
-    {
-        sink.triangle(base, base + 1 + i, base + 1 + ((i + 1) % segments));
-    }
+    fan_arc(sink, base, segments);
 }
 
 void append_quad(PrimitiveSink& sink, Vec2 centre, Vec2 half_extents, float angle, float z)
@@ -234,9 +249,8 @@ void append_enemy_bar(PrimitiveSink& sink, const EntityDrawItem& item)
 void append_projectile(PrimitiveSink& sink, const EntityDrawItem& item)
 {
     const WeaponVisual& weapon = weapon_visual(item.style);
-    const ProjShape shape = static_cast<ProjShape>(item.shape);
 
-    switch (shape)
+    switch (static_cast<ProjShape>(item.shape))
     {
         case ProjShape::Arc:
         {
@@ -244,27 +258,47 @@ void append_projectile(PrimitiveSink& sink, const EntityDrawItem& item)
             // the direction it was fired in.
             append_arc(sink, item.pos, weapon.reach, item.angle, weapon.arc, kZProjectile,
                       arc_segments(weapon.arc));
-            break;
+            return;
         }
         case ProjShape::Circle:
             append_circle(sink, item.pos, weapon.radius, kZProjectile, 10);
-            break;
+            return;
         case ProjShape::Ray:
+        {
             // A rectangle running from the muzzle to the end of its reach.
             const float half_length = weapon.reach * 0.5f;
             append_quad(sink, Vec2{item.pos.x + std::cos(item.angle) * half_length,
                                    item.pos.y + std::sin(item.angle) * half_length},
                         Vec2{half_length, weapon.radius}, item.angle, kZProjectile);
-            break;
+            return;
+        }
     }
+
+    // A `shape` byte this client does not know: a newer server, or a corrupt
+    // payload. Drawing nothing would make a live projectile invisible, which
+    // reads as a desync, so fall back to the body circle. A projectile weapon
+    // already has a body radius to use; the arc weapons carry a radius of zero
+    // — their reach lives in `reach` — so the fallback needs a floor of its own.
+    const float radius = weapon.radius > 0.0f ? weapon.radius : kUnknownShapeRadius;
+    append_circle(sink, item.pos, radius, kZProjectile, 10);
 }
 
 std::vector<EntityDrawItem> collect_draw_items(const InterpolationBuffer& buffer)
 {
     std::vector<EntityDrawItem> items;
+    collect_draw_items(buffer, items);
+    return items;
+}
+
+void collect_draw_items(const InterpolationBuffer& buffer, std::vector<EntityDrawItem>& items)
+{
+    // The buffer is rewritten from scratch each frame, so the caller's vector is
+    // cleared rather than replaced: a steady 1,000 entity load then reuses one
+    // allocation instead of taking a fresh one every frame.
+    items.clear();
     const std::unordered_map<uint32_t, Vec2>& positions = buffer.latest_positions();
     const std::unordered_map<uint32_t, EntityStyle>& styles = buffer.latest_styles();
-    if (positions.empty() || styles.empty()) return items;
+    if (positions.empty() || styles.empty()) return;
 
     items.reserve(positions.size());
     for (const auto& entry : positions)
@@ -287,7 +321,6 @@ std::vector<EntityDrawItem> collect_draw_items(const InterpolationBuffer& buffer
         item.shape = style->second.shape;
         items.push_back(item);
     }
-    return items;
 }
 
 }  // namespace haven

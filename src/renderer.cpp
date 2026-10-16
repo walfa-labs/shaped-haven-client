@@ -37,13 +37,14 @@ constexpr uint32_t kMaxEnemies = 4096;
 constexpr uint32_t kMaxProjectiles = 2048;
 
 /// Vertices and indices per entity: a 16 segment circle fan is the worst case
-/// for a body, two quads make up an HP bar, and a 24 segment arc is the
-/// worst case for a projectile.
+/// for a body, two quads make up an HP bar, and a projectile is worst as an arc
+/// at the 24 segment cap `arc_segments()` applies — a centre vertex plus
+/// `segments + 1` ring vertices, i.e. 26.
 constexpr uint32_t kVertsPerEnemyBody = 17;
 constexpr uint32_t kVertsPerEnemyBar = 8;
 constexpr uint32_t kIndicesPerEnemyBody = 48;
 constexpr uint32_t kIndicesPerEnemyBar = 12;
-constexpr uint32_t kVertsPerProjectile = 25;
+constexpr uint32_t kVertsPerProjectile = 26;
 constexpr uint32_t kIndicesPerProjectile = 72;
 
 Ogre::ColourValue colour(float r, float g, float b)

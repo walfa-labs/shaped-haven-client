@@ -10,6 +10,7 @@
 #include <cstdint>
 #include <string>
 #include <unordered_set>
+#include <vector>
 
 namespace haven {
 
@@ -25,6 +26,9 @@ struct SessionStats {
     uint32_t stale_snapshots = 0;
     uint32_t send_failures = 0;
     uint32_t snapshots_received = 0;
+    /// Packets whose header disagreed with the bytes actually delivered, or
+    /// whose snapshot payload was rejected by the decoder.
+    uint32_t malformed_packets = 0;
     uint32_t reconcile_count = 0;
     float last_prediction_error = 0.0f;
     Vec2 predicted;
@@ -75,6 +79,16 @@ private:
     /// Remote player ids drawn on the previous frame, so a player who left
     /// has its SceneNode destroyed.
     std::unordered_set<uint32_t> known_remotes_;
+
+    // Per-frame scratch, owned by the session rather than built on the stack:
+    // at 1,000 enemies a fresh vector or set every frame is a megabyte a second
+    // of pure allocator traffic. Every one of these is cleared, never rebuilt,
+    // so its capacity survives from frame to frame.
+    std::vector<EntityDrawItem> draw_items_;
+    std::vector<EntityDrawItem> combat_items_;
+    std::unordered_set<uint32_t> present_remotes_;
+    std::vector<std::vector<uint8_t>> packets_;
+    RenderSnapshot pending_snapshot_;
 
     float accumulator_ = 0.0f;
     uint64_t session_token_ = 0;
