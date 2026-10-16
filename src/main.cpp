@@ -4,6 +4,12 @@
 
 #include <OgreRoot.h>
 
+// winsock2.h pulls in windows.h, which defines min/max as macros.
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <winsock2.h>
+
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -11,7 +17,6 @@
 #include <string>
 #include <thread>
 #include <vector>
-#include <winsock2.h>
 
 namespace {
 
@@ -20,9 +25,21 @@ struct WinsockScope {
     WinsockScope()
     {
         WSADATA data{};
-        ::WSAStartup(MAKEWORD(2, 2), &data);
+        if (::WSAStartup(MAKEWORD(2, 2), &data) != 0)
+        {
+            std::fprintf(stderr, "haven: WSAStartup failed: %d\n", ::WSAGetLastError());
+            available_ = false;
+        }
     }
-    ~WinsockScope() { ::WSACleanup(); }
+    ~WinsockScope()
+    {
+        if (available_) ::WSACleanup();
+    }
+
+    bool available() const { return available_; }
+
+private:
+    bool available_ = true;
 };
 
 void print_usage(const char* argv0)
@@ -71,6 +88,11 @@ int main(int argc, char** argv)
     if (!screenshot.empty() && frame_limit == 0) frame_limit = 120;
 
     WinsockScope winsock;
+    if (!winsock.available())
+    {
+        std::fprintf(stderr, "haven: Winsock is unavailable, cannot connect\n");
+        return 1;
+    }
 
     std::vector<haven::Vec2> scripted_moves;
     if (!input_script.empty() && !haven::load_input_script(input_script, scripted_moves))
@@ -93,7 +115,7 @@ int main(int argc, char** argv)
 
     haven::NetClient net;
     haven::GameSession session(renderer, net, input);
-    if (!session.connect(host, port))
+    if (!session.connect(host, port, name))
     {
         std::fprintf(stderr, "haven: could not connect to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
         return 1;
@@ -110,10 +132,13 @@ int main(int argc, char** argv)
         {
             const haven::SessionStats& s = session.stats();
             std::printf("haven: frame=%d tick=%u srv_tick=%u acked=%u pred=(%.2f,%.2f) err=%.3f "
-                        "interp=%zu remotes=%zu snaps=%u inputs=%u reconciles=%u key=%d move=(%.2f,%.2f)\n",
+                        "interp=%zu remotes=%zu snaps=%u stale=%u inputs=%u qdropped=%u prewelcome=%u "
+                        "disconnected=%u sendfail=%u reconciles=%u key=%d move=(%.2f,%.2f)\n",
                         frames, s.client_tick, s.server_tick, s.last_acked_seq, s.predicted.x, s.predicted.y,
                         s.last_prediction_error, s.interpolation_depth, s.remote_player_count, s.snapshots_received,
-                        s.inputs_sent, s.reconcile_count, input.last_key(), s.last_move.x, s.last_move.y);
+                        s.stale_snapshots, s.inputs_sent, net.send_dropped(), s.pre_welcome_steps,
+                        s.disconnected_steps, s.send_failures, s.reconcile_count, input.last_key(), s.last_move.x,
+                        s.last_move.y);
         }
 
         if (frame_limit > 0 && frames >= frame_limit)

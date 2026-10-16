@@ -19,14 +19,26 @@ struct RenderSnapshot {
 /// Holds the newest snapshots and answers "where should entity `id` be drawn
 /// right now?" for a render time 100 ms behind the newest snapshot
 /// (DESIGN.md section 2).
+///
+/// The render time is anchored to a local clock that the caller advances once
+/// per rendered frame via advance(), not to the newest snapshot's timestamp.
+/// Anchoring it to the snapshot froze the render time between arrivals, so
+/// sample() returned an identical position for every frame in an interval and
+/// then jumped once per snapshot — visibly stepped remote motion. Anchoring it
+/// to the render clock keeps remote motion continuous at the display rate.
 class InterpolationBuffer {
 public:
     static constexpr float kDelayMs = kInterpolationDelaySeconds * 1000.0f;
     static constexpr size_t kCapacity = 32;
 
+    /// Advances the render clock. Call once per rendered frame with the frame
+    /// delta in seconds.
+    void advance(float dt_seconds);
+
+    /// Records a snapshot as arriving at the current render-clock time.
     void push(const RenderSnapshot& snapshot);
 
-    /// Render timestamp used for the newest snapshot in the buffer.
+    /// Render timestamp carried by the newest snapshot.
     uint32_t latest_time_ms() const;
     size_t size() const { return snapshots_.size(); }
     void clear();
@@ -34,9 +46,14 @@ public:
     /// Positions carried by the newest snapshot, keyed by entity id.
     const std::unordered_map<uint32_t, Vec2>& latest_positions() const;
 
-    /// Interpolates the position of `entity_id` at
-    /// `t_render = latest_time_ms - kDelayMs`. Returns false when the buffer
-    /// does not span that time yet or the entity is unknown.
+    /// Render time expressed in snapshot (server) milliseconds: the newest
+    /// snapshot's timestamp plus the wall time elapsed since it arrived, minus
+    /// the interpolation delay. Negative until the buffer has filled.
+    int64_t render_time_ms() const;
+
+    /// Interpolates the position of `entity_id` at `render_time_ms()`. Returns
+    /// false when the buffer does not span that time yet or the entity is
+    /// unknown.
     bool sample(uint32_t entity_id, Vec2& out) const;
 
     /// Interpolates between two explicit snapshots; exposed for testing.
@@ -44,7 +61,13 @@ public:
                                     uint32_t entity_id, Vec2& out);
 
 private:
-    std::deque<RenderSnapshot> snapshots_;
+    struct Snapshot {
+        RenderSnapshot data;
+        uint32_t arrival_ms;
+    };
+
+    std::deque<Snapshot> snapshots_;
+    uint32_t clock_ms_ = 0;
 };
 
 /// Blend factor between two snapshots 50 ms apart.

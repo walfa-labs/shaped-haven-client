@@ -90,7 +90,7 @@ Entity records, in array order. Every record is 4-byte aligned.
 `pos_y` i2, `vel_angle` u1, `hp_pct` u1.
 
 `ProjNet` — 12 bytes: `id` u32, `owner_id` u8, `weapon_id` u8, `shape` u8,
-`pos_x` i2, `pos_y` i2, `vel_angle` u1, `reserved` u1.
+`pos_x` i2, `pos_y` i2, `vel_angle` u1.
 
 `GemNet` — 12 bytes: `id` u32, `pos_x` i2, `pos_y` i2, `xp_value` u2,
 `magnet_target_id` u1, `reserved` u1.

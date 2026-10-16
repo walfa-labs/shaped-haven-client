@@ -24,14 +24,15 @@ GameSession::GameSession(HavenRenderer& renderer, NetClient& net, InputState& in
     session_token_ = 0x53484156454E31ULL;
 }
 
-bool GameSession::connect(const std::string& host, uint16_t port)
+bool GameSession::connect(const std::string& host, uint16_t port, const std::string& name)
 {
     for (int attempt = 1; attempt <= kConnectAttempts; ++attempt)
     {
         if (net_.connect(host, port))
         {
             net_.start();
-            net_.send(encode_hello(session_token_, 0, "haven"));
+            if (!net_.send(encode_hello(session_token_, 0, name)))
+                std::fprintf(stderr, "haven: could not queue C2S_HELLO\n");
             std::printf("haven: connected to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
             return true;
         }
@@ -59,19 +60,50 @@ void GameSession::update(float dt_seconds)
     stats_.predicted = predictor_.position();
 
     drain_packets();
+
+    // The interpolation clock tracks wall time so remote motion stays
+    // continuous between snapshot arrivals.
+    interpolation_.advance(dt_seconds);
+
     renderer_.set_local_player(predictor_.position());
     update_remote_players();
+    renderer_.follow_camera(predictor_.position());
 }
 
 void GameSession::step_fixed()
 {
+    // Nothing to predict against until the server has told us who we are.
+    if (!stats_.welcomed)
+    {
+        ++stats_.pre_welcome_steps;
+        return;
+    }
+
+    // Without a live link the integrator would run away from any state
+    // reconciliation could correct, so hold position instead.
+    if (!net_.connected())
+    {
+        ++stats_.disconnected_steps;
+        return;
+    }
+
     const Vec2 move = input_.move_vector();
     stats_.last_move = move;
-    const Vec2 pos = predictor_.step(move);
-    renderer_.set_local_player(pos);
 
-    const uint32_t seq = predictor_.last_seq();
-    net_.send(encode_input(seq, client_tick_, move, 0, 0));
+    // Reserve the sequence number the predictor is about to use, so the packet
+    // describes exactly the step that is about to be taken.
+    const uint32_t seq = predictor_.next_seq();
+    if (!net_.send(encode_input(seq, client_tick_, move, 0, 0)))
+    {
+        // The link went away between the connected() check above and the send.
+        // The move is lost, so do not advance the prediction either: a step the
+        // server never saw would show up as a permanent offset.
+        ++stats_.send_failures;
+        return;
+    }
+
+    predictor_.step(move);
+    renderer_.set_local_player(predictor_.position());
     ++stats_.inputs_sent;
     ++client_tick_;
 }
@@ -119,6 +151,15 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
     }
 
     ++stats_.snapshots_received;
+
+    // Snapshots must arrive in order. A stale one carries an older
+    // authoritative position, and applying it would drag the prediction
+    // backwards.
+    if (stats_.server_tick != 0 && snapshot.server_tick < stats_.server_tick)
+    {
+        ++stats_.stale_snapshots;
+        return;
+    }
     stats_.server_tick = snapshot.server_tick;
 
     RenderSnapshot render{};
@@ -126,7 +167,10 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
     for (const PlayerNet& player : snapshot.players)
         render.positions.emplace(player.id, player.pos);
 
-    // Reconcile our own prediction against the server's acknowledged input.
+    // Reconcile on every snapshot, not only when the ack advances: the server
+    // can re-send the same acked sequence with a corrected position, and the
+    // blend needs those corrections to converge instead of leaving residual
+    // error behind on repeated identical acks.
     if (stats_.welcomed && stats_.player_id < snapshot.acked_seq.size())
     {
         const uint32_t acked = snapshot.acked_seq[stats_.player_id];
@@ -134,7 +178,7 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
         for (const PlayerNet& player : snapshot.players)
             if (player.id == stats_.player_id) self = &player;
 
-        if (self != nullptr && acked != stats_.last_acked_seq)
+        if (self != nullptr)
         {
             stats_.last_acked_seq = acked;
             stats_.authoritative = self->pos;

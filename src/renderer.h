@@ -57,6 +57,11 @@ public:
     /// Local player square, driven by the prediction state.
     void set_local_player(const Vec2& pos);
 
+    /// Keeps the 80x45 viewport centred on the local player, so the action
+    /// stays in view inside the 2000x2000 arena. Called by the game loop after
+    /// it advances the player, so tracking does not lag a frame behind.
+    void follow_camera(const Vec2& pos);
+
     /// Remote players, driven by the interpolation buffer.
     void set_remote_player(uint8_t player_id, const Vec2& pos);
     void remove_player(uint8_t player_id);

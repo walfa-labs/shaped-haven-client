@@ -245,6 +245,108 @@ void test_snapshot_packet()
     expect(!haven::decode_snapshot_full(truncated.data(), truncated.size(), broken), "truncated snapshot is rejected");
 }
 
+void test_interpolation_is_continuous_between_snapshots()
+{
+    std::printf("interpolation is continuous between snapshots\n");
+    // The render clock advances on its own, so remote entities move smoothly
+    // between snapshot arrivals instead of holding still and then jumping.
+    haven::InterpolationBuffer buffer;
+    haven::RenderSnapshot a;
+    a.run_time_ms = 0;
+    a.positions = {{1, {0.0f, 0.0f}}};
+    haven::RenderSnapshot b;
+    b.run_time_ms = 50;
+    b.positions = {{1, {10.0f, 0.0f}}};
+    haven::RenderSnapshot c;
+    c.run_time_ms = 100;
+    c.positions = {{1, {20.0f, 0.0f}}};
+
+    buffer.push(a);
+    buffer.advance(0.100f);
+    buffer.push(b);
+    buffer.advance(0.100f);
+    buffer.push(c);
+
+    // t_render = 100 (newest server time) + 0 elapsed - 100 ms delay = 0.
+    haven::Vec2 first{0.0f, 0.0f};
+    haven::Vec2 second{0.0f, 0.0f};
+    haven::Vec2 third{0.0f, 0.0f};
+    expect(buffer.sample(1, first), "sample succeeds");
+    expect_near(first.x, 0.0f, 1e-6f, "render time 0 is snapshot a");
+
+    buffer.advance(0.025f);
+    expect(buffer.sample(1, second), "sample succeeds 25 ms later");
+    buffer.advance(0.025f);
+    expect(buffer.sample(1, third), "sample succeeds 50 ms later");
+
+    expect(second.x > first.x, "25 ms of render time moves the entity forward");
+    expect(third.x > second.x, "a further 25 ms moves it further");
+    expect_near(second.x, 5.0f, 1e-6f, "halfway between a and b");
+    expect_near(third.x, 10.0f, 1e-6f, "render time 50 lands on snapshot b");
+
+    // Without clock advance the answer is stable; the clock, not the snapshot
+    // set, is what drives motion.
+    haven::Vec2 again{0.0f, 0.0f};
+    expect(buffer.sample(1, again) && std::fabs(again.x - third.x) < 1e-6f,
+           "no clock advance means no movement");
+
+    // A stalled frame must not fling the render time forward.
+    const int64_t before_stall = buffer.render_time_ms();
+    buffer.advance(10.0f);
+    const int64_t after_stall = buffer.render_time_ms();
+    expect(after_stall - before_stall == 250, "a 10 s stall advances the clock by the 250 ms clamp");
+    expect(!buffer.sample(1, again),
+           "running past the newest snapshot reports nothing to draw, so the entity holds still");
+}
+
+void test_reconcile_repeats_identical_acks()
+{
+    std::printf("reconciliation applies repeated identical acks\n");
+    // The server may re-send the same acked sequence with a corrected position.
+    // Reconciling only when the ack advances would leave the residual error in
+    // place forever, so the client must fold every snapshot in.
+    haven::ClientPredictor predictor;
+    for (int i = 0; i < 10; ++i) predictor.step({1.0f, 0.0f});
+    const uint32_t acked = predictor.last_seq();
+    const haven::Vec2 server_pos = predictor.position() - haven::Vec2{1.0f, 0.0f};
+
+    haven::Vec2 previous = predictor.position();
+    for (int i = 0; i < 40; ++i)
+    {
+        predictor.reconcile(acked, server_pos);
+        expect(predictor.position().x < previous.x, "each identical ack blends further toward the server");
+        previous = predictor.position();
+    }
+    expect(distance(predictor.position(), server_pos) < 0.01f,
+           "repeated identical acks converge on the corrected position");
+
+    // And the history is not re-replayed: nothing is left to replay.
+    expect(predictor.history().empty(), "history is drained by the first reconcile");
+}
+
+void test_reconcile_tolerates_a_stale_ack()
+{
+    std::printf("reconciliation tolerates a stale ack\n");
+    // A stale ack is only harmful if it is paired with an inconsistent
+    // position. With a position that actually corresponds to the acked input
+    // count, replaying the remainder must land exactly where the client
+    // already is, so a repeated old ack is a no-op rather than a drag
+    // backwards.
+    haven::ClientPredictor predictor;
+    for (int i = 0; i < 10; ++i) predictor.step({1.0f, 0.0f});
+    const haven::Vec2 full = predictor.position();
+
+    const uint32_t acked = 3;
+    const haven::Vec2 position_at_ack = {static_cast<float>(acked) * 0.2f, 0.0f};
+    predictor.reconcile(acked, position_at_ack);
+    expect_near(predictor.position().x, full.x, 1e-3f, "a consistent stale ack is a no-op");
+    expect(predictor.history().size() == 10 - acked, "only the unacked tail stays in the history");
+
+    // Repeating it changes nothing further.
+    predictor.reconcile(acked, position_at_ack);
+    expect_near(predictor.position().x, full.x, 1e-3f, "a repeated consistent stale ack is still a no-op");
+}
+
 void test_sequence_numbers()
 {
     std::printf("sequence numbers\n");
@@ -520,6 +622,9 @@ int main()
     test_reconcile_replays_unacked_inputs();
     test_reconcile_blends_small_errors();
     test_interpolation();
+    test_interpolation_is_continuous_between_snapshots();
+    test_reconcile_repeats_identical_acks();
+    test_reconcile_tolerates_a_stale_ack();
     test_input_state();
     test_input_script();
 

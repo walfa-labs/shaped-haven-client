@@ -209,12 +209,13 @@ bool HavenRenderer::frameRenderingQueued(const Ogre::FrameEvent& evt)
         return true;
     }
 
-    // The camera tracks the local player so the 80x45 viewport stays centred
-    // on the action inside the 2000x2000 arena.
-    camera_node_->setPosition(local_player_node_->getPosition().x, local_player_node_->getPosition().y, 10.0f);
-
     if (tick_) tick_(evt.timeSinceLastFrame);
     return true;
+}
+
+void HavenRenderer::follow_camera(const Vec2& pos)
+{
+    if (camera_node_ != nullptr) camera_node_->setPosition(pos.x, pos.y, 10.0f);
 }
 
 void HavenRenderer::set_local_player(const Vec2& pos)

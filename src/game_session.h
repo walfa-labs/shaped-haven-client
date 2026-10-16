@@ -19,6 +19,10 @@ struct SessionStats {
     uint32_t server_tick = 0;
     uint32_t last_acked_seq = 0;
     uint32_t inputs_sent = 0;
+    uint32_t pre_welcome_steps = 0;
+    uint32_t disconnected_steps = 0;
+    uint32_t stale_snapshots = 0;
+    uint32_t send_failures = 0;
     uint32_t snapshots_received = 0;
     uint32_t reconcile_count = 0;
     float last_prediction_error = 0.0f;
@@ -35,9 +39,9 @@ class GameSession {
 public:
     GameSession(HavenRenderer& renderer, NetClient& net, InputState& input);
 
-    /// Connects, sends C2S_HELLO and starts the reader thread. Retries a few
+    /// Connects, sends C2S_HELLO and starts the socket thread. Retries a few
     /// times so a server that is still starting up does not kill the client.
-    bool connect(const std::string& host, uint16_t port);
+    bool connect(const std::string& host, uint16_t port, const std::string& name);
 
     void update(float dt_seconds);
     void shutdown();
