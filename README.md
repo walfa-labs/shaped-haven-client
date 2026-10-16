@@ -110,13 +110,16 @@ Measured on this machine (Release build, 1280x720), against the real
 `shaped-haven-server` phase-2 branch built from `phase-2-combat` and started
 with `--stress-enemies 1000 --stress-projectiles 500`:
 
-- The logic tests report **534 checks, 0 failures**.
-- A 400-frame run renders at **133.9 fps** (2.99 s), with 3.0–3.7 ms of
-  client-side work per frame, `malformed=0` and `stale=0` throughout.
-- The client draws what the server reports: **881–968 enemies and 347–463
-  projectiles** per frame over that run. The stress flag asks for 1,000 and
-  500 and the server does not quite hold them (see the server's own status
-  notes), so the counts a client sees sit below the requested target.
+- The logic tests report **544 checks, 0 failures**.
+- A 600-frame run renders at **136.0 fps** (4.41 s), with 3.5–3.8 ms of
+  client-side work per frame, `malformed=0`, `stale=0` and `qdropped=0`
+  throughout.
+- The client draws exactly what the server reports: **1,000 enemies and 500
+  projectiles** per frame, matching the stress flag. A raw probe of the same
+  server confirms every snapshot on the wire carries exactly that. An entity
+  the interpolation window does not bracket yet is held at its first-seen
+  position, so nothing is dropped and the handover to interpolation is
+  continuous.
 
 The arc wedge's triangulation is pinned by a test that walks the index buffer
 and requires every interval of the ring to be covered exactly once; the
