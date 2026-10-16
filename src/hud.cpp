@@ -13,7 +13,6 @@
 #include <OgreSceneManager.h>
 #include <OgreTechnique.h>
 
-#include <algorithm>
 #include <array>
 #include <cstdio>
 #include <map>

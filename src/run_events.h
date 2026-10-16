@@ -7,17 +7,20 @@ namespace haven {
 /// Rejects the snapshots of the run the client has just left.
 ///
 /// The client cannot tell one run's entities from another's by id — the server
-/// restarts its pools at 1 — but it can tell their clocks apart: a new run's
-/// run_time_ms restarts near zero while the dead run's snapshots carry its
-/// final, larger value. Everything the socket still holds when C2S_RESTART
-/// goes out was sent after the last snapshot the client processed, so all of it
-/// carries the dead run's frozen clock and is rejected. The boundary disarms on
-/// the first snapshot below it, and the ordinary server-tick ordering takes
-/// over from there.
+/// restarts its pools at 1 — but it can tell their clocks apart: the server
+/// resets its run clock when it starts a fresh run (`Simulation::restart` sets
+/// the tick to zero), so a new run's run_time_ms restarts near zero while the
+/// dead run's snapshots carry its final, larger value. Everything the socket
+/// still holds when C2S_RESTART goes out was sent after the last snapshot the
+/// client processed, so all of it carries the dead run's frozen clock and is
+/// rejected. The boundary disarms on the first snapshot below it, and the
+/// ordinary server-tick ordering takes over from there.
 ///
 /// This is deliberately not a counter of "the next few snapshots": a fixed
 /// budget accepts whatever arrives, which is exactly how the dead run's tail
-/// gets mistaken for the new run's baseline.
+/// gets mistaken for the new run's baseline. It does assume the server resets
+/// its run clock with the run; a server that kept counting would need a
+/// different signal, because then no clock value would distinguish the runs.
 class RestartBoundary {
 public:
     /// Records the dead run's last observed run clock and arms the boundary. A
