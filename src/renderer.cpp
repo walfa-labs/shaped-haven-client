@@ -50,6 +50,15 @@ constexpr uint32_t kIndicesPerProjectile = 72;
 constexpr uint32_t kVertsPerGem = 4;
 constexpr uint32_t kIndicesPerGem = 6;
 
+// Elite outline rings and boss telegraph boxes. A ring is one 16-segment
+// circle, worst case one per enemy in a slot; a telegraph box is four thin
+// quads, worst case one per boss in the arena's interest radius.
+constexpr uint32_t kVertsPerEliteRing = 17;
+constexpr uint32_t kIndicesPerEliteRing = 48;
+constexpr uint32_t kMaxBossesDrawn = 64;
+constexpr uint32_t kVertsPerTelegraph = 16;
+constexpr uint32_t kIndicesPerTelegraph = 24;
+
 Ogre::ColourValue colour(float r, float g, float b)
 {
     return Ogre::ColourValue(r, g, b);
@@ -260,6 +269,35 @@ void append_to_pool(ColourPool pool, PrimitiveSink& sink, const EntityDrawItem& 
         append_projectile(sink, item);
 }
 
+/// Segments in an elite outline ring: enough to read as a circle at the
+/// 80 x 45 viewport without costing a second of vertex uploads.
+constexpr uint32_t kOutlineSegments = 16;
+
+/// One elite outline ring for modifier `bit`: a filled circle slightly larger
+/// than the body, drawn just under it (and just under any inner ring), so the
+/// body and the inner rings cover the middle and only the coloured annulus
+/// shows. One concentric ring per set modifier bit reads as a multi-colour
+/// outline around the archetype's own body colour.
+void append_elite_ring(PrimitiveSink& sink, const EntityDrawItem& item, uint8_t bit)
+{
+    const float body_radius = enemy_radius(item.style);
+    const float ring_radius = body_radius + 0.10f + 0.14f * static_cast<float>(bit);
+    const float z = kZEnemy - 0.005f - 0.002f * static_cast<float>(bit);
+    append_circle(sink, item.pos, ring_radius, z, kOutlineSegments);
+}
+
+/// The boss dash warning: a red wireframe rectangle spanning the dash path
+/// ahead of the boss along its facing. DESIGN.md section 4 specifies a 1.0 s
+/// red wireframe warning box before the 22.0 u/s dash.
+void append_boss_telegraph(PrimitiveSink& sink, const EntityDrawItem& item)
+{
+    const float boss_radius = enemy_radius(item.style);
+    const Vec2 centre{item.pos.x + std::cos(item.angle) * kBossDashUnits * 0.5f,
+                       item.pos.y + std::sin(item.angle) * kBossDashUnits * 0.5f};
+    const Vec2 half_extents{kBossDashUnits * 0.5f, boss_radius + 0.6f};
+    append_wireframe_rect(sink, centre, half_extents, item.angle, kZProjectile + 0.005f, 0.18f);
+}
+
 /// The bar pool is drawn in two passes: every enemy's dark background first,
 /// then each fill in its own colour slot. Both are quads at the same depth, so
 /// the background has to be a separate section to avoid z-fighting.
@@ -301,6 +339,14 @@ void HavenRenderer::slot_capacity(ColourPool pool, uint32_t& verts, uint32_t& in
             verts = kMaxGems * kVertsPerGem;
             indices = kMaxGems * kIndicesPerGem;
             break;
+        case ColourPool::EliteOutline:
+            verts = kMaxEnemies * kVertsPerEliteRing;
+            indices = kMaxEnemies * kIndicesPerEliteRing;
+            break;
+        case ColourPool::BossTelegraph:
+            verts = kMaxBossesDrawn * kVertsPerTelegraph;
+            indices = kMaxBossesDrawn * kIndicesPerTelegraph;
+            break;
     }
 }
 
@@ -312,6 +358,8 @@ Ogre::ManualObject* HavenRenderer::pool_object(ColourPool pool)
         case ColourPool::EnemyBar: return enemy_bars_;
         case ColourPool::Projectile: return projectiles_;
         case ColourPool::Gem: return gem_bodies_;
+        case ColourPool::EliteOutline: return elite_outlines_;
+        case ColourPool::BossTelegraph: return boss_telegraph_;
     }
     return nullptr;
 }
@@ -368,6 +416,8 @@ void HavenRenderer::build_combat_batches()
         {"haven/enemy_bars", &enemy_bars_},
         {"haven/projectiles", &projectiles_},
         {"haven/gem_bodies", &gem_bodies_},
+        {"haven/elite_outlines", &elite_outlines_},
+        {"haven/boss_telegraph", &boss_telegraph_},
     };
 
     for (const Pool& pool : pools)
@@ -381,14 +431,16 @@ void HavenRenderer::build_combat_batches()
     }
 }
 
-void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items)
+void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items, uint32_t run_time_ms)
 {
     if (enemy_bodies_ == nullptr || enemy_bars_ == nullptr || projectiles_ == nullptr) return;
 
     for (size_t i = 0; i < kSlotItemCount; ++i) slot_items_[i].clear();
 
-    // Group the entities by the colour each is drawn in. An enemy appears three
-    // times over: its body, the dark background of its HP bar, and the fill.
+    // Group the entities by the colour each is drawn in. An enemy appears
+    // several times over: its body, the dark background of its HP bar, the
+    // fill, and — when it is elite — one outline ring per set modifier bit.
+    // A boss in the dash-warning window also contributes its telegraph box.
     for (const EntityDrawItem& item : items)
     {
         if (item.kind == EntityKind::Enemy)
@@ -399,6 +451,19 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items)
             slot_items_[slot_index(body)].push_back(&item);
             slot_items_[slot_index(background)].push_back(&item);
             slot_items_[slot_index(fill)].push_back(&item);
+
+            for (uint8_t bit = 0; bit < kEliteOutlineSlots; ++bit)
+            {
+                if ((item.elite_mask & (1u << bit)) == 0) continue;
+                const ColourSlot ring = slot_for_elite_outline(bit);
+                slot_items_[slot_index(ring)].push_back(&item);
+            }
+
+            if (item.style == static_cast<uint8_t>(Archetype::Boss) && boss_telegraph_active(run_time_ms))
+            {
+                const ColourSlot telegraph = slot_for_boss_telegraph();
+                slot_items_[slot_index(telegraph)].push_back(&item);
+            }
         }
         else if (item.kind == EntityKind::Projectile)
         {
@@ -420,7 +485,7 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items)
     if (camera_node_ != nullptr)
     {
         const Ogre::Vector3 cam = camera_node_->getPosition();
-        for (uint8_t pool = 0; pool < 4; ++pool)
+        for (uint8_t pool = 0; pool < kPoolCount; ++pool)
         {
             Ogre::ManualObject* object = pool_object(static_cast<ColourPool>(pool));
             if (object != nullptr)
@@ -432,7 +497,7 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items)
         }
     }
 
-    for (uint8_t pool = 0; pool < 4; ++pool)
+    for (uint8_t pool = 0; pool < kPoolCount; ++pool)
     {
         const ColourPool colour_pool = static_cast<ColourPool>(pool);
         Ogre::ManualObject* object = pool_object(colour_pool);
@@ -453,7 +518,17 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items)
 
             object->beginUpdate(batch.section);
             ManualPrimitiveSink sink(*object);
-            if (colour_pool == ColourPool::EnemyBar && slot == 0)
+            if (colour_pool == ColourPool::EliteOutline)
+            {
+                for (const EntityDrawItem* item : slot_items_[slot_index(key)])
+                    append_elite_ring(sink, *item, slot);
+            }
+            else if (colour_pool == ColourPool::BossTelegraph)
+            {
+                for (const EntityDrawItem* item : slot_items_[slot_index(key)])
+                    append_boss_telegraph(sink, *item);
+            }
+            else if (colour_pool == ColourPool::EnemyBar && slot == 0)
             {
                 for (const EntityDrawItem* item : slot_items_[slot_index(key)])
                     append_bar_background(sink, *item);

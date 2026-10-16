@@ -20,6 +20,7 @@ struct EntityStyle {
     uint8_t hp_pct = 0;  // enemies only
     uint8_t shape = 0;   // projectiles only; ProjNet shape byte
     float angle = 0.0f;  // facing, in radians
+    uint8_t elite_mask = 0;  // enemies only; one bit per elite modifier
 };
 
 /// A snapshot reduced to what the renderer needs, keyed by the namespaced

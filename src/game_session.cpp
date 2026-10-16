@@ -17,6 +17,17 @@ namespace {
 constexpr int kMaxStepsPerFrame = 8;
 constexpr int kConnectAttempts = 10;
 
+/// Finds the client's own player record in a list of decoded player records,
+/// or nullptr when the snapshot did not carry one. A stationary player can be
+/// absent from a delta's updated array, and then there is nothing to
+/// reconcile against this snapshot.
+const PlayerNet* find_self_in(const std::vector<PlayerNet>& players, uint8_t player_id)
+{
+    for (const PlayerNet& p : players)
+        if (p.id == player_id) return &p;
+    return nullptr;
+}
+
 }  // namespace
 
 GameSession::GameSession(HavenRenderer& renderer, NetClient& net, InputState& input, Hud& hud)
@@ -162,6 +173,8 @@ void GameSession::drain_packets()
             handle_welcome(payload, payload_len);
         else if (static_cast<uint8_t>(MsgType::S2C_SNAPSHOT_FULL) == header.msg_type)
             handle_snapshot(payload, payload_len);
+        else if (static_cast<uint8_t>(MsgType::S2C_SNAPSHOT_DELTA) == header.msg_type)
+            handle_delta(payload, payload_len);
         else if (static_cast<uint8_t>(MsgType::S2C_LEVELUP_OFFER) == header.msg_type)
             handle_levelup_offer(payload, payload_len);
         else if (static_cast<uint8_t>(MsgType::S2C_GAME_OVER) == header.msg_type)
@@ -367,6 +380,10 @@ void GameSession::maybe_restart()
     // buffer and the HUD start the fresh run clean. Reconciliation snaps the
     // predictor to the respawn point on the first snapshot.
     interpolation_.clear();
+    // The held baseline is reset with the run too: the server restarts its
+    // tick counter, so the old run's baseline tick names nothing in the new
+    // run, and the new run's first snapshot is a full one.
+    snapshot_state_.reset();
     renderer_.clear_remote_players();
     hud_.reset();
     evolution_watch_.reset();
@@ -399,10 +416,11 @@ void GameSession::handle_welcome(const uint8_t* payload, size_t len)
     }
     stats_.welcomed = true;
     stats_.player_id = welcome.player_id;
-    std::printf("haven: welcome player_id=%u tick_hz=%u snap_hz=%u arena_half=%u server_tick=%u\n",
+    stats_.interest_radius = welcome.interest_radius;
+    std::printf("haven: welcome player_id=%u tick_hz=%u snap_hz=%u arena_half=%u server_tick=%u interest_radius=%u\n",
                 static_cast<unsigned>(welcome.player_id), static_cast<unsigned>(welcome.tick_hz),
                 static_cast<unsigned>(welcome.snap_hz), static_cast<unsigned>(welcome.arena_half_size),
-                welcome.server_tick);
+                welcome.server_tick, static_cast<unsigned>(welcome.interest_radius));
 }
 
 void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
@@ -416,7 +434,65 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
     }
 
     ++stats_.snapshots_received;
+    ++stats_.snapshots_full;
 
+    // A full snapshot is the server's answer to a client with no usable
+    // baseline: it replaces the held state outright and its tick becomes the
+    // new baseline the next delta is diffed against.
+    if (!ingest_header(snapshot.server_tick, snapshot.run_time_ms, snapshot.game_state)) return;
+
+    send_ack(snapshot_state_.apply_full(snapshot));
+    reconcile_from(find_self_in(snapshot.players, stats_.player_id), snapshot.acked_seq);
+    push_render();
+}
+
+void GameSession::handle_delta(const uint8_t* payload, size_t len)
+{
+    SnapshotDelta delta{};
+    if (!decode_snapshot_delta(payload, len, delta))
+    {
+        ++stats_.malformed_packets;
+        std::fprintf(stderr, "haven: malformed S2C_SNAPSHOT_DELTA (%zu bytes)\n", len);
+        return;
+    }
+
+    ++stats_.snapshots_received;
+    ++stats_.snapshots_delta;
+
+    if (!ingest_header(delta.server_tick, delta.run_time_ms, delta.game_state)) return;
+
+    // A delta is applied on top of the held state only when its baseline_tick
+    // is the tick that state is complete for. One that names any other tick
+    // must not be applied: the client keeps acknowledging the state it does
+    // hold, and the server answers with a full snapshot.
+    uint32_t applied_baseline = 0;
+    const bool applicable = snapshot_state_.apply_delta(delta, applied_baseline);
+    if (applicable)
+    {
+        send_ack(applied_baseline);
+        ++stats_.deltas_applied;
+    }
+    else
+    {
+        ++stats_.deltas_rejected;
+        if (snapshot_state_.baseline().has_value()) send_ack(*snapshot_state_.baseline());
+    }
+
+    // The local player's authoritative position does not depend on the entity
+    // baseline, so reconcile from the snapshot's own record of us even when the
+    // delta itself is not applied.
+    const PlayerNet* self = find_self_in(delta.spawned_players, stats_.player_id);
+    if (self == nullptr) self = find_self_in(delta.updated_players, stats_.player_id);
+    reconcile_from(self, delta.acked_seq);
+
+    // Only an applied delta carries new world state, so only it refreshes the
+    // interpolation buffer; a refused delta leaves the render clock where it
+    // was until the full snapshot arrives.
+    if (applicable) push_render();
+}
+
+bool GameSession::ingest_header(uint32_t server_tick, uint32_t run_time_ms, GameState game_state)
+{
     // Everything still in the socket when C2S_RESTART went out was sent after
     // the last snapshot the client processed, so it carries the dead run's
     // frozen clock and its game_over state. Only a snapshot that reports the
@@ -424,113 +500,65 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
     // accepting the rest would repopulate interpolation with the dead run's
     // entities and drag the prediction back to an old position. See
     // run_events.h for why both signals are needed.
-    if (!restart_boundary_.accepts(snapshot.run_time_ms, snapshot.game_state))
+    if (!restart_boundary_.accepts(run_time_ms, game_state))
     {
         ++stats_.stale_snapshots;
-        return;
+        return false;
     }
 
     // Snapshots must otherwise arrive in order. A stale one carries an older
     // authoritative position, and applying it would drag the prediction
     // backwards.
-    if (stats_.server_tick != 0 && snapshot.server_tick < stats_.server_tick)
+    if (stats_.server_tick != 0 && server_tick < stats_.server_tick)
     {
         ++stats_.stale_snapshots;
-        return;
+        return false;
     }
 
-    // Only an accepted snapshot describes the run: a rejected one is a
-    // leftover from before the transition, and letting it set game_state or
-    // the run clock would undo that transition or put the dead run's clock
-    // back on the HUD.
-    stats_.game_state = snapshot.game_state;
-    run_time_ms_ = snapshot.run_time_ms;
-
-    accept_snapshot(snapshot);
+    // Only a snapshot that passes both checks describes the run: a rejected
+    // one is a leftover from before the transition, and letting it set
+    // game_state or the run clock would undo that transition or put the dead
+    // run's clock back on the HUD.
+    stats_.server_tick = server_tick;
+    stats_.game_state = game_state;
+    run_time_ms_ = run_time_ms;
+    return true;
 }
 
-void GameSession::accept_snapshot(const SnapshotFull& snapshot)
+void GameSession::send_ack(uint32_t tick)
 {
-    stats_.server_tick = snapshot.server_tick;
+    if (net_.send(encode_ack_snapshot(tick)))
+        ++stats_.acks_sent;
+    else
+        ++stats_.send_failures;
+}
 
-    // Reused, not rebuilt: clearing the maps keeps their buckets, so the only
-    // allocation left in this path is the one InterpolationBuffer::push makes
-    // for the copy it stores.
-    RenderSnapshot& render = pending_snapshot_;
-    render.positions.clear();
-    render.styles.clear();
-    render.run_time_ms = snapshot.run_time_ms;
-
-    // Every stream goes into one interpolation buffer, so each is stored under
-    // a key that carries its kind. Only the position is interpolated; the style
-    // travels alongside and is taken from the newest snapshot.
-    for (const PlayerNet& player : snapshot.players)
-    {
-        const uint32_t key = interpolation_key(player.id, EntityKind::Player);
-        render.positions.emplace(key, player.pos);
-        EntityStyle style;
-        style.kind = EntityKind::Player;
-        style.angle = player.vel_angle;
-        render.styles.emplace(key, style);
-    }
-
-    for (const EnemyNet& enemy : snapshot.enemies)
-    {
-        const uint32_t key = interpolation_key(enemy.id, EntityKind::Enemy);
-        render.positions.emplace(key, enemy.pos);
-        EntityStyle style;
-        style.kind = EntityKind::Enemy;
-        style.style = enemy.archetype;
-        style.hp_pct = enemy.hp_pct;
-        style.angle = enemy.vel_angle;
-        render.styles.emplace(key, style);
-    }
-
-    for (const ProjNet& proj : snapshot.projs)
-    {
-        const uint32_t key = interpolation_key(proj.id, EntityKind::Projectile);
-        render.positions.emplace(key, proj.pos);
-        EntityStyle style;
-        style.kind = EntityKind::Projectile;
-        style.style = proj.weapon_id;
-        style.shape = proj.shape;
-        style.angle = proj.vel_angle;
-        render.styles.emplace(key, style);
-    }
-
-    for (const GemNet& gem : snapshot.gems)
-    {
-        const uint32_t key = interpolation_key(gem.id, EntityKind::Gem);
-        render.positions.emplace(key, gem.pos);
-        EntityStyle style;
-        style.kind = EntityKind::Gem;
-        style.style = gem_bucket(gem.xp_value);
-        render.styles.emplace(key, style);
-    }
-
+void GameSession::reconcile_from(const PlayerNet* self, const std::array<uint32_t, kMaxPlayers>& acked_seq)
+{
     // Reconcile on every snapshot, not only when the ack advances: the server
     // can re-send the same acked sequence with a corrected position, and the
     // blend needs those corrections to converge instead of leaving residual
     // error behind on repeated identical acks.
-    if (stats_.welcomed && stats_.player_id < snapshot.acked_seq.size())
-    {
-        const uint32_t acked = snapshot.acked_seq[stats_.player_id];
-        const PlayerNet* self = nullptr;
-        for (const PlayerNet& player : snapshot.players)
-            if (player.id == stats_.player_id) self = &player;
+    if (!stats_.welcomed || self == nullptr) return;
+    if (stats_.player_id >= acked_seq.size()) return;
 
-        if (self != nullptr)
-        {
-            stats_.last_acked_seq = acked;
-            stats_.authoritative = self->pos;
-            const Vec2 before = predictor_.position();
-            predictor_.reconcile(acked, self->pos);
-            stats_.last_prediction_error = distance(before, predictor_.position());
-            ++stats_.reconcile_count;
-        }
-    }
+    const uint32_t acked = acked_seq[stats_.player_id];
+    stats_.last_acked_seq = acked;
+    stats_.authoritative = self->pos;
+    const Vec2 before = predictor_.position();
+    predictor_.reconcile(acked, self->pos);
+    stats_.last_prediction_error = distance(before, predictor_.position());
+    ++stats_.reconcile_count;
+}
 
-    interpolation_.push(render);
+void GameSession::push_render()
+{
+    // The held state is the complete world within the interest radius, so it
+    // is what goes into the interpolation buffer: an entity the server
+    // destroyed is simply absent from the newest snapshot, and the draw-item
+    // collection — which iterates the newest snapshot's positions — then does
+    // not draw it. Nothing stale survives a destroy.
+    interpolation_.push(snapshot_state_.build_render(run_time_ms_));
     stats_.interpolation_depth = interpolation_.size();
 }
 
@@ -563,7 +591,7 @@ void GameSession::update_entities()
         if (present_remotes_.find(id) == present_remotes_.end()) renderer_.remove_player(id);
     known_remotes_.swap(present_remotes_);
 
-    renderer_.render_entities(combat_items_);
+    renderer_.render_entities(combat_items_, run_time_ms_);
 
     size_t enemies = 0;
     size_t projectiles = 0;

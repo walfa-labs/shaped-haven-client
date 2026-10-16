@@ -13,6 +13,7 @@
 #include "prediction.h"
 #include "protocol.h"
 #include "run_events.h"
+#include "snapshot_state.h"
 
 #include <algorithm>
 #include <cmath>
@@ -180,6 +181,56 @@ void test_welcome_packet()
     expect(!haven::decode_welcome(truncated.data(), truncated.size(), broken), "truncated welcome is rejected");
 }
 
+/// Phase 4 grows `S2C_WELCOME` from 17 to 21 bytes: `interest_radius` u16 at
+/// offset 13 and `reserved` u16 at 15 push `server_tick` from 13 to 17. The
+/// first 13 bytes are unchanged, so both layouts decode.
+void test_welcome_packet_phase4()
+{
+    std::printf("S2C_WELCOME phase 4\n");
+    std::vector<uint8_t> payload;
+    auto append_u8 = [&](uint8_t v) { payload.push_back(v); };
+    auto append_u16 = [&](uint16_t v) { payload.push_back(v & 0xFF); payload.push_back((v >> 8) & 0xFF); };
+    auto append_u32 = [&](uint32_t v) {
+        for (int s = 0; s < 32; s += 8) payload.push_back((v >> s) & 0xFF);
+    };
+    append_u8(2);  // player_id
+    for (int s = 0; s < 64; s += 8) payload.push_back((0x1122334455667788ULL >> s) & 0xFF);
+    append_u8(60);
+    append_u8(20);
+    append_u16(1000);
+    append_u16(75);  // interest_radius
+    append_u16(0);   // reserved
+    append_u32(99999);
+
+    expect(payload.size() == 21, "the phase-4 welcome is 21 bytes");
+    haven::Welcome welcome{};
+    expect(haven::decode_welcome(payload.data(), payload.size(), welcome), "phase-4 welcome decodes");
+    expect(welcome.player_id == 2, "player_id");
+    expect(welcome.session_token == 0x1122334455667788ULL, "session_token");
+    expect(welcome.arena_half_size == 1000, "arena_half_size");
+    expect(welcome.interest_radius == 75, "interest_radius");
+    expect(welcome.server_tick == 99999, "server_tick moved to offset 17");
+    expect(welcome.has_interest_radius, "the interest-radius field is flagged present");
+
+    // The byte at offset 13 is the low byte of interest_radius, not of
+    // server_tick: reading the old layout here would give the wrong tick.
+    expect(payload[13] == 75 && payload[14] == 0, "interest_radius sits at offset 13");
+    expect(payload[17] == 0x9F && payload[18] == 0x86 && payload[19] == 0x01, "server_tick starts at offset 17");
+
+    // A 17 byte payload is still the phase-3 layout and must keep decoding, and
+    // a payload that is neither length is rejected.
+    std::vector<uint8_t> old_layout(payload.begin(), payload.begin() + 13);
+    for (int s = 0; s < 32; s += 8) old_layout.push_back(static_cast<uint8_t>((12345u >> s) & 0xFF));
+    haven::Welcome phase3{};
+    expect(haven::decode_welcome(old_layout.data(), old_layout.size(), phase3), "a 17 byte welcome still decodes");
+    expect(phase3.server_tick == 12345, "its server_tick is at offset 13");
+    expect(!phase3.has_interest_radius, "and carries no interest radius");
+
+    std::vector<uint8_t> wrong(payload.begin(), payload.end() - 1);
+    haven::Welcome broken{};
+    expect(!haven::decode_welcome(wrong.data(), wrong.size(), broken), "a 20 byte welcome is rejected");
+}
+
 void test_snapshot_packet()
 {
     std::printf("S2C_SNAPSHOT_FULL\n");
@@ -341,6 +392,220 @@ void test_snapshot_decoder_validation()
     haven::SnapshotFull short_payload{};
     expect(!haven::decode_snapshot_full(cut.data(), cut.size(), short_payload),
            "a payload one byte short of its records is rejected");
+}
+
+/// Builds a delta payload byte by byte, the way the tests build a full one, so
+/// the decoder is checked against the exact bytes PROTOCOL.md fixes.
+std::vector<uint8_t> build_delta_payload()
+{
+    std::vector<uint8_t> payload;
+    auto u8 = [&](uint8_t v) { payload.push_back(v); };
+    auto u16 = [&](uint16_t v) { payload.push_back(v & 0xFF); payload.push_back((v >> 8) & 0xFF); };
+    auto i16 = [&](int16_t v) { u16(static_cast<uint16_t>(v)); };
+    auto u32 = [&](uint32_t v) { for (int s = 0; s < 32; s += 8) payload.push_back(static_cast<uint8_t>((v >> s) & 0xFF)); };
+
+    u32(600);    // server_tick
+    u32(540);    // baseline_tick
+    u32(10000);  // run_time_ms
+    u32(9);      // acked_seq[0]
+    u32(0);
+    u32(0);
+    u32(0);
+    u8(0);       // game_state
+    u16(2);      // spawned
+    u16(1);      // updated
+    u16(1);      // destroyed
+    u16(0);      // reserved
+
+    // Spawned: one player and one enemy.
+    u8(0);                 // kind = player
+    u8(0);                 // id
+    u8(1);                 // state_flags
+    i16(haven::encode_pos(1.0f));
+    i16(haven::encode_pos(-2.0f));
+    u8(haven::encode_angle(0.25f));
+    u8(100);
+
+    u8(1);                 // kind = enemy
+    u32(55);               // id
+    u8(1);                 // archetype
+    u8(0x03);              // elite_mask: Vampiric | Shielded
+    i16(haven::encode_pos(30.0f));
+    i16(haven::encode_pos(-30.0f));
+    u8(haven::encode_angle(0.5f));
+    u8(75);
+
+    // Updated: one enemy, carrying its id then the full record. The full
+    // record is the 12 byte EnemyNet, whose own id field follows the separate
+    // id — the spec sends the id twice for an updated entity.
+    u8(1);                 // kind = enemy
+    u32(55);               // id
+    u32(55);               // the full EnemyNet record, whose own id field leads it
+    u8(1);                 // archetype
+    u8(0x03);              // elite_mask
+    i16(haven::encode_pos(31.0f));
+    i16(haven::encode_pos(-31.0f));
+    u8(haven::encode_angle(0.6f));
+    u8(70);
+
+    // Destroyed: one gem.
+    u8(3);                 // kind = gem
+    u32(77);               // id
+
+    return payload;
+}
+
+void test_snapshot_delta_packet()
+{
+    std::printf("S2C_SNAPSHOT_DELTA\n");
+    std::vector<uint8_t> payload = build_delta_payload();
+
+    haven::SnapshotDelta delta{};
+    expect(haven::decode_snapshot_delta(payload.data(), payload.size(), delta), "delta decodes");
+    expect(delta.server_tick == 600, "server_tick");
+    expect(delta.baseline_tick == 540, "baseline_tick");
+    expect(delta.run_time_ms == 10000, "run_time_ms");
+    expect(delta.acked_seq[0] == 9, "acked_seq[0]");
+    expect(delta.spawned_count == 2 && delta.updated_count == 1 && delta.destroyed_count == 1, "counts");
+    expect(delta.spawned_players.size() == 1, "one spawned player");
+    expect(delta.spawned_enemies.size() == 1, "one spawned enemy");
+    expect(delta.updated_enemies.size() == 1, "one updated enemy");
+    expect(delta.destroyed_gems.size() == 1, "one destroyed gem");
+
+    const haven::EnemyNet& spawned = delta.spawned_enemies[0];
+    expect(spawned.id == 55 && spawned.archetype == 1 && spawned.elite_mask == 0x03, "spawned enemy fields");
+    expect_near(spawned.pos.x, 30.0f, 0.01f, "spawned enemy pos.x dequantised");
+    expect(spawned.hp_pct == 75, "spawned enemy hp_pct");
+
+    const haven::EnemyNet& updated = delta.updated_enemies[0];
+    expect(updated.id == 55 && updated.hp_pct == 70, "updated enemy carries its id and full record");
+    expect_near(updated.pos.x, 31.0f, 0.01f, "updated enemy pos.x dequantised");
+
+    expect(delta.destroyed_gems[0] == 77, "destroyed gem id");
+
+    // A payload a byte short of its last record is rejected, and one with a
+    // trailing byte is a framing error rather than something to ignore.
+    std::vector<uint8_t> cut(payload.begin(), payload.end() - 1);
+    haven::SnapshotDelta short_delta{};
+    expect(!haven::decode_snapshot_delta(cut.data(), cut.size(), short_delta), "truncated delta is rejected");
+
+    std::vector<uint8_t> trailing = payload;
+    trailing.push_back(0);
+    haven::SnapshotDelta padded{};
+    expect(!haven::decode_snapshot_delta(trailing.data(), trailing.size(), padded), "trailing garbage is rejected");
+
+    // A kind byte outside 0..3 names a record type that does not exist. The
+    // first spawned record's kind byte sits right after the 37 byte header
+    // (which already includes the four counts): offset 37.
+    std::vector<uint8_t> bad_kind = payload;
+    bad_kind[37] = 4;
+    haven::SnapshotDelta rejected{};
+    expect(!haven::decode_snapshot_delta(bad_kind.data(), bad_kind.size(), rejected), "an unknown kind byte is rejected");
+    expect(rejected.spawned_enemies.empty(), "a rejected delta leaves nothing behind");
+
+    // An inflated count is caught when the reader runs off the end, not by
+    // trusting the count: the vectors only ever hold what was actually read.
+    const size_t spawned_count_offset = 29;
+    std::vector<uint8_t> lying = payload;
+    lying[spawned_count_offset] = 0xFF;
+    lying[spawned_count_offset + 1] = 0xFF;
+    haven::SnapshotDelta lying_delta{};
+    expect(!haven::decode_snapshot_delta(lying.data(), lying.size(), lying_delta), "an inflated spawned count is rejected");
+    expect(lying_delta.spawned_enemies.size() < 65535, "the inflated count never reached a resize");
+}
+
+/// The phase-4 core: the client holds exactly one complete state, a delta is
+/// applied only against the tick it holds, and a full snapshot replaces it.
+void test_snapshot_state_baseline()
+{
+    std::printf("snapshot state baseline\n");
+    haven::SnapshotState state;
+    expect(!state.baseline().has_value(), "a fresh state holds no baseline");
+    expect(state.size() == 0, "and no entities");
+
+    // A full snapshot becomes the held state and its tick the baseline.
+    haven::SnapshotFull full{};
+    full.server_tick = 100;
+    full.players.push_back(haven::PlayerNet{});
+    full.players[0].id = 0;
+    full.players[0].pos = {1.0f, 2.0f};
+    full.enemies.push_back(haven::EnemyNet{});
+    full.enemies[0].id = 7;
+    full.enemies[0].archetype = 1;
+    full.enemies[0].elite_mask = haven::kEliteVampiric;
+    full.enemies[0].pos = {3.0f, 4.0f};
+    full.gems.push_back(haven::GemNet{});
+    full.gems[0].id = 9;
+    full.gems[0].pos = {5.0f, 6.0f};
+    full.gems[0].xp_value = 10;
+
+    expect(state.apply_full(full) == 100, "apply_full returns the tick to acknowledge");
+    expect(state.baseline().has_value() && *state.baseline() == 100, "the full snapshot's tick is the baseline");
+    expect(state.size() == 3, "the held state carries every entity");
+    expect(state.contains(0, haven::EntityKind::Player), "the player is held");
+    expect(state.contains(7, haven::EntityKind::Enemy), "the enemy is held");
+    expect(state.contains(9, haven::EntityKind::Gem), "the gem is held");
+
+    // A delta against a baseline the client does not hold changes nothing.
+    haven::SnapshotDelta wrong{};
+    wrong.baseline_tick = 999;  // not the tick held
+    wrong.server_tick = 150;
+    wrong.destroyed_enemies.push_back(7);
+    uint32_t applied = 0;
+    expect(!state.apply_delta(wrong, applied), "a delta against another baseline is refused");
+    expect(state.size() == 3, "and the held state is untouched");
+    expect(state.contains(7, haven::EntityKind::Enemy), "the enemy is still there");
+
+    // A delta against the held baseline applies: spawn, update, destroy.
+    haven::SnapshotDelta delta{};
+    delta.baseline_tick = 100;
+    delta.server_tick = 103;
+    delta.spawned_enemies.push_back(haven::EnemyNet{});
+    delta.spawned_enemies[0].id = 20;
+    delta.spawned_enemies[0].archetype = 0;
+    delta.spawned_enemies[0].pos = {10.0f, 10.0f};
+    delta.updated_enemies.push_back(haven::EnemyNet{});
+    delta.updated_enemies[0].id = 7;
+    delta.updated_enemies[0].archetype = 1;
+    delta.updated_enemies[0].elite_mask = haven::kEliteVampiric | haven::kEliteHasteAura;
+    delta.updated_enemies[0].pos = {3.5f, 4.5f};
+    delta.updated_enemies[0].hp_pct = 50;
+    delta.destroyed_gems.push_back(9);
+
+    expect(state.apply_delta(delta, applied), "a delta against the held baseline applies");
+    expect(applied == 103, "and returns the new tick to acknowledge");
+    expect(*state.baseline() == 103, "the baseline advances to it");
+    expect(state.size() == 3, "one spawned, one updated, one destroyed: still three");
+    expect(state.contains(20, haven::EntityKind::Enemy), "the spawned enemy is held");
+    expect(!state.contains(9, haven::EntityKind::Gem), "the destroyed gem is gone");
+    expect(state.contains(7, haven::EntityKind::Enemy), "the updated enemy is still held");
+
+    // build_render carries the held state, elite mask included, for the
+    // interpolation buffer.
+    const haven::RenderSnapshot render = state.build_render(1234);
+    expect(render.run_time_ms == 1234, "the render carries the run clock");
+    const uint32_t enemy_key = haven::interpolation_key(7, haven::EntityKind::Enemy);
+    const auto style = render.styles.find(enemy_key);
+    expect(style != render.styles.end(), "the updated enemy has a style");
+    expect(style->second.elite_mask == (haven::kEliteVampiric | haven::kEliteHasteAura),
+           "the style carries the updated elite mask");
+    const auto pos = render.positions.find(enemy_key);
+    expect(pos != render.positions.end() && std::fabs(pos->second.x - 3.5f) < 0.01f,
+           "the render carries the updated position");
+
+    // A full snapshot replaces the held state outright, dropping anything the
+    // delta had added that the full does not carry.
+    haven::SnapshotFull second{};
+    second.server_tick = 200;
+    second.players.push_back(full.players[0]);
+    state.apply_full(second);
+    expect(*state.baseline() == 200, "the new full snapshot's tick is the baseline");
+    expect(state.size() == 1, "only what the full carries is held");
+    expect(!state.contains(20, haven::EntityKind::Enemy), "the delta-added enemy is gone");
+
+    // reset returns the state to a fresh one, which is what a restart needs.
+    state.reset();
+    expect(!state.baseline().has_value() && state.size() == 0, "reset clears the baseline and every entity");
 }
 
 void test_interpolation_is_continuous_between_snapshots()
@@ -899,6 +1164,106 @@ void test_colour_slots()
     expect(full_fill.g > background.g, "a full bar is brighter than its background");
 }
 
+void test_elite_outline_and_telegraph_slots()
+{
+    std::printf("elite outline and boss telegraph slots\n");
+    // Each modifier bit gets its own slot in the outline pool, and the slots
+    // are told apart by colour.
+    for (uint8_t bit = 0; bit < haven::kEliteOutlineSlots; ++bit)
+    {
+        const haven::ColourSlot slot = haven::slot_for_elite_outline(bit);
+        expect(slot.pool == haven::ColourPool::EliteOutline, "the ring slot is in the outline pool");
+        expect(static_cast<uint8_t>(slot.slot) == bit, "each modifier bit has its own slot");
+    }
+    haven::Rgba previous = haven::slot_colour(haven::slot_for_elite_outline(0));
+    for (uint8_t bit = 1; bit < haven::kEliteOutlineSlots; ++bit)
+    {
+        const haven::Rgba colour = haven::slot_colour(haven::slot_for_elite_outline(bit));
+        expect(colour.r != previous.r || colour.g != previous.g || colour.b != previous.b,
+               "each modifier ring colour is distinct");
+        previous = colour;
+    }
+
+    // The boss telegraph has its own pool and a single red slot.
+    const haven::ColourSlot telegraph = haven::slot_for_boss_telegraph();
+    expect(telegraph.pool == haven::ColourPool::BossTelegraph, "the telegraph slot is in its pool");
+    expect(telegraph.slot == 0, "and is the pool's only slot");
+    const haven::Rgba red = haven::slot_colour(telegraph);
+    expect(red.r > 0.9f && red.g < 0.3f && red.b < 0.3f, "the telegraph is warning red");
+
+    // The modifier bits and names line up with DESIGN.md section 4's order.
+    expect(std::string(haven::elite_name(0)) == "Vampiric", "bit 0 is Vampiric");
+    expect(std::string(haven::elite_name(1)) == "Splitter", "bit 1 is Splitter");
+    expect(std::string(haven::elite_name(2)) == "Shielded", "bit 2 is Shielded");
+    expect(std::string(haven::elite_name(3)) == "Haste Aura", "bit 3 is Haste Aura");
+    expect(haven::kEliteMaskAny == 0x0F, "the four modifiers fill the low nibble");
+
+    // The telegraph window is the 1.0 s before the dash in a 6.0 s loop.
+    expect(!haven::boss_telegraph_active(0), "the loop start is not the warning");
+    expect(!haven::boss_telegraph_active(1999), "just before the window is not the warning");
+    expect(haven::boss_telegraph_active(2000), "the window opens at 2.0 s");
+    expect(haven::boss_telegraph_active(2500), "and spans the full second");
+    expect(!haven::boss_telegraph_active(3000), "and closes at 3.0 s");
+    expect(haven::boss_telegraph_active(8500), "and repeats every 6.0 s (8.5 s is 2.5 s into the loop)");
+    expect(!haven::boss_telegraph_active(5999), "just before the loop wraps is not the warning");
+}
+
+void test_wireframe_rect()
+{
+    std::printf("wireframe rect\n");
+    // The boss telegraph box is four thin quads: 16 vertices, 24 indices, wound
+    // counter-clockwise like every other builder.
+    RecordingSink sink;
+    haven::append_wireframe_rect(sink, {10.0f, -4.0f}, {11.0f, 3.6f}, 0.0f, 0.045f, 0.18f);
+    expect(sink.vertices.size() == 16 * 3, "four quads is 16 vertices");
+    expect(sink.indices.size() == 24, "four quads is 24 indices");
+
+    // At angle 0 the box spans centre +/- half_extents on both axes, plus the
+    // stroke's own half thickness: each edge is a quad centred on the nominal
+    // edge, so it overhangs by thickness / 2.
+    const float overhang = 0.18f * 0.5f;
+    float min_x = 1e30f, max_x = -1e30f, min_y = 1e30f, max_y = -1e30f;
+    for (size_t i = 0; i < sink.vertices.size(); i += 3)
+    {
+        min_x = std::min(min_x, sink.vertices[i]);
+        max_x = std::max(max_x, sink.vertices[i]);
+        min_y = std::min(min_y, sink.vertices[i + 1]);
+        max_y = std::max(max_y, sink.vertices[i + 1]);
+    }
+    expect_near(min_x, 10.0f - 11.0f - overhang, 1e-4f, "the box reaches its left edge");
+    expect_near(max_x, 10.0f + 11.0f + overhang, 1e-4f, "the box reaches its right edge");
+    expect_near(min_y, -4.0f - 3.6f - overhang, 1e-4f, "the box reaches its bottom edge");
+    expect_near(max_y, -4.0f + 3.6f + overhang, 1e-4f, "the box reaches its top edge");
+
+    // Every triangle is wound counter-clockwise, which Ogre reads as the front
+    // face.
+    for (size_t t = 0; t + 2 < sink.indices.size(); t += 3)
+    {
+        const auto vx = [&sink](uint32_t i) { return sink.vertices[static_cast<size_t>(i) * 3]; };
+        const auto vy = [&sink](uint32_t i) { return sink.vertices[static_cast<size_t>(i) * 3 + 1]; };
+        const uint32_t a = sink.indices[t];
+        const uint32_t b = sink.indices[t + 1];
+        const uint32_t c = sink.indices[t + 2];
+        expect((vx(b) - vx(a)) * (vy(c) - vy(a)) - (vy(b) - vy(a)) * (vx(c) - vx(a)) > 0.0f,
+               "wireframe rect triangles are wound counter-clockwise");
+    }
+
+    // Rotated 90 degrees, a box half-extents (11, 3.6) spans 3.6 horizontally
+    // and 11 vertically: the rotation is applied, not ignored.
+    RecordingSink rotated;
+    haven::append_wireframe_rect(rotated, {0.0f, 0.0f}, {11.0f, 3.6f}, kPi * 0.5f, 0.045f, 0.18f);
+    float rmin_x = 1e30f, rmax_x = -1e30f, rmin_y = 1e30f, rmax_y = -1e30f;
+    for (size_t i = 0; i < rotated.vertices.size(); i += 3)
+    {
+        rmin_x = std::min(rmin_x, rotated.vertices[i]);
+        rmax_x = std::max(rmax_x, rotated.vertices[i]);
+        rmin_y = std::min(rmin_y, rotated.vertices[i + 1]);
+        rmax_y = std::max(rmax_y, rotated.vertices[i + 1]);
+    }
+    expect_near(rmax_x - rmin_x, 2.0f * (3.6f + overhang), 1e-3f, "rotated 90 degrees the box is 2 * (3.6 + stroke) wide");
+    expect_near(rmax_y - rmin_y, 2.0f * (11.0f + overhang), 1e-3f, "and 2 * (11 + stroke) tall");
+}
+
 void test_projectile_shapes()
 {
     std::printf("projectile shapes\n");
@@ -1290,6 +1655,20 @@ void test_levelup_packets()
     expect(haven::decode_header(restart.data(), restart.size(), restart_header), "restart header decodes");
     expect(restart_header.msg_type == 0x05, "msg_type is C2S_RESTART");
     expect(restart_header.payload_len == 0, "payload_len is 0");
+}
+
+void test_ack_packet()
+{
+    std::printf("C2S_ACK_SNAPSHOT\n");
+    // last_recv_server_tick u32 = 4 byte payload.
+    std::vector<uint8_t> packet = haven::encode_ack_snapshot(0xDEADBEEF);
+    expect(packet.size() == haven::kHeaderSize + 4, "an ack is a 7 byte header + 4 byte payload");
+    haven::PacketHeader header{};
+    expect(haven::decode_header(packet.data(), packet.size(), header), "header decodes");
+    expect(header.msg_type == 0x04, "msg_type is C2S_ACK_SNAPSHOT");
+    expect(header.payload_len == 4, "payload_len is 4");
+    expect(packet[7] == 0xEF && packet[8] == 0xBE && packet[9] == 0xAD && packet[10] == 0xDE,
+           "last_recv_server_tick is little-endian");
 }
 
 void test_levelup_offer_packet()
@@ -1884,6 +2263,11 @@ void test_choice_input()
 
 int main()
 {
+    // The client keeps both streams unbuffered so a crash cannot lose the
+    // verdict; the test harness has the same reason to.
+    std::setvbuf(stdout, nullptr, _IONBF, 0);
+    std::setvbuf(stderr, nullptr, _IONBF, 0);
+
     test_vec_math();
     test_integrator();
     test_position_quantisation();
@@ -1891,8 +2275,11 @@ int main()
     test_hello_packet();
     test_input_packet();
     test_welcome_packet();
+    test_welcome_packet_phase4();
     test_snapshot_packet();
     test_snapshot_decoder_validation();
+    test_snapshot_delta_packet();
+    test_snapshot_state_baseline();
     test_sequence_numbers();
     test_input_history();
     test_prediction();
@@ -1918,8 +2305,11 @@ int main()
     test_enemy_body_and_hp_bar();
     test_enemy_radius_and_shape_tables();
     test_colour_slots();
+    test_elite_outline_and_telegraph_slots();
+    test_wireframe_rect();
     test_gem_geometry();
     test_levelup_packets();
+    test_ack_packet();
     test_levelup_offer_packet();
     test_game_over_packet();
     test_loadout_packet();

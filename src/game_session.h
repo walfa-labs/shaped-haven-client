@@ -9,10 +9,12 @@
 #include "prediction.h"
 #include "renderer.h"
 #include "run_events.h"
+#include "snapshot_state.h"
 
 #include <cstdint>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <vector>
 
@@ -56,6 +58,17 @@ struct SessionStats {
     size_t enemy_count = 0;
     size_t projectile_count = 0;
     size_t gem_count = 0;
+    /// Phase-4 snapshot accounting, for the verbose log.
+    uint32_t snapshots_full = 0;
+    uint32_t snapshots_delta = 0;
+    /// Deltas applied on top of the held baseline, and deltas refused because
+    /// their `baseline_tick` was not the tick the client holds.
+    uint32_t deltas_applied = 0;
+    uint32_t deltas_rejected = 0;
+    uint32_t acks_sent = 0;
+    /// The server's interest radius, from the 21 byte `S2C_WELCOME`. Zero when
+    /// the server still speaks the 17 byte phase-3 layout.
+    uint16_t interest_radius = 0;
     /// Wall-clock cost of one GameSession::update(), exponentially averaged.
     /// The frame rate main() prints at exit also includes the GL render.
     float update_ms_ema = 0.0f;
@@ -89,7 +102,24 @@ private:
     void drain_packets();
     void handle_welcome(const uint8_t* payload, size_t len);
     void handle_snapshot(const uint8_t* payload, size_t len);
-    void accept_snapshot(const SnapshotFull& snapshot);
+    void handle_delta(const uint8_t* payload, size_t len);
+
+    /// Shared snapshot-header handling for both message types: the restart
+    /// boundary and the ordering check, then the header fields the run state
+    /// and HUD read. Returns false when the snapshot is a stale leftover.
+    bool ingest_header(uint32_t server_tick, uint32_t run_time_ms, GameState game_state);
+
+    /// Answers a snapshot with C2S_ACK_SNAPSHOT for `tick`, which is what lets
+    /// the server pick a baseline to diff against.
+    void send_ack(uint32_t tick);
+
+    /// Folds the snapshot's own record of the local player into the predictor.
+    void reconcile_from(const PlayerNet* self, const std::array<uint32_t, kMaxPlayers>& acked_seq);
+
+    /// Pushes the held state into the interpolation buffer as the newest
+    /// snapshot, so the render clock and the draw items track the run.
+    void push_render();
+
     void handle_levelup_offer(const uint8_t* payload, size_t len);
     void handle_game_over(const uint8_t* payload, size_t len);
     void handle_loadout(const uint8_t* payload, size_t len);
@@ -163,7 +193,12 @@ private:
     std::vector<EntityDrawItem> combat_items_;
     std::unordered_set<uint32_t> present_remotes_;
     std::vector<std::vector<uint8_t>> packets_;
-    RenderSnapshot pending_snapshot_;
+
+    /// The one complete world state the client holds and the tick it is
+    /// complete for. A delta is applied on top of it only when its
+    /// baseline_tick matches; a full snapshot replaces it outright. See
+    /// PROTOCOL.md "Baseline rules" and snapshot_state.h.
+    SnapshotState snapshot_state_;
 
     float accumulator_ = 0.0f;
     uint64_t session_token_ = 0;

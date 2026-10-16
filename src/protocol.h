@@ -118,6 +118,11 @@ std::vector<uint8_t> encode_levelup_choice(uint16_t event_id, uint8_t choice_idx
 /// game over; the server ignores it otherwise.
 std::vector<uint8_t> encode_restart();
 
+/// C2S_ACK_SNAPSHOT (0x04) — 4 byte payload: last_recv_server_tick u32. This is
+/// what tells the server which tick the client holds a complete state for, so
+/// it can pick a baseline to diff against. Sent at most once per snapshot.
+std::vector<uint8_t> encode_ack_snapshot(uint32_t last_recv_server_tick);
+
 bool decode_header(const uint8_t* data, size_t len, PacketHeader& out);
 
 struct Welcome {
@@ -127,8 +132,20 @@ struct Welcome {
     uint8_t snap_hz = 0;
     uint16_t arena_half_size = 0;
     uint32_t server_tick = 0;
+    /// Phase 4: the server's interest radius in world units, from the 21 byte
+    /// `S2C_WELCOME`. Zero when the server still speaks the 17 byte phase-3
+    /// layout, which carries no such field.
+    uint16_t interest_radius = 0;
+    /// True when the payload carried the phase-4 interest_radius field, i.e.
+    /// when it was the 21 byte layout rather than the 17 byte one.
+    bool has_interest_radius = false;
 };
 
+/// Decodes either `S2C_WELCOME` layout. The first 13 bytes are identical across
+/// both; the phase-4 form appends `interest_radius` u16 and `reserved` u16
+/// before moving `server_tick` from offset 13 to 17, growing the payload from
+/// 17 to 21 bytes. The payload length in the frame header is what tells them
+/// apart, so a phase-3 server and a phase-4 server both decode.
 bool decode_welcome(const uint8_t* payload, size_t len, Welcome& out);
 
 struct PlayerNet {
@@ -179,6 +196,67 @@ struct SnapshotFull {
     std::vector<ProjNet> projs;
     std::vector<GemNet> gems;
 };
+
+/// The `kind` byte that heads every spawned and updated record in a delta.
+/// It names the record type that follows, so the decoder can split the
+/// trailing arrays without guessing record sizes.
+enum class DeltaKind : uint8_t {
+    Player = 0,
+    Enemy = 1,
+    Projectile = 2,
+    Gem = 3,
+};
+
+/// S2C_SNAPSHOT_DELTA (0x83) — phase 4. The fixed header is byte-for-byte the
+/// same shape as a full snapshot's; only the four counts mean something
+/// different (spawned, updated, destroyed, reserved). The three trailing
+/// arrays carry interest-management changes relative to `baseline_tick`: an
+/// entity the client has never seen, an entity whose full record changed, and
+/// an entity that left the interest radius. See PROTOCOL.md.
+struct SnapshotDelta {
+    uint32_t server_tick = 0;
+    uint32_t baseline_tick = 0;
+    uint32_t run_time_ms = 0;
+    GameState game_state = GameState::Running;
+    std::array<uint32_t, kMaxPlayers> acked_seq{};
+    uint16_t spawned_count = 0;
+    uint16_t updated_count = 0;
+    uint16_t destroyed_count = 0;
+
+    // Spawned records: kind implied by which vector they land in.
+    std::vector<PlayerNet> spawned_players;
+    std::vector<EnemyNet> spawned_enemies;
+    std::vector<ProjNet> spawned_projs;
+    std::vector<GemNet> spawned_gems;
+    // Updated records: same, carrying the full record rather than a mask.
+    std::vector<PlayerNet> updated_players;
+    std::vector<EnemyNet> updated_enemies;
+    std::vector<ProjNet> updated_projs;
+    std::vector<GemNet> updated_gems;
+    // Destroyed records: just the id, per kind.
+    std::vector<uint32_t> destroyed_players;
+    std::vector<uint32_t> destroyed_enemies;
+    std::vector<uint32_t> destroyed_projs;
+    std::vector<uint32_t> destroyed_gems;
+};
+
+/// Decodes the shared 37 byte snapshot header both message types start with:
+/// the three u32s, the four acked sequences, the game state byte, and the four
+/// u16 counts. For a full snapshot the counts are the entity counts; for a
+/// delta they are spawned / updated / destroyed / reserved. Returns false if
+/// the payload is too short to hold the header.
+bool decode_snapshot_header(const uint8_t* payload, size_t len, uint32_t& server_tick, uint32_t& baseline_tick,
+                            uint32_t& run_time_ms, std::array<uint32_t, kMaxPlayers>& acked_seq, GameState& game_state,
+                            std::array<uint16_t, 4>& counts);
+
+bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out);
+
+/// Decodes a delta. The counts come off the wire, so they are validated as the
+/// records are read: every record is pulled through a ByteReader that checks
+/// the remaining length first, and the payload must be exactly consumed. A
+/// `kind` byte outside 0..3, or a payload that does not hold every record the
+/// counts declare, is rejected.
+bool decode_snapshot_delta(const uint8_t* payload, size_t len, SnapshotDelta& out);
 
 /// S2C_LEVELUP_OFFER (0x84) — 14 byte payload: player_id u8, event_id u16,
 /// new_level u16, then three UpgradeOptionNet. The run pauses until the client

@@ -107,6 +107,31 @@ void append_quad(PrimitiveSink& sink, Vec2 centre, Vec2 half_extents, float angl
     sink.quad(centre.x, centre.y, half_extents.x, half_extents.y, z, angle);
 }
 
+void append_wireframe_rect(PrimitiveSink& sink, Vec2 centre, Vec2 half_extents, float angle, float z,
+                           float thickness)
+{
+    const float ca = std::cos(angle);
+    const float sa = std::sin(angle);
+    const float t = thickness;
+    const float hx = half_extents.x;
+    const float hy = half_extents.y;
+    // Rotates a rect-local offset into world space, so each edge is centred on
+    // its rotated position and turned with the rectangle.
+    const auto edge_centre = [&](float lx, float ly) {
+        return Vec2{centre.x + lx * ca - ly * sa, centre.y + lx * sa + ly * ca};
+    };
+    // The top and bottom edges run along the rectangle's local x axis.
+    const Vec2 top = edge_centre(0.0f, hy);
+    sink.quad(top.x, top.y, hx, t * 0.5f, z, angle);
+    const Vec2 bottom = edge_centre(0.0f, -hy);
+    sink.quad(bottom.x, bottom.y, hx, t * 0.5f, z, angle);
+    // The left and right edges run along its local y axis.
+    const Vec2 left = edge_centre(-hx, 0.0f);
+    sink.quad(left.x, left.y, t * 0.5f, hy, z, angle);
+    const Vec2 right = edge_centre(hx, 0.0f);
+    sink.quad(right.x, right.y, t * 0.5f, hy, z, angle);
+}
+
 const WeaponVisual& weapon_visual(uint8_t weapon_id)
 {
     // DESIGN.md section 3, level 1: reach and arc for the two arc weapons,
@@ -152,6 +177,30 @@ Rgba archetype_colour(uint8_t archetype)
     const bool circle = archetype_is_circle(archetype);
     const uint8_t tier = circle ? archetype : archetype - 3;
     return circle ? kCircle[tier] : kTriangle[tier];
+}
+
+Rgba elite_colour(uint8_t bit)
+{
+    // One ring colour per modifier, chosen to read at a glance around the
+    // archetype's own body colour: Vampiric red, Splitter orange, Shielded
+    // blue, Haste Aura yellow.
+    static const Rgba kColour[kEliteOutlineSlots] = {Rgba{0.95f, 0.25f, 0.30f, 1.0f},
+                                                     Rgba{0.95f, 0.60f, 0.20f, 1.0f},
+                                                     Rgba{0.35f, 0.65f, 0.95f, 1.0f},
+                                                     Rgba{0.95f, 0.90f, 0.30f, 1.0f}};
+    return kColour[bit < kEliteOutlineSlots ? bit : 0];
+}
+
+const char* elite_name(uint8_t bit)
+{
+    static const char* const kName[kEliteOutlineSlots] = {"Vampiric", "Splitter", "Shielded", "Haste Aura"};
+    return kName[bit < kEliteOutlineSlots ? bit : 0];
+}
+
+bool boss_telegraph_active(uint32_t run_time_ms)
+{
+    const uint32_t phase = run_time_ms % kBossCycleMs;
+    return phase >= kBossTelegraphStartMs && phase < kBossTelegraphEndMs;
 }
 
 float enemy_hp_bar_width(uint8_t archetype)
@@ -201,6 +250,22 @@ ColourSlot slot_for_gem(const EntityDrawItem& item)
     return slot;
 }
 
+ColourSlot slot_for_elite_outline(uint8_t bit)
+{
+    ColourSlot slot;
+    slot.pool = ColourPool::EliteOutline;
+    slot.slot = bit < kEliteOutlineSlots ? bit : 0;
+    return slot;
+}
+
+ColourSlot slot_for_boss_telegraph()
+{
+    ColourSlot slot;
+    slot.pool = ColourPool::BossTelegraph;
+    slot.slot = 0;
+    return slot;
+}
+
 Rgba slot_colour(const ColourSlot& slot)
 {
     switch (slot.pool)
@@ -219,6 +284,11 @@ Rgba slot_colour(const ColourSlot& slot)
             return weapon_visual(slot.slot).colour;
         case ColourPool::Gem:
             return gem_colour(slot.slot);
+        case ColourPool::EliteOutline:
+            return elite_colour(static_cast<uint8_t>(slot.slot));
+        case ColourPool::BossTelegraph:
+            // The warning-box red, distinct from every archetype and weapon.
+            return Rgba{1.00f, 0.20f, 0.20f, 1.0f};
     }
     return Rgba{1.0f, 1.0f, 1.0f, 1.0f};
 }
@@ -377,6 +447,7 @@ void collect_draw_items(const InterpolationBuffer& buffer, std::vector<EntityDra
         item.style = style->second.style;
         item.hp_pct = style->second.hp_pct;
         item.shape = style->second.shape;
+        item.elite_mask = style->second.elite_mask;
         items.push_back(item);
     }
 }

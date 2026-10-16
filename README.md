@@ -102,89 +102,77 @@ the XP bar fill and the evolution rising edge, the item catalog, the bitmap font
 and its auto-fit, and the geometry builders (primitive counts, winding, HP bar
 layout, and the arc fan's interval coverage). They link no Ogre libraries.
 
+Phase 4 added coverage for the delta protocol: the 21 byte `S2C_WELCOME` (and
+the 17 byte phase-3 layout it must still decode), `C2S_ACK_SNAPSHOT`, the
+`S2C_SNAPSHOT_DELTA` decoder and its validation (unknown `kind` bytes, inflated
+counts, trailing bytes), the `SnapshotState` baseline machine (a full snapshot
+replaces the held state, a delta applies only against the tick it holds and is
+refused otherwise, and `build_render` carries the elite mask), the elite
+outline and boss telegraph slots and colours, and the wireframe-rect builder.
+
 The pure parts of the run logic live in their own translation units so they can
 be tested without Ogre: `run_events` holds the restart boundary, the level-up
-offer gate and the restart gate, and `hud_model` holds what the HUD should show
-for a `S2C_LOADOUT`.
+offer gate and the restart gate, `hud_model` holds what the HUD should show
+for a `S2C_LOADOUT`, and `snapshot_state` holds the baseline machine the delta
+protocol rests on.
 
 ## Status
 
-Phase 3 — level-up and HUD. The client now speaks the phase-3 protocol from
-`PROTOCOL.md` (the authoritative byte layout for both repos):
+Phase 4 — deltas, elites and the boss. The client speaks the phase-4 protocol
+from `PROTOCOL.md` (the authoritative byte layout for both repos) while still
+decoding the phase-3 `S2C_WELCOME` and `S2C_SNAPSHOT_FULL`, so it runs against
+either server:
 
-- **XP gems.** The `GemNet` array the snapshot already carries is drawn as
-  diamonds through the same batched primitive renderer and the same 100 ms
-  interpolation buffer as players, enemies and projectiles — one more
-  `EntityKind`, one more colour pool, no second render path. Size and colour
-  follow the DESIGN.md §1 gem tiers: small cyan, medium green, large violet,
-  boss cache gold.
-- **Level-up draft.** `S2C_LEVELUP_OFFER` (0x84) raises a three-card modal over
-  a dimmed, input-frozen game; the pick goes out as `C2S_LEVELUP_CHOICE` (0x03)
-  with the offer's `event_id`, from the `1`/`2`/`3` keys or `--choice-script`.
-  An evolution card names its two components; the server's 15 s timeout
-  auto-selects option 0 when no input arrives.
-- **HUD.** `S2C_LOADOUT` (0x86) drives an XP bar with the level label and run
-  clock, and an item tray: up to four weapon boxes (level pips, or an `EVOLVED`
-  tag) and up to ten passive boxes. Text is a baked 5x7 bitmap font drawn as
-  quads through the same immediate-mode sink — the Ogre SDK ships no font and
-  the design allows no art assets.
-- **Evolution banner.** A weapon slot whose `evolved` byte just became 1 raises
-  an `EVOLUTION!` banner naming the new weapon for 2.5 s. The rising-edge memory
-  is cleared with the run, so an evolution in a new run is announced even when
-  the slot index already held one when the previous run ended.
-- **Game over and restart.** `S2C_GAME_OVER` (0x85) freezes input and shows a
-  scoreboard (time survived, score, kills); `R` or a `restart` line in the
-  choice script sends `C2S_RESTART` (0x05), and the next snapshot starts a fresh
-  run. The dead run's snapshots are still in flight when the request goes out,
-  so the boundary is proof of run identity rather than a count of snapshots: the
-  server holds `game_over` and freezes its run clock until it has processed the
-  request, so every packet still in flight carries `game_over` and the first
-  snapshot that reports the run running again is the new run's — with a run
-  clock below the dead run's last observed one as the second, narrower filter.
-  One restart is queued per game over: the client cannot see the new run until
-  the server answers, so a second keypress, or the next `restart` marker in the
-  script, is held back rather than sent, and the script's marker survives for
-  the game over after this one. The server restarts its tick counter with the
-  run, so the interpolation buffer, the HUD, the level-up offer gate, the
-  evolution memory and both run-transition tick guards are reset with it —
-  without that the scoreboard stayed up and input stayed frozen for the whole of
-  the new run.
+- **Baseline state machine.** The client holds exactly one complete world
+  state — the tick it last acknowledged with `C2S_ACK_SNAPSHOT` (0x04) — in a new
+  Ogre-free `snapshot_state` module. A `S2C_SNAPSHOT_FULL` replaces it outright
+  and its tick becomes the baseline; a `S2C_SNAPSHOT_DELTA` (0x83) is applied on
+  top of it only when its `baseline_tick` is the tick the client holds. A delta
+  that names any other tick is **not** applied: the client keeps acknowledging
+  the state it does hold and the server answers with a full snapshot. The 21
+  byte `S2C_WELCOME` carries the server's `interest_radius`; the 17 byte
+  phase-3 layout still decodes, with the field defaulting to 0.
+- **Interest management.** The held state is the complete world within the
+  interest radius, so it is what goes into the interpolation buffer each
+  snapshot. An entity the server destroys is simply absent from the newest
+  snapshot, and the draw-item collection — which iterates the newest snapshot's
+  positions — then does not draw it. Nothing stale survives a destroy, and the
+  HUD holds no per-entity state to clean up.
+- **Elite modifiers.** `EnemyNet.elite_mask` is carried through the
+  interpolation buffer to the renderer, which draws one concentric outline ring
+  per set bit (Vampiric red, Splitter orange, Shielded blue, Haste Aura yellow)
+  under the archetype's own body colour — a filled circle at a slightly larger
+  radius and a lower z, so the body covers the middle and only the annulus
+  shows. Two new colour pools (elite outline, boss telegraph) join the four
+  existing ones in the same batched renderer.
+- **Boss telegraph.** The boss runs a 6.0 s attack loop; the client derives the
+  phase from the snapshot's run clock (boss spawns land on 180 s multiples, which
+  are multiples of the loop, so the phase is the same whether the loop is
+  anchored to the run start or the boss's spawn). During the 1.0 s window before
+  the dash it draws a red wireframe rectangle spanning the 22.0 u dash path
+  ahead of the boss along its facing.
+- **Run timer.** The HUD run clock (`TIME mm:ss`) is driven by the snapshot's
+  `run_time_ms`, so it tracks the run even while deltas keep the entity state
+  in sync.
 
-The level-up offer gate tracks the offer lifecycle rather than only the newest
-`event_id`: the server pauses the whole simulation while an offer is unresolved
-and cannot raise another one, so a second `S2C_LEVELUP_OFFER` arriving while one
-is still open is a duplicate or a corrupt packet. It is dropped rather than
-replacing the open offer — replacing it would change the modal under the
-player's hand and leave the event it displaced unanswered — and an offer older
-than the newest one *answered* is dropped too, so a resolved event cannot be
-answered twice. The gate closes again when the client sends its choice, and when
-a snapshot reports the run running again, which is what the server's 15 s
-timeout leaves behind.
+Measured on this machine (Release build, 1280x720):
 
-Measured on this machine (Release build, 1280x720) against the real
-`shaped-haven-server` `phase-3-upgrades` branch:
-
-- The logic tests report **890 checks, 0 failures** (Release and Debug).
-- A 6,000-frame run renders at **143.5 fps** with 0.3 ms of client-side update
-  work per frame, `stale=0`, `staleoffers=0`, `malformed=0` and `qdropped=0`
-  throughout, while the server offers level-ups and the script answers them
-  (`choices` counts them; the item tray and XP bar track `S2C_LOADOUT`).
-- Two consecutive `restart` markers were run against a server under
-  `--stress-enemies 40`, where the run ends after ~5 s: the client queued
-  exactly one `C2S_RESTART` for the game over and the second marker was still
-  the script's head at the next event, where it was reported as the wrong event
-  for a level-up. The pre-fix client on the same server and script queued
-  **two** `C2S_RESTART` on consecutive frames for that one game over, spending
-  the second marker on a run the server had already restarted.
-- The restart path was driven to a real game over against a server whose run had
-  been live for ~160 s: `S2C_GAME_OVER` at 178 s, `C2S_RESTART`, and the next
-  snapshot arrived with the new run's clock (`srv_tick` 10,713 → 3) and was
-  accepted — the client was back in `Running`, sending input and predicting
-  again, on the following frame, with `stale=0`. The pre-fix client, run against
-  the same server with the same scripts, stayed on the scoreboard with its input
-  frozen from frame 1,980 to frame 8,340 while the new run's clock advanced from
-  24 to 1,749, and spent the choice script's last two `restart` markers on
-  consecutive frames — the earlier level-ups had already eaten the rest.
+- The logic tests report **999 checks, 0 failures** (Release and Debug).
+- Against a mock delta server (21 byte welcome, full baseline, then deltas):
+  `interest_radius=75`, **27 deltas applied, 0 rejected**, 28 `C2S_ACK_SNAPSHOT`
+  sent, entities spawning and leaving the radius, `stale=0 malformed=0
+  disconnected=0`, ~119 fps.
+- Against the real `shaped-haven-server` `phase-4-delta` branch under
+  `--stress-enemies 40`: the 21 byte welcome decodes (`interest_radius=50`),
+  deltas are applied and acknowledged, level-ups and game over + restart all
+  work, `stale=0 malformed=0`. The server sends some deltas against a baseline
+  one broadcast stale (its reader thread processes the ACK a 50 ms broadcast
+  late), so the client rejects roughly half and re-acknowledges — the behaviour
+  the spec requires, and the server answers with a full snapshot once the
+  baseline leaves its 32-snapshot ring. The run is playable start to finish.
+- Against the phase-3 server (`main`, 17 byte welcome, full snapshots only):
+  `interest_radius=0`, full snapshots flow, level-ups and restart work,
+  `stale=0 malformed=0`, ~134 fps.
 
 An evolution was not reached in these runs: the scripted picks are the ones the
 offer happened to list first, and reaching a level-8 weapon needs both a longer
