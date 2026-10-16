@@ -817,9 +817,10 @@ void test_projectile_shapes()
         item.style = weapon;
         item.pos = {0.0f, 0.0f};
         item.angle = 0.0f;
-        // DESIGN.md section 3 order: sword and axe are arcs, bow and gun are
-        // travelling circles.
-        item.shape = weapon < 2 ? 0 : 1;
+        // The shape byte the server's weapon table sends (shape 0 ARC, 1 CIRCLE,
+        // 2 RAY): sword and axe are arcs, the bow is a ray and the gun a
+        // travelling circle.
+        item.shape = weapon < 2 ? 0 : (weapon == 2 ? 2 : 1);
         haven::append_projectile(sink, item);
         expect(sink.vertices.size() > 0, "every weapon emits geometry");
         expect(sink.indices.size() % 3 == 0, "geometry is made of whole triangles");
@@ -852,13 +853,25 @@ void test_projectile_shapes()
     };
     expect(span(axe) > span(sword), "the axe arc spans more than the sword arc");
 
-    // A bow arrow is a circle of its projectile radius, not an arc.
+    // The bow's arrow is a ray: a quad running from the arrow to the end of its
+    // reach, `reach` long and twice its radius wide.
     RecordingSink arrow;
     haven::EntityDrawItem arrow_item = sword_item;
     arrow_item.style = 2;
-    arrow_item.shape = 1;
+    arrow_item.shape = 2;
     haven::append_projectile(arrow, arrow_item);
-    expect_near(arrow.vertices.size(), 11 * 3, 0.0f, "a 10 segment arrow emits 11 vertices");
+    expect_near(arrow.vertices.size(), 4 * 3, 0.0f, "a ray arrow emits one quad");
+    const haven::WeaponVisual& bow = haven::weapon_visual(2);
+    expect_near(arrow.vertices[0], 0.0f, 1e-4f, "the ray starts at the arrow");
+    expect_near(arrow.vertices[2 * 3], bow.reach, 1e-4f, "the ray runs a full reach ahead of it");
+
+    // The gun's bullet is a circle of its projectile radius.
+    RecordingSink bullet;
+    haven::EntityDrawItem bullet_item = arrow_item;
+    bullet_item.style = 3;
+    bullet_item.shape = 1;
+    haven::append_projectile(bullet, bullet_item);
+    expect_near(bullet.vertices.size(), 11 * 3, 0.0f, "a 10 segment bullet emits 11 vertices");
 
     // A shape byte this client does not know must still draw something: an
     // invisible live projectile reads as a desync. The fallback is the body

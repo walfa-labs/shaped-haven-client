@@ -110,9 +110,11 @@ void append_quad(PrimitiveSink& sink, Vec2 centre, Vec2 half_extents, float angl
 const WeaponVisual& weapon_visual(uint8_t weapon_id)
 {
     // DESIGN.md section 3, level 1: reach and arc for the two arc weapons,
-    // projectile radius for the two projectile weapons. Speed and lifetime do
-    // not change how a projectile is drawn; they only set the reach of the RAY
-    // fallback that no phase-2 weapon uses.
+    // projectile radius for the two projectile weapons. The server's weapon
+    // table gives the bow shape RAY and the gun shape CIRCLE, so the bow's
+    // `reach` is what its beam is drawn with — it is the arrow's speed times
+    // its lifetime, 18 u/s x 2.0 s. The gun travels 28 u/s x 1.2 s = 33.6 u;
+    // its reach only matters to the RAY fallback that nothing sends.
     static const WeaponVisual kWeapons[4] = {
         {0.0f, 3.5f, kPi * 0.5f, Rgba{1.00f, 0.78f, 0.30f, 1.0f}},  // Sword
         {0.0f, 5.0f, kPi * 0.89f, Rgba{1.00f, 0.42f, 0.35f, 1.0f}},  // Axe
