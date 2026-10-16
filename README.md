@@ -97,14 +97,15 @@ The tests cover the packet encode/decode and its payload validation (including
 the phase-3 messages and the loadout slot counts), the position and angle
 quantisation, the prediction ring buffer and both reconciliation paths, the
 interpolation buffer, the keyboard mapping, the choice script's event matching,
-the restart boundary and the level-up offer gate, the XP bar fill and the
-evolution rising edge, the item catalog, the bitmap font and its auto-fit, and
-the geometry builders (primitive counts, winding, HP bar layout, and the arc
-fan's interval coverage). They link no Ogre libraries.
+the restart boundary, the level-up offer gate and the one-shot restart gate,
+the XP bar fill and the evolution rising edge, the item catalog, the bitmap font
+and its auto-fit, and the geometry builders (primitive counts, winding, HP bar
+layout, and the arc fan's interval coverage). They link no Ogre libraries.
 
 The pure parts of the run logic live in their own translation units so they can
-be tested without Ogre: `run_events` holds the restart boundary and the level-up
-gate, and `hud_model` holds what the HUD should show for a `S2C_LOADOUT`.
+be tested without Ogre: `run_events` holds the restart boundary, the level-up
+offer gate and the restart gate, and `hud_model` holds what the HUD should show
+for a `S2C_LOADOUT`.
 
 ## Status
 
@@ -135,26 +136,46 @@ Phase 3 — level-up and HUD. The client now speaks the phase-3 protocol from
   scoreboard (time survived, score, kills); `R` or a `restart` line in the
   choice script sends `C2S_RESTART` (0x05), and the next snapshot starts a fresh
   run. The dead run's snapshots are still in flight when the request goes out,
-  so the boundary is the run clock rather than a count of snapshots: a new run's
-  `run_time_ms` restarts at zero while the dead run's snapshots carry its final
-  value, and everything at or above that value is dropped. The server restarts
-  its tick counter with the run, so the interpolation buffer, the HUD, the
-  level-up offer gate, the evolution memory and both run-transition tick guards
-  are reset with it — without that the scoreboard stayed up and input stayed
-  frozen for the whole of the new run.
+  so the boundary is proof of run identity rather than a count of snapshots: the
+  server holds `game_over` and freezes its run clock until it has processed the
+  request, so every packet still in flight carries `game_over` and the first
+  snapshot that reports the run running again is the new run's — with a run
+  clock below the dead run's last observed one as the second, narrower filter.
+  One restart is queued per game over: the client cannot see the new run until
+  the server answers, so a second keypress, or the next `restart` marker in the
+  script, is held back rather than sent, and the script's marker survives for
+  the game over after this one. The server restarts its tick counter with the
+  run, so the interpolation buffer, the HUD, the level-up offer gate, the
+  evolution memory and both run-transition tick guards are reset with it —
+  without that the scoreboard stayed up and input stayed frozen for the whole of
+  the new run.
 
-A duplicate or older `S2C_LEVELUP_OFFER` — the same `event_id` arriving again
-after the client has answered it — is ignored rather than reopening the modal,
-so a resolved event cannot be answered twice.
+The level-up offer gate tracks the offer lifecycle rather than only the newest
+`event_id`: the server pauses the whole simulation while an offer is unresolved
+and cannot raise another one, so a second `S2C_LEVELUP_OFFER` arriving while one
+is still open is a duplicate or a corrupt packet. It is dropped rather than
+replacing the open offer — replacing it would change the modal under the
+player's hand and leave the event it displaced unanswered — and an offer older
+than the newest one *answered* is dropped too, so a resolved event cannot be
+answered twice. The gate closes again when the client sends its choice, and when
+a snapshot reports the run running again, which is what the server's 15 s
+timeout leaves behind.
 
 Measured on this machine (Release build, 1280x720) against the real
 `shaped-haven-server` `phase-3-upgrades` branch:
 
-- The logic tests report **855 checks, 0 failures** (Release and Debug).
+- The logic tests report **890 checks, 0 failures** (Release and Debug).
 - A 6,000-frame run renders at **143.5 fps** with 0.3 ms of client-side update
   work per frame, `stale=0`, `staleoffers=0`, `malformed=0` and `qdropped=0`
   throughout, while the server offers level-ups and the script answers them
   (`choices` counts them; the item tray and XP bar track `S2C_LOADOUT`).
+- Two consecutive `restart` markers were run against a server under
+  `--stress-enemies 40`, where the run ends after ~5 s: the client queued
+  exactly one `C2S_RESTART` for the game over and the second marker was still
+  the script's head at the next event, where it was reported as the wrong event
+  for a level-up. The pre-fix client on the same server and script queued
+  **two** `C2S_RESTART` on consecutive frames for that one game over, spending
+  the second marker on a run the server had already restarted.
 - The restart path was driven to a real game over against a server whose run had
   been live for ~160 s: `S2C_GAME_OVER` at 178 s, `C2S_RESTART`, and the next
   snapshot arrived with the new run's clock (`srv_tick` 10,713 → 3) and was

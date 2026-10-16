@@ -40,7 +40,8 @@ struct SessionStats {
     uint32_t stale_snapshots = 0;
     uint32_t send_failures = 0;
     uint32_t snapshots_received = 0;
-    /// Level-up offers for this player that named an event already seen.
+    /// Level-up offers for this player that were ignored: one that named an
+    /// event already answered, or a second offer while one was still open.
     uint32_t stale_offers = 0;
     /// Packets whose header disagreed with the bytes actually delivered, or
     /// whose snapshot payload was rejected by the decoder.
@@ -127,10 +128,14 @@ private:
     uint32_t run_time_ms_ = 0;
     EvolutionWatch evolution_watch_;
     /// Suppresses a level-up offer the client has already seen, so a duplicate
-    /// or older one cannot reopen the modal for an event that is answered.
+    /// or older one cannot reopen the modal for an event that is answered, and
+    /// a second offer cannot displace one that is still open. See run_events.h.
     LevelUpGate levelup_gate_;
     /// Rejects the dead run's snapshots after C2S_RESTART; see run_events.h.
     RestartBoundary restart_boundary_;
+    /// Keeps a second C2S_RESTART from being queued while the first is still
+    /// unacknowledged; see run_events.h.
+    RestartGate restart_gate_;
     /// Set when the choice script's head line names the other event, so the
     /// stall is reported once per event rather than once per frame.
     bool script_mismatch_reported_ = false;

@@ -1527,62 +1527,221 @@ void test_restart_boundary()
     std::printf("restart boundary\n");
     haven::RestartBoundary boundary;
     expect(!boundary.armed(), "the boundary starts disarmed");
-    expect(boundary.accepts(1234), "a disarmed boundary accepts anything");
+    expect(boundary.accepts(1234, haven::GameState::Running), "a disarmed boundary accepts anything");
+    expect(boundary.accepts(1234, haven::GameState::GameOver), "whatever state it carries");
 
-    // The dead run's snapshots still in flight carry its final run clock, so
-    // anything at or above that clock is the run the client just left.
+    // The dead run's snapshots still in flight carry its final run clock and
+    // its game_over state, so anything at or above that clock is the run the
+    // client just left.
     boundary.arm(30000);
     expect(boundary.armed(), "arming the boundary closes it");
-    expect(!boundary.accepts(30000), "the dead run's final snapshot is rejected");
-    expect(!boundary.accepts(30400), "a later dead-run snapshot is rejected too");
+    expect(!boundary.accepts(30000, haven::GameState::GameOver), "the dead run's final snapshot is rejected");
+    expect(!boundary.accepts(30400, haven::GameState::GameOver), "a later dead-run snapshot is rejected too");
     expect(boundary.armed(), "a rejected snapshot leaves the boundary closed");
 
-    // The new run's clock restarts at zero.
-    expect(boundary.accepts(0), "the new run's first snapshot is accepted");
+    // The new run restarts its clock at zero and reports the run running.
+    expect(boundary.accepts(0, haven::GameState::Running), "the new run's first snapshot is accepted");
     expect(!boundary.armed(), "the first new snapshot disarms the boundary");
-    expect(boundary.accepts(30000), "the ordinary tick ordering takes over afterwards");
+    expect(boundary.accepts(30000, haven::GameState::Running), "the ordinary tick ordering takes over afterwards");
 
     // Over TCP everything still in the socket was sent after the last snapshot
     // the client processed, so its clock is at or above that snapshot's: a
     // clock below the boundary is the new run's, not an older dead-run one.
     boundary.arm(30000);
-    expect(boundary.accepts(29950), "a clock below the boundary is accepted as the new run's");
+    expect(boundary.accepts(29950, haven::GameState::GameOver),
+           "a clock below the boundary is accepted as the new run's");
     expect(!boundary.armed(), "and it disarms the boundary");
-
-    // A dead run that ended at clock zero carries nothing to compare against.
-    boundary.arm(0);
-    expect(!boundary.armed(), "a zero run clock leaves the boundary disarmed");
-    expect(boundary.accepts(0), "and every snapshot passes");
 
     boundary.arm(5000);
     boundary.clear();
     expect(!boundary.armed(), "clear disarms the boundary");
-    expect(boundary.accepts(9000), "and everything passes again");
+    expect(boundary.accepts(9000, haven::GameState::GameOver), "and everything passes again");
+}
+
+/// The boundary is a filter, not the proof: what proves the run changed is the
+/// snapshot's own state. This walks the packets the client would actually see,
+/// in the order the server sends them, across a restart.
+void test_restart_boundary_proves_run_identity()
+{
+    std::printf("restart boundary proves run identity\n");
+
+    // The server holds `game_over` and stops advancing the run clock until it
+    // has processed C2S_RESTART, so what is still in flight when the client
+    // arms the boundary is the tail of frozen snapshots; over TCP, nothing the
+    // server sent before them is left either.
+    struct Packet {
+        uint32_t run_time_ms;
+        haven::GameState state;
+        bool new_run;
+    };
+    const Packet tail[] = {
+        {1650, haven::GameState::GameOver, false},  // already in the socket when the request went out
+        {1650, haven::GameState::GameOver, false},  // the frozen tick re-broadcast while the client decides
+        {1650, haven::GameState::GameOver, false},
+        {50, haven::GameState::Running, true},  // first broadcast after the restart: tick 3, clock 50
+        {100, haven::GameState::Running, true},
+    };
+
+    haven::RestartBoundary boundary;
+    boundary.arm(1650);
+    for (const Packet& packet : tail)
+    {
+        const bool accepted = boundary.accepts(packet.run_time_ms, packet.state);
+        expect(accepted == packet.new_run, "a snapshot is accepted exactly when it belongs to the new run");
+    }
+    expect(!boundary.armed(), "and the first new-run snapshot disarms the boundary");
+
+    // The clock alone cannot do this. The client only ever sees the run clock at
+    // the 20 Hz snapshot boundary, so the new run's first snapshot carries the
+    // clock of the first broadcast after the restart, not zero. A dead run that
+    // ended before its own second snapshot leaves the boundary armed at that
+    // same value, and every snapshot of the new run is then at or above it: a
+    // boundary that could only disarm on a strictly lower clock would reject the
+    // whole new run, for the rest of the session. The state is what disarms it.
+    haven::RestartBoundary short_run;
+    short_run.arm(50);
+    expect(short_run.accepts(50, haven::GameState::Running),
+           "the new run's first snapshot is accepted even at the dead run's own clock");
+    expect(!short_run.armed(), "so a short dead run cannot latch the boundary shut");
+
+    // The running state is the proof, so it is accepted whatever clock it
+    // carries; the clock is only the narrower filter. The server cannot report a
+    // running run until it has processed the restart, which is what makes this
+    // safe.
+    haven::RestartBoundary running_wins;
+    running_wins.arm(1650);
+    expect(running_wins.accepts(1650, haven::GameState::Running),
+           "a running state is the new run whatever clock it carries");
+}
+
+/// A run that ends before its clock advances: the client has seen no snapshot of
+/// it at all, so the clock has nothing to compare — but the packets that arrive
+/// next are still the dead run's until the server has processed the restart, so
+/// the boundary must not simply give up.
+void test_restart_boundary_zero_clock()
+{
+    std::printf("restart boundary with a zero run clock\n");
+    haven::RestartBoundary boundary;
+    boundary.arm(0);
+    expect(boundary.armed(), "a zero run clock still arms the boundary");
+    expect(!boundary.accepts(0, haven::GameState::GameOver),
+           "the dead run's game-over snapshot is rejected even at clock zero");
+    expect(boundary.armed(), "a rejected snapshot leaves the boundary closed");
+    expect(boundary.accepts(0, haven::GameState::Running), "the new run's first snapshot is accepted");
+    expect(!boundary.armed(), "and disarms the boundary");
+
+    // Arming at zero cannot latch: the running state is what disarms it, and
+    // that does not depend on the clock at all.
+    boundary.arm(0);
+    expect(boundary.accepts(5000, haven::GameState::Running), "a running snapshot at any clock disarms it");
+    expect(!boundary.armed(), "and the ordinary ordering takes over");
 }
 
 void test_levelup_gate()
 {
     std::printf("level-up gate\n");
     haven::LevelUpGate gate;
-    expect(gate.accept(1), "the first offer is new");
+    expect(gate.accept(1), "the first offer opens");
     expect(!gate.accept(1), "the same offer arriving again is suppressed");
-    expect(gate.accept(2), "the next offer is new");
-    expect(!gate.accept(1), "an older offer is suppressed");
-    expect(!gate.accept(2), "the current offer is suppressed when it repeats");
+
+    // One offer at a time. The server pauses the run while an offer is
+    // unresolved and cannot raise another one, so an offer arriving now is a
+    // duplicate or a corrupt packet. Replacing the open offer with it would
+    // change the modal under the player's hand and leave the event it displaced
+    // unanswered with the server still paused on it.
+    expect(!gate.accept(2), "a newer offer while one is unanswered is ignored");
+    expect(!gate.accept(3), "and so is any later one");
+    expect(!gate.accept(1), "and the open offer itself is not reopened");
+
+    // Answering the open offer lets the next event open.
+    gate.resolve();
+    expect(gate.accept(2), "once the open offer is answered, the next event opens");
+    expect(!gate.accept(1), "an event older than the answered one is still suppressed");
+    expect(!gate.accept(2), "and the answered one is suppressed when it repeats");
+    gate.resolve();
     expect(gate.accept(3), "offers keep arriving");
+
+    // Resolving an offer that is not open must not disturb the next one.
+    gate.resolve();
+    gate.resolve();
+    expect(gate.accept(4), "a repeated resolve is harmless");
 
     // The server renumbers from 1 with the run, so a restart starts the gate
     // over: without it the new run's first offer would look like an old one.
     gate.reset();
     expect(gate.accept(1), "a restarted run's first offer is new again");
-    expect(gate.accept(2), "and its second one too");
+    expect(!gate.accept(2), "and the gate is open again, so a second offer is still ignored");
+    gate.resolve();
+    expect(gate.accept(2), "and its second one opens once the first is answered");
 
     // The event id is a wrapping u16 counter; the comparison has to survive it.
     haven::LevelUpGate wrapping;
     expect(wrapping.accept(65535), "the last id before the wrap is accepted");
+    wrapping.resolve();
     expect(wrapping.accept(0), "the id after the wrap is newer, not older");
+    wrapping.resolve();
     expect(wrapping.accept(1), "and so is the one after that");
+    wrapping.resolve();
     expect(!wrapping.accept(65535), "while the pre-wrap id is now old");
+}
+
+/// Two consecutive `restart` markers in a choice script are two requests for the
+/// same game over: the client cannot see the new run until the server has
+/// answered, so only the first may become a C2S_RESTART.
+void test_restart_gate()
+{
+    std::printf("restart gate\n");
+    const std::vector<int8_t> script = {-1, -1};
+    haven::InputState input;
+    input.set_choice_script(script);
+
+    haven::RestartGate gate;
+    bool mismatch = false;
+    int queued = 0;
+    for (int frame = 0; frame < 200; ++frame)
+        if (gate.take(input, mismatch)) ++queued;
+
+    expect(queued == 1, "two restart markers queue exactly one C2S_RESTART");
+    expect(!mismatch, "a restart marker is not reported as a level-up mismatch");
+    expect(input.peek_scripted_line() == -1,
+           "the second marker is left where it is, for the game over after this one");
+
+    // The new run arrives, so the next game over gets its own restart.
+    gate.clear();
+    for (int frame = 0; frame < 200; ++frame)
+        if (gate.take(input, mismatch)) ++queued;
+    expect(queued == 2, "the next game over queues its own restart");
+    expect(input.peek_scripted_line() == -3, "and the script is then exhausted");
+
+    // The keyboard is the same one-shot: R held down through a restart must not
+    // send a second request either.
+    haven::InputState keys;
+    haven::RestartGate key_gate;
+    int key_queued = 0;
+    keys.key_down(haven::InputState::kKeyR);
+    for (int frame = 0; frame < 200; ++frame)
+        if (key_gate.take(keys, mismatch)) ++key_queued;
+    expect(key_queued == 1, "a restart key that stays down queues exactly one request");
+    expect(!keys.restart_requested(), "and the flag is consumed even while the gate is pending");
+
+    key_gate.clear();
+    keys.key_down(haven::InputState::kKeyR);
+    expect(key_gate.take(keys, mismatch), "a keypress after the new run queues another");
+    expect(key_gate.pending(), "and leaves the gate pending");
+    expect(!key_gate.take(keys, mismatch), "while a request is in flight nothing more is queued");
+
+    // A choice line is not a restart, and a game over must leave it alone.
+    // `set_choice_script` keeps a pointer to the vector, so it has to outlive
+    // the InputState.
+    const std::vector<int8_t> pick_script = {0, -1};
+    haven::InputState picks;
+    picks.set_choice_script(pick_script);
+    haven::RestartGate pick_gate;
+    expect(!pick_gate.take(picks, mismatch), "a choice line is not a restart");
+    expect(mismatch, "and the stall is reported as a level-up mismatch");
+    expect(picks.peek_scripted_line() == 0, "the pick is left for the level-up it names");
+    expect(picks.take_scripted_choice() == 0, "which the level-up then consumes");
+    expect(pick_gate.take(picks, mismatch), "and the restart marker after it is spent here");
 }
 
 void test_xp_bar_fill()
@@ -1748,7 +1907,10 @@ int main()
     test_input_script();
     test_choice_input();
     test_restart_boundary();
+    test_restart_boundary_proves_run_identity();
+    test_restart_boundary_zero_clock();
     test_levelup_gate();
+    test_restart_gate();
     test_entity_keys();
     test_circle_and_triangle_primitives();
     test_arc_and_hp_bar();

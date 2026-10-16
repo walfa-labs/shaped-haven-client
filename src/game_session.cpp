@@ -185,12 +185,13 @@ void GameSession::handle_levelup_offer(const uint8_t* payload, size_t len)
     // co-op client of phase 5, not this one.
     if (offer.player_id != stats_.player_id) return;
 
-    // A duplicate, or an offer older than one already answered, would reopen
-    // the modal for a resolved event and let a second choice go out for it.
+    // A duplicate, an offer older than one already answered, or a second offer
+    // arriving while one is still open would reopen or replace the modal for an
+    // event that is not resolved yet, and let a second choice go out for it.
     if (!levelup_gate_.accept(offer.event_id))
     {
         ++stats_.stale_offers;
-        std::printf("haven: ignoring level-up offer event=%u, already seen\n",
+        std::printf("haven: ignoring level-up offer event=%u, already seen or still open\n",
                     static_cast<unsigned>(offer.event_id));
         return;
     }
@@ -280,6 +281,13 @@ void GameSession::apply_run_state()
         !stale_after_game_over)
     {
         pending_offer_.reset();
+        // The run is running again, so any offer that was open has been
+        // answered — by the client, or by the server's 15 s timeout — and a
+        // later event may open from here.
+        levelup_gate_.resolve();
+        // The run running again is also the first proof that a queued restart
+        // went through, so the next game over may queue its own.
+        restart_gate_.clear();
         run_state_ = RunState::Running;
         hud_.hide_offer();
         hud_.hide_game_over();
@@ -318,6 +326,9 @@ void GameSession::resolve_levelup_choice()
         return;
     }
     ++stats_.choices_made;
+    // The offer is answered, so the next event may open a modal even before the
+    // run resumes: the server may have already resolved it.
+    levelup_gate_.resolve();
     std::printf("haven: level-up choice event=%u idx=%d\n", static_cast<unsigned>(pending_offer_->event_id),
                 pick);
     pending_offer_.reset();
@@ -337,22 +348,16 @@ void GameSession::report_script_mismatch(const char* event, const char* marker)
 
 void GameSession::maybe_restart()
 {
-    bool restart = input_.restart_requested();
-    input_.consume_restart();
-
-    if (!restart && input_.has_choice_script())
-    {
-        // A choice index is not a restart. Consuming it here would throw the
-        // pick away and leave the run stuck at the scoreboard with no line
-        // left to answer the level-up it was written for.
-        restart = input_.take_scripted_restart();
-        if (!restart && input_.peek_scripted_line() >= 0)
-            report_script_mismatch("the game over", "choice");
-    }
-    if (!restart) return;
+    bool script_mismatch = false;
+    const bool queued = restart_gate_.take(input_, script_mismatch);
+    if (script_mismatch) report_script_mismatch("the game over", "choice");
+    if (!queued) return;
 
     if (!net_.send(encode_restart()))
     {
+        // The request never went out, so this game over is still unanswered and
+        // the next frame is free to try again.
+        restart_gate_.clear();
         ++stats_.send_failures;
         return;
     }
@@ -369,9 +374,10 @@ void GameSession::maybe_restart()
     // over too; otherwise the new run's first offer would look like an old one.
     levelup_gate_.reset();
     // The dead run's snapshots still in flight carry its final run clock and
-    // the new run's restarts at zero, so anything at or above this value
-    // belongs to the run that just ended. This is the boundary; the tick
-    // counters below are reset with it because the server restarts those too.
+    // its game_over state, and the new run's restart the clock at zero and
+    // report the run running again. Either is proof the boundary can disarm on;
+    // see run_events.h. The tick counters below are reset with it because the
+    // server restarts those too.
     restart_boundary_.arm(run_time_ms_);
     run_time_ms_ = 0;
     stats_.server_tick = 0;
@@ -413,10 +419,12 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
 
     // Everything still in the socket when C2S_RESTART went out was sent after
     // the last snapshot the client processed, so it carries the dead run's
-    // frozen clock. Only a snapshot below that clock can be the new run's, and
+    // frozen clock and its game_over state. Only a snapshot that reports the
+    // run running again, or one below that clock, can be the new run's, and
     // accepting the rest would repopulate interpolation with the dead run's
-    // entities and drag the prediction back to an old position.
-    if (!restart_boundary_.accepts(snapshot.run_time_ms))
+    // entities and drag the prediction back to an old position. See
+    // run_events.h for why both signals are needed.
+    if (!restart_boundary_.accepts(snapshot.run_time_ms, snapshot.game_state))
     {
         ++stats_.stale_snapshots;
         return;
