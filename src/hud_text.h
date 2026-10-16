@@ -37,9 +37,11 @@ bool font_has_glyph(char c);
 /// units. Quads are counter-clockwise, like every other builder.
 void append_text(PrimitiveSink& sink, const std::string& text, Vec2 top_left, float pixel);
 
-/// The pixel size that fits `text` into `max_width` world units at the given
-/// top_left, without shrinking below `min_pixel`. Used to auto-fit long card
-/// titles.
-float fit_text_pixel(const std::string& text, float max_width, float top_left_x, float min_pixel);
+/// The pixel size that fits `text` into `max_width` world units: `default_pixel`
+/// for text that already fits, and the largest size that still fits otherwise.
+/// Text is never enlarged past `default_pixel`, so a short name keeps the size
+/// its layout was designed around and a long one shrinks instead of overflowing.
+/// Used to auto-fit card titles and tray names.
+float fit_text_pixel(const std::string& text, float max_width, float top_left_x, float default_pixel);
 
 }  // namespace haven

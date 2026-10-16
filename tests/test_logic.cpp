@@ -5,12 +5,14 @@
 
 #include "entity_frame.h"
 #include "game_math.h"
+#include "hud_model.h"
 #include "hud_text.h"
 #include "input_state.h"
 #include "interpolation.h"
 #include "item_catalog.h"
 #include "prediction.h"
 #include "protocol.h"
+#include "run_events.h"
 
 #include <algorithm>
 #include <cmath>
@@ -1384,6 +1386,26 @@ void test_loadout_packet()
 
     expect(!haven::decode_loadout(payload.data(), payload.size() - 1, loadout), "truncated loadout is rejected");
     expect(!haven::decode_loadout(payload.data(), payload.size() + 1, loadout), "a padded loadout is rejected");
+
+    // The payload always carries all four weapon slots and all ten passive
+    // slots, so a count past the array it indexes is a payload the sender got
+    // wrong. Accepting one would have the HUD walk past the slots it was given
+    // and build a tray that does not match the game.
+    std::vector<uint8_t> bad = payload;
+    bad[11] = 5;  // weapon_count, one past the four slots that exist
+    expect(!haven::decode_loadout(bad.data(), bad.size(), loadout), "weapon_count past four is rejected");
+    bad[11] = 4;
+    expect(haven::decode_loadout(bad.data(), bad.size(), loadout), "weapon_count of exactly four is accepted");
+
+    bad = payload;
+    bad[24] = 11;  // passive_count, one past the ten slots that exist
+    expect(!haven::decode_loadout(bad.data(), bad.size(), loadout), "passive_count past ten is rejected");
+    bad[24] = 10;
+    expect(haven::decode_loadout(bad.data(), bad.size(), loadout), "passive_count of exactly ten is accepted");
+
+    bad = payload;
+    bad[11] = 0xFF;
+    expect(!haven::decode_loadout(bad.data(), bad.size(), loadout), "a wrapped weapon_count is rejected");
 }
 
 void test_item_catalog()
@@ -1452,7 +1474,10 @@ void test_hud_text()
     expect(haven::font_has_glyph('A'), "A has a glyph");
     expect(haven::font_has_glyph('7'), "7 has a glyph");
     expect(haven::font_has_glyph('!'), "! has a glyph");
-    expect(haven::font_has_glyph(' '), "space has a glyph");
+    // Space is what everything unknown falls back to, so it is the blank rather
+    // than a glyph of its own: `find_glyph` cannot tell the two apart, and the
+    // header lists the charset as A-Z, 0-9 and the HUD's punctuation.
+    expect(!haven::font_has_glyph(' '), "space is the blank fallback, not a glyph of its own");
     expect(!haven::font_has_glyph('@'), "@ has no glyph");
 
     // Each lit pixel is one quad: 4 vertices and 6 indices.
@@ -1466,22 +1491,168 @@ void test_hud_text()
                     "two triangles per lit pixel");
     }
 
-    // Text starts at the top-left corner it is given.
+    // The glyph box's top-left corner is the point the line is given. 'E' lights
+    // its first column, so the first quad's left edge is exactly top_left.x; a
+    // quad's first vertex is its bottom-left corner, so the top edge is one
+    // pixel up from it.
     RecordingSink sink;
-    haven::append_text(sink, "0", {10.0f, -5.0f}, 0.5f);
-    expect_near(sink.vertices[0], 10.0f, 1e-6f, "the first pixel starts at top_left.x");
-    expect_near(sink.vertices[1], -5.0f, 1e-6f, "the first pixel starts at top_left.y");
+    const float pixel = 0.5f;
+    haven::append_text(sink, "E", {10.0f, -5.0f}, pixel);
+    expect_near(sink.vertices[0], 10.0f, 1e-6f, "the first pixel's left edge is top_left.x");
+    expect_near(sink.vertices[1] + pixel, -5.0f, 1e-6f, "the first pixel's top edge is top_left.y");
 
     // The digit 0 has a hole in the middle: its lit pixel count is below the
     // full glyph area, and its first quad is the top bar.
     expect(haven::text_lit_pixels("0") < 5 * 7, "the 0 glyph is not a full block");
 
-    // Auto-fit: a long name shrinks to the width it is given.
-    const float fit = haven::fit_text_pixel("JUGGERNAUT HALBERD", 10.0f, 0.0f, 0.05f);
-    expect(fit < 0.34f, "a long name is shrunk to fit");
-    expect(fit >= 0.05f, "the fit never goes below the floor");
-    const float short_fit = haven::fit_text_pixel("AXE", 20.0f, 0.0f, 0.05f);
-    expect_near(short_fit, 0.34f, 1e-6f, "a short name keeps the default size");
+    // Auto-fit. The size passed in is the one the layout was designed around,
+    // so the fit only ever shrinks: a long name is narrowed to exactly the
+    // width it is given, and a short name is never blown up to fill the box.
+    const float long_fit = haven::fit_text_pixel("JUGGERNAUT HALBERD", 10.0f, 0.0f, 0.34f);
+    expect_near(long_fit, 10.0f / static_cast<float>(haven::text_pixel_width("JUGGERNAUT HALBERD")), 1e-6f,
+                "a long name shrinks to exactly the width it is given");
+    expect_near(static_cast<float>(haven::text_pixel_width("JUGGERNAUT HALBERD")) * long_fit, 10.0f, 1e-4f,
+                "the shrunk name fits its box");
+    const float short_fit = haven::fit_text_pixel("AXE", 20.0f, 0.0f, 0.34f);
+    expect_near(short_fit, 0.34f, 1e-6f, "a short name keeps the size it was given");
+    // The old behaviour grew a short name to fill the box: "AXE" is 17 font
+    // pixels wide, so a 20 unit box asked for 20/17 ~= 1.18, more than three
+    // times the card's title size. The upper bound is the point of the test.
+    expect(short_fit <= 0.34f, "a short name is never enlarged past its given size");
+    expect_near(haven::fit_text_pixel("", 20.0f, 0.0f, 0.34f), 0.34f, 1e-6f, "an empty string keeps the given size");
+}
+
+void test_restart_boundary()
+{
+    std::printf("restart boundary\n");
+    haven::RestartBoundary boundary;
+    expect(!boundary.armed(), "the boundary starts disarmed");
+    expect(boundary.accepts(1234), "a disarmed boundary accepts anything");
+
+    // The dead run's snapshots still in flight carry its final run clock, so
+    // anything at or above that clock is the run the client just left.
+    boundary.arm(30000);
+    expect(boundary.armed(), "arming the boundary closes it");
+    expect(!boundary.accepts(30000), "the dead run's final snapshot is rejected");
+    expect(!boundary.accepts(30400), "a later dead-run snapshot is rejected too");
+    expect(boundary.armed(), "a rejected snapshot leaves the boundary closed");
+
+    // The new run's clock restarts at zero.
+    expect(boundary.accepts(0), "the new run's first snapshot is accepted");
+    expect(!boundary.armed(), "the first new snapshot disarms the boundary");
+    expect(boundary.accepts(30000), "the ordinary tick ordering takes over afterwards");
+
+    // Over TCP everything still in the socket was sent after the last snapshot
+    // the client processed, so its clock is at or above that snapshot's: a
+    // clock below the boundary is the new run's, not an older dead-run one.
+    boundary.arm(30000);
+    expect(boundary.accepts(29950), "a clock below the boundary is accepted as the new run's");
+    expect(!boundary.armed(), "and it disarms the boundary");
+
+    // A dead run that ended at clock zero carries nothing to compare against.
+    boundary.arm(0);
+    expect(!boundary.armed(), "a zero run clock leaves the boundary disarmed");
+    expect(boundary.accepts(0), "and every snapshot passes");
+
+    boundary.arm(5000);
+    boundary.clear();
+    expect(!boundary.armed(), "clear disarms the boundary");
+    expect(boundary.accepts(9000), "and everything passes again");
+}
+
+void test_levelup_gate()
+{
+    std::printf("level-up gate\n");
+    haven::LevelUpGate gate;
+    expect(gate.accept(1), "the first offer is new");
+    expect(!gate.accept(1), "the same offer arriving again is suppressed");
+    expect(gate.accept(2), "the next offer is new");
+    expect(!gate.accept(1), "an older offer is suppressed");
+    expect(!gate.accept(2), "the current offer is suppressed when it repeats");
+    expect(gate.accept(3), "offers keep arriving");
+
+    // The server renumbers from 1 with the run, so a restart starts the gate
+    // over: without it the new run's first offer would look like an old one.
+    gate.reset();
+    expect(gate.accept(1), "a restarted run's first offer is new again");
+    expect(gate.accept(2), "and its second one too");
+
+    // The event id is a wrapping u16 counter; the comparison has to survive it.
+    haven::LevelUpGate wrapping;
+    expect(wrapping.accept(65535), "the last id before the wrap is accepted");
+    expect(wrapping.accept(0), "the id after the wrap is newer, not older");
+    expect(wrapping.accept(1), "and so is the one after that");
+    expect(!wrapping.accept(65535), "while the pre-wrap id is now old");
+}
+
+void test_xp_bar_fill()
+{
+    std::printf("xp bar fill\n");
+    // The HUD asks for this on every frame, including the ones before the first
+    // S2C_LOADOUT and after a restart clears the HUD. Reading through an absent
+    // loadout is undefined behaviour, which is what the first frame used to do.
+    const haven::XpBarFill none = haven::xp_bar_fill(std::nullopt);
+    expect(!none.visible, "no loadout means no XP bar");
+    expect_near(none.fraction, 0.0f, 0.0f, "and no fill");
+
+    haven::Loadout loadout{};
+    loadout.level = 1;
+    loadout.xp = 0;
+    loadout.xp_next = 0;
+    expect(!haven::xp_bar_fill(loadout).visible, "an unknown xp_next hides the bar");
+
+    loadout.xp = 5;
+    loadout.xp_next = 10;
+    const haven::XpBarFill half = haven::xp_bar_fill(loadout);
+    expect(half.visible, "a loadout with an xp_next shows the bar");
+    expect_near(half.fraction, 0.5f, 1e-6f, "half the xp fills half the bar");
+
+    loadout.xp = 10;
+    expect_near(haven::xp_bar_fill(loadout).fraction, 1.0f, 1e-6f, "a full bar is capped at one");
+
+    // A malformed payload could carry xp above xp_next; the bar must not run
+    // past the end of its track.
+    loadout.xp = 40;
+    expect_near(haven::xp_bar_fill(loadout).fraction, 1.0f, 1e-6f, "an overflowing xp is clamped");
+
+    loadout.xp = 0;
+    loadout.xp_next = 100;
+    expect_near(haven::xp_bar_fill(loadout).fraction, 0.0f, 1e-6f, "an empty bar is zero");
+}
+
+void test_evolution_watch()
+{
+    std::printf("evolution watch\n");
+    haven::Loadout loadout{};
+    loadout.weapon_count = 2;
+    loadout.weapons[0].item_id = 0;
+    loadout.weapons[1].item_id = 1;
+
+    haven::EvolutionWatch watch;
+    expect(watch.observe(loadout) == -1, "no evolution at the start");
+
+    loadout.weapons[1].evolved = 1;
+    expect(watch.observe(loadout) == 1, "a slot whose evolved flag rose reports its index");
+    expect(watch.observe(loadout) == -1, "the same loadout again reports nothing: the flag did not rise");
+
+    // The flag stays set across the run, so the edge is only visible if the
+    // watch's memory is cleared with the run. Without that reset a new run
+    // would never announce the evolution of a slot that was already evolved
+    // when the previous run ended.
+    watch.reset();
+    expect(watch.observe(loadout) == 1, "after a reset the same evolved slot reports its index again");
+
+    loadout.weapon_count = 4;
+    loadout.weapons[3].evolved = 1;
+    watch.reset();
+    expect(watch.observe(loadout) == 3, "the last slot to rise wins");
+    expect(watch.observe(loadout) == -1, "and does not rise again");
+
+    // A slot past weapon_count is not part of the loadout, so it is not watched.
+    loadout.weapons[2].evolved = 1;
+    loadout.weapon_count = 2;
+    watch.reset();
+    expect(watch.observe(loadout) == 1, "a slot past weapon_count is ignored");
 }
 
 void test_choice_input()
@@ -1517,12 +1688,34 @@ void test_choice_input()
     haven::InputState scripted;
     scripted.set_choice_script(script);
     expect(scripted.has_choice_script(), "the script is armed");
-    expect(scripted.consume_scripted_line() == 0, "the first event is choice 0");
-    expect(scripted.consume_scripted_line() == 2, "the second event is choice 2");
-    expect(scripted.consume_scripted_line() == 1, "the third event is choice 1");
-    expect(scripted.consume_scripted_line() == -1, "the fourth event is a restart");
-    expect(scripted.consume_scripted_line() == 1, "the fifth event is choice 1");
-    expect(scripted.consume_scripted_line() == -3, "an exhausted script reports empty");
+    expect(scripted.peek_scripted_line() == 0, "peeking does not consume the line");
+    expect(scripted.peek_scripted_line() == 0, "peeking twice still does not");
+    expect(scripted.take_scripted_choice() == 0, "a choice line answers a level-up");
+    expect(scripted.take_scripted_choice() == 2, "the next choice line follows");
+    expect(scripted.take_scripted_choice() == 1, "the third choice line follows");
+
+    // The fourth line is a restart marker. It names a game over, so a level-up
+    // must leave it alone: spending it as choice 0 would answer an offer with a
+    // pick nobody made and leave the run with no restart when it ends.
+    expect(scripted.peek_scripted_line() == -1, "the fourth line is a restart marker");
+    expect(scripted.take_scripted_choice() == -1, "a restart marker is not a choice");
+    expect(scripted.peek_scripted_line() == -1, "and the level-up left it in place");
+    expect(scripted.take_scripted_restart(), "the restart marker is consumed by the game over it names");
+
+    // The fifth line is a choice, which the game over must leave alone.
+    expect(scripted.peek_scripted_line() == 1, "the fifth line is a choice");
+    expect(!scripted.take_scripted_restart(), "a choice line is not a restart");
+    expect(scripted.peek_scripted_line() == 1, "and the game over left it in place");
+    expect(scripted.take_scripted_choice() == 1, "the level-up then consumes it");
+
+    expect(scripted.peek_scripted_line() == -3, "an exhausted script reports empty");
+    expect(scripted.take_scripted_choice() == -3, "an exhausted script offers no choice");
+    expect(!scripted.take_scripted_restart(), "an exhausted script offers no restart");
+
+    haven::InputState unarmed;
+    expect(unarmed.peek_scripted_line() == -3, "no script peeks empty");
+    expect(unarmed.take_scripted_choice() == -3, "no script offers no choice");
+    expect(!unarmed.take_scripted_restart(), "no script offers no restart");
 
     expect(!haven::load_choice_script("tests/data/does_not_exist.txt", script), "missing script is rejected");
     expect(!haven::load_choice_script("tests/data/choice_script_bad.txt", script), "malformed script is rejected");
@@ -1554,6 +1747,8 @@ int main()
     test_input_state();
     test_input_script();
     test_choice_input();
+    test_restart_boundary();
+    test_levelup_gate();
     test_entity_keys();
     test_circle_and_triangle_primitives();
     test_arc_and_hp_bar();
@@ -1567,6 +1762,9 @@ int main()
     test_game_over_packet();
     test_loadout_packet();
     test_item_catalog();
+    test_hud_text();
+    test_xp_bar_fill();
+    test_evolution_watch();
     test_projectile_shapes();
     test_collect_draw_items();
     test_empty_buffer_collects_nothing();

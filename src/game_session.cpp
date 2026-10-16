@@ -1,6 +1,7 @@
 #include "game_session.h"
 
 #include "protocol.h"
+#include "run_events.h"
 
 #include <chrono>
 #include <cstdio>
@@ -184,11 +185,22 @@ void GameSession::handle_levelup_offer(const uint8_t* payload, size_t len)
     // co-op client of phase 5, not this one.
     if (offer.player_id != stats_.player_id) return;
 
+    // A duplicate, or an offer older than one already answered, would reopen
+    // the modal for a resolved event and let a second choice go out for it.
+    if (!levelup_gate_.accept(offer.event_id))
+    {
+        ++stats_.stale_offers;
+        std::printf("haven: ignoring level-up offer event=%u, already seen\n",
+                    static_cast<unsigned>(offer.event_id));
+        return;
+    }
+
     // The server pauses the simulation while it waits for the choice, so the
     // modal goes up now and input freezes until the run resumes.
     pending_offer_ = offer;
     run_state_ = RunState::LevelUp;
     offer_tick_ = stats_.server_tick;
+    script_mismatch_reported_ = false;
     hud_.show_offer(offer);
     std::printf("haven: level-up offer event=%u level=%u options=[%u %u %u] [%u %u %u] [%u %u %u]\n",
                 static_cast<unsigned>(offer.event_id), static_cast<unsigned>(offer.new_level),
@@ -212,6 +224,7 @@ void GameSession::handle_game_over(const uint8_t* payload, size_t len)
     game_over_ = stats;
     run_state_ = RunState::GameOver;
     game_over_tick_ = stats_.server_tick;
+    script_mismatch_reported_ = false;
     std::printf("haven: game over after %u s, score %u, kills %u\n", static_cast<unsigned>(stats.seconds_survived),
                 static_cast<unsigned>(stats.score), static_cast<unsigned>(stats.kills));
 }
@@ -230,17 +243,15 @@ void GameSession::handle_loadout(const uint8_t* payload, size_t len)
     stats_.xp = loadout.xp;
     stats_.xp_next = loadout.xp_next;
 
-    // An evolution is visible when it happens: a weapon slot whose `evolved`
-    // byte just became 1 raises the banner.
-    for (size_t i = 0; i < 4 && i < loadout.weapon_count; ++i)
+    // An evolution is visible when it happens: the watch reports the weapon
+    // slot whose `evolved` byte just became 1. It is cleared with the run, so
+    // an evolution in the new run is announced even when the slot index already
+    // held one when the previous run ended.
+    const int raised = evolution_watch_.observe(loadout);
+    if (raised >= 0)
     {
-        const bool evolved = loadout.weapons[i].evolved != 0;
-        if (evolved && !last_evolved_[i])
-        {
-            hud_.show_evolution(loadout.weapons[i].item_id);
-            ++stats_.evolutions_seen;
-        }
-        last_evolved_[i] = evolved ? 1 : 0;
+        hud_.show_evolution(loadout.weapons[static_cast<size_t>(raised)].item_id);
+        ++stats_.evolutions_seen;
     }
 
     hud_.set_loadout(loadout);
@@ -254,8 +265,16 @@ void GameSession::apply_run_state()
     // simulation the instant it sends the level-up offer, so the first
     // snapshot arriving after the offer can still carry the pre-pause
     // game_state, and acting on it would cancel the offer that just opened.
-    const bool stale_after_offer = run_state_ == RunState::LevelUp && stats_.server_tick <= offer_tick_;
-    const bool stale_after_game_over = run_state_ == RunState::GameOver && stats_.server_tick <= game_over_tick_;
+    //
+    // A tick of zero means the transition has not happened in this run, and a
+    // restart clears both back to zero. The server restarts its tick counter
+    // with the run, so without that a new run's low ticks would keep comparing
+    // at-or-below the dead run's final tick: the scoreboard would stay up and
+    // input would stay frozen for the whole of the new run.
+    const bool stale_after_offer = run_state_ == RunState::LevelUp && offer_tick_ != 0 &&
+                                   stats_.server_tick <= offer_tick_;
+    const bool stale_after_game_over = run_state_ == RunState::GameOver && game_over_tick_ != 0 &&
+                                       stats_.server_tick <= game_over_tick_;
 
     if (stats_.game_state == GameState::Running && run_state_ != RunState::Running && !stale_after_offer &&
         !stale_after_game_over)
@@ -283,11 +302,13 @@ void GameSession::resolve_levelup_choice()
     input_.consume_choice();
     if (pick < 0 && input_.has_choice_script())
     {
-        const int8_t scripted = input_.consume_scripted_line();
-        if (scripted >= 0 && scripted <= 2)
-            pick = scripted;
-        else if (scripted == -1)
-            pick = 0;  // a restart marker at an offer: server default is option 0
+        // Only a line that names a level-up is spent here. A restart marker is
+        // left for the game over it was written for: consuming it as choice 0
+        // would both answer this offer with a pick nobody made and leave the
+        // run without a restart when the run actually ends.
+        const int8_t scripted = input_.take_scripted_choice();
+        if (scripted >= 0 && scripted <= 2) pick = scripted;
+        else if (scripted == -1) report_script_mismatch("a level-up offer", "restart");
     }
     if (pick < 0 || pick > 2) return;  // wait for a keypress or the script
 
@@ -304,16 +325,29 @@ void GameSession::resolve_levelup_choice()
     // again (apply_run_state), not when the packet goes out.
 }
 
+void GameSession::report_script_mismatch(const char* event, const char* marker)
+{
+    if (script_mismatch_reported_) return;
+    script_mismatch_reported_ = true;
+    std::fprintf(stderr,
+                 "haven: choice script is out of order at %s: its next line is a `%s` marker, so the run "
+                 "will wait here rather than spend it on the wrong event\n",
+                 event, marker);
+}
+
 void GameSession::maybe_restart()
 {
     bool restart = input_.restart_requested();
     input_.consume_restart();
 
-    int8_t scripted = -3;
     if (!restart && input_.has_choice_script())
     {
-        scripted = input_.consume_scripted_line();
-        restart = scripted == -1;
+        // A choice index is not a restart. Consuming it here would throw the
+        // pick away and leave the run stuck at the scoreboard with no line
+        // left to answer the level-up it was written for.
+        restart = input_.take_scripted_restart();
+        if (!restart && input_.peek_scripted_line() >= 0)
+            report_script_mismatch("the game over", "choice");
     }
     if (!restart) return;
 
@@ -330,10 +364,20 @@ void GameSession::maybe_restart()
     interpolation_.clear();
     renderer_.clear_remote_players();
     hud_.reset();
-    // A fresh run's snapshots may well carry a server tick below the dead
-    // run's last one, so the staleness guard has to restart with the run.
+    evolution_watch_.reset();
+    // The server renumbers its offers from 1 with the run, so the gate starts
+    // over too; otherwise the new run's first offer would look like an old one.
+    levelup_gate_.reset();
+    // The dead run's snapshots still in flight carry its final run clock and
+    // the new run's restarts at zero, so anything at or above this value
+    // belongs to the run that just ended. This is the boundary; the tick
+    // counters below are reset with it because the server restarts those too.
+    restart_boundary_.arm(run_time_ms_);
+    run_time_ms_ = 0;
     stats_.server_tick = 0;
-    restart_baseline_left_ = 4;
+    offer_tick_ = 0;
+    game_over_tick_ = 0;
+    pending_offer_.reset();
     stats_.level = 1;
     stats_.xp = 0;
     stats_.xp_next = 0;
@@ -367,25 +411,33 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
 
     ++stats_.snapshots_received;
 
-    stats_.game_state = snapshot.game_state;
-    run_time_ms_ = snapshot.run_time_ms;
-
-    // Snapshots must arrive in order. A stale one carries an older
-    // authoritative position, and applying it would drag the prediction
-    // backwards — unless the run has just restarted, in which case the next
-    // few snapshots re-establish the baseline whatever ticks they carry (the
-    // server may reset its tick to 0, or keep counting from the dead run).
-    if (restart_baseline_left_ > 0)
+    // Everything still in the socket when C2S_RESTART went out was sent after
+    // the last snapshot the client processed, so it carries the dead run's
+    // frozen clock. Only a snapshot below that clock can be the new run's, and
+    // accepting the rest would repopulate interpolation with the dead run's
+    // entities and drag the prediction back to an old position.
+    if (!restart_boundary_.accepts(snapshot.run_time_ms))
     {
-        --restart_baseline_left_;
-        accept_snapshot(snapshot);
+        ++stats_.stale_snapshots;
         return;
     }
+
+    // Snapshots must otherwise arrive in order. A stale one carries an older
+    // authoritative position, and applying it would drag the prediction
+    // backwards.
     if (stats_.server_tick != 0 && snapshot.server_tick < stats_.server_tick)
     {
         ++stats_.stale_snapshots;
         return;
     }
+
+    // Only an accepted snapshot describes the run: a rejected one is a
+    // leftover from before the transition, and letting it set game_state or
+    // the run clock would undo that transition or put the dead run's clock
+    // back on the HUD.
+    stats_.game_state = snapshot.game_state;
+    run_time_ms_ = snapshot.run_time_ms;
+
     accept_snapshot(snapshot);
 }
 

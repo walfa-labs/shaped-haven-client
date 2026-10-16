@@ -69,14 +69,27 @@ public:
 
     /// The choice script: one line per run event, in chronological order — a
     /// choice index 0..2 for each level-up offer, the literal `restart` for
-    /// each game over. Consumed one line per event, so a fully unattended run
-    /// is `--input-script` for movement plus `--choice-script` for picks.
+    /// each game over. Each line names the event it answers, so it is consumed
+    /// only by that event: a marker is never spent on a different one, which is
+    /// what would let an extra level-up eat the restart line and leave an
+    /// unattended run stuck at the scoreboard. A fully unattended run is
+    /// `--input-script` for movement plus `--choice-script` for picks.
     void set_choice_script(const std::vector<int8_t>& picks);
     bool has_choice_script() const { return choice_script_ != nullptr; }
 
-    /// Consumes the next scripted line: 0..2 is a choice index, -1 a restart
-    /// marker, -3 when the script is exhausted.
-    int8_t consume_scripted_line();
+    /// The next scripted line without consuming it: 0..2 is a choice index, -1
+    /// a restart marker, -3 when the script is absent or exhausted.
+    int8_t peek_scripted_line() const;
+
+    /// Consumes the next line only when it is a choice index; when it is not,
+    /// returns the line's own value (-1 restart marker, -3 exhausted) and
+    /// leaves it in place.
+    int8_t take_scripted_choice();
+
+    /// Consumes the next line only when it is a restart marker; returns false
+    /// and leaves the line in place when it names a level-up or the script is
+    /// exhausted.
+    bool take_scripted_restart();
 
 private:
     std::unordered_map<int, bool> held_;

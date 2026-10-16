@@ -17,6 +17,7 @@ set(HAVEN_SOURCES
   src/entity_frame.cpp
   src/game_session.cpp
   src/hud.cpp
+  src/hud_model.cpp
   src/hud_text.cpp
   src/input_state.cpp
   src/interpolation.cpp
@@ -25,7 +26,8 @@ set(HAVEN_SOURCES
   src/net_client.cpp
   src/prediction.cpp
   src/protocol.cpp
-  src/renderer.cpp)
+  src/renderer.cpp
+  src/run_events.cpp)
 
 add_executable(shaped-haven-client src/main.cpp ${HAVEN_SOURCES})
 
@@ -56,12 +58,14 @@ enable_testing()
 
 add_executable(shaped-haven-client-tests tests/test_logic.cpp
   src/entity_frame.cpp
+  src/hud_model.cpp
   src/hud_text.cpp
   src/input_state.cpp
   src/interpolation.cpp
   src/item_catalog.cpp
   src/prediction.cpp
-  src/protocol.cpp)
+  src/protocol.cpp
+  src/run_events.cpp)
 
 target_include_directories(shaped-haven-client-tests PRIVATE src)
 

@@ -140,12 +140,18 @@ void append_text(PrimitiveSink& sink, const std::string& text, Vec2 top_left, fl
     }
 }
 
-float fit_text_pixel(const std::string& text, float max_width, float /*top_left_x*/, float min_pixel)
+float fit_text_pixel(const std::string& text, float max_width, float /*top_left_x*/, float default_pixel)
 {
+    // Shrink to fit, never enlarge. The size passed in is the one the caller's
+    // layout was designed around — a card title, a tray label — so a name that
+    // already fits keeps it. Growing to fill `max_width` instead would render a
+    // three-letter weapon several times the height of the text beside it, and a
+    // floor above the fitting size would let a long name overflow the box it is
+    // being fitted into.
     const int width_px = text_pixel_width(text);
-    if (width_px <= 0) return min_pixel;
+    if (width_px <= 0) return default_pixel;
     const float fit = max_width / static_cast<float>(width_px);
-    return fit < min_pixel ? min_pixel : fit;
+    return fit < default_pixel ? fit : default_pixel;
 }
 
 }  // namespace haven

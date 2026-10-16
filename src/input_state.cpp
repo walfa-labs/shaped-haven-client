@@ -47,10 +47,27 @@ void InputState::set_choice_script(const std::vector<int8_t>& picks)
     choice_index_ = 0;
 }
 
-int8_t InputState::consume_scripted_line()
+int8_t InputState::peek_scripted_line() const
 {
     if (choice_script_ == nullptr || choice_index_ >= choice_script_->size()) return -3;
-    return (*choice_script_)[choice_index_++];
+    return (*choice_script_)[choice_index_];
+}
+
+int8_t InputState::take_scripted_choice()
+{
+    const int8_t line = peek_scripted_line();
+    // Not a choice index: hand the value back untouched (-1 restart marker,
+    // -3 exhausted) and leave the line for the event it names.
+    if (line < 0 || line > 2) return line;
+    ++choice_index_;
+    return line;
+}
+
+bool InputState::take_scripted_restart()
+{
+    if (peek_scripted_line() != -1) return false;
+    ++choice_index_;
+    return true;
 }
 
 bool load_input_script(const std::string& path, std::vector<Vec2>& out)

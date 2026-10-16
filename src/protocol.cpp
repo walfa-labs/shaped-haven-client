@@ -291,12 +291,20 @@ bool decode_loadout(const uint8_t* payload, size_t len, Loadout& out)
         !r.u8(out.weapon_count))
         return false;
 
+    // The payload always carries all four weapon slots and all ten passive
+    // slots, so a count past the array it indexes is a payload the sender got
+    // wrong. Accepting it would have the HUD walk past the slots it was given
+    // and build a tray that does not match the game.
+    if (static_cast<size_t>(out.weapon_count) > out.weapons.size()) return false;
+
     for (LoadoutSlot& slot : out.weapons)
     {
         if (!r.u8(slot.item_id) || !r.u8(slot.level) || !r.u8(slot.evolved)) return false;
     }
 
     if (!r.u8(out.passive_count)) return false;
+    if (static_cast<size_t>(out.passive_count) > out.passives.size()) return false;
+
     for (LoadoutSlot& slot : out.passives)
     {
         if (!r.u8(slot.item_id) || !r.u8(slot.level)) return false;

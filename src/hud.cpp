@@ -1,5 +1,6 @@
 #include "hud.h"
 
+#include "hud_model.h"
 #include "hud_text.h"
 #include "mesh_factory.h"
 
@@ -204,13 +205,13 @@ void Hud::set_run_time(uint32_t run_time_ms)
 {
     if (!initialised_) return;
 
-    const Loadout& loadout = *loadout_;
-
-    if (loadout_.has_value() && loadout.xp_next > 0)
+    // `loadout_` is empty until the first S2C_LOADOUT arrives, and again after
+    // a restart clears the HUD; GameSession::update() calls this every frame,
+    // so the empty case has to be answered without reading through it.
+    const XpBarFill fill = xp_bar_fill(loadout_);
+    if (fill.visible)
     {
-        const float fraction = std::max(0.0f, std::min(1.0f, static_cast<float>(loadout.xp) /
-                                                                  static_cast<float>(loadout.xp_next)));
-        const float width = kXpBarWidth * fraction;
+        const float width = kXpBarWidth * fill.fraction;
         if (width > 0.01f)
         {
             xp_fill_->setVisible(true);

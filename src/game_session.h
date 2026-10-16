@@ -2,11 +2,13 @@
 
 #include "game_math.h"
 #include "hud.h"
+#include "hud_model.h"
 #include "input_state.h"
 #include "interpolation.h"
 #include "net_client.h"
 #include "prediction.h"
 #include "renderer.h"
+#include "run_events.h"
 
 #include <cstdint>
 #include <optional>
@@ -38,6 +40,8 @@ struct SessionStats {
     uint32_t stale_snapshots = 0;
     uint32_t send_failures = 0;
     uint32_t snapshots_received = 0;
+    /// Level-up offers for this player that named an event already seen.
+    uint32_t stale_offers = 0;
     /// Packets whose header disagreed with the bytes actually delivered, or
     /// whose snapshot payload was rejected by the decoder.
     uint32_t malformed_packets = 0;
@@ -105,6 +109,11 @@ private:
     /// Sends C2S_RESTART from the keyboard or the choice script.
     void maybe_restart();
 
+    /// Prints, once per event, that the choice script's next line names the
+    /// other event and is therefore not consumed. `event` and `marker` name the
+    /// event being waited on and the marker found in its place.
+    void report_script_mismatch(const char* event, const char* marker);
+
     HavenRenderer& renderer_;
     NetClient& net_;
     InputState& input_;
@@ -116,20 +125,25 @@ private:
     std::optional<LevelUpOffer> pending_offer_;
     GameOverStats game_over_{};
     uint32_t run_time_ms_ = 0;
-    std::array<uint8_t, 4> last_evolved_{};
-    /// Set when C2S_RESTART goes out: the fresh run's snapshots are the new
-    /// baseline whatever tick they carry, so the staleness guard stands down
-    /// until the run's own ordering is re-established.
-    int restart_baseline_left_ = 0;
+    EvolutionWatch evolution_watch_;
+    /// Suppresses a level-up offer the client has already seen, so a duplicate
+    /// or older one cannot reopen the modal for an event that is answered.
+    LevelUpGate levelup_gate_;
+    /// Rejects the dead run's snapshots after C2S_RESTART; see run_events.h.
+    RestartBoundary restart_boundary_;
+    /// Set when the choice script's head line names the other event, so the
+    /// stall is reported once per event rather than once per frame.
+    bool script_mismatch_reported_ = false;
 
     /// Server tick of the newest snapshot when the level-up offer arrived:
     /// the pause begins at that tick, so snapshots at or below it describe the
-    /// pre-pause run even though they arrive after the offer.
+    /// pre-pause run even though they arrive after the offer. Zero means no
+    /// offer in this run, which is what a restart restores.
     uint32_t offer_tick_ = 0;
 
     /// Server tick of the newest snapshot when the run ended. A snapshot at or
     /// below it still describes the dead run, so it must not dismiss the
-    /// scoreboard the moment it arrives.
+    /// scoreboard the moment it arrives. Zero means no game over in this run.
     uint32_t game_over_tick_ = 0;
 
     /// Remote player ids drawn on the previous frame, so a player who left
