@@ -87,8 +87,11 @@ bool NetClient::send(const std::vector<uint8_t>& packet)
     std::lock_guard<std::mutex> lock(send_mutex_);
     if (outbound_.size() >= kMaxOutgoingPackets)
     {
-        outbound_.pop_front();
+        // Refuse instead of evicting. The queue only ever holds whole packets,
+        // so refusing cannot corrupt the stream, and returning false is what
+        // tells the caller its input never reached the server.
         send_dropped_.fetch_add(1);
+        return false;
     }
     outbound_.push_back(packet);
     return true;
@@ -181,6 +184,14 @@ NetClient::ReadStatus NetClient::read_packet(int sock, std::vector<uint8_t>& pac
                 read_offset_ = 0;
                 if (!decode_header(header_.data(), kHeaderSize, parsed_)) return ReadStatus::Failed;
                 payload_.resize(parsed_.payload_len);
+                if (parsed_.payload_len == 0)
+                {
+                    // The packet is already complete: a zero length recv() would
+                    // return 0 and be misread as the peer closing.
+                    read_phase_ = ReadPhase::Header;
+                    packet.assign(header_.begin(), header_.end());
+                    return ReadStatus::Packet;
+                }
                 read_phase_ = ReadPhase::Payload;
                 continue;
             }
@@ -213,32 +224,32 @@ bool NetClient::flush_outgoing(int sock)
 {
     for (;;)
     {
-        std::vector<uint8_t> packet;
+        // A packet that could not be sent in one go leaves its tail in
+        // `send_remainder_`, which lives outside the queue so no queue policy
+        // can drop it and splice two packets together on the wire.
+        if (send_remainder_.empty())
         {
             std::lock_guard<std::mutex> lock(send_mutex_);
             if (outbound_.empty()) return true;
-            packet = std::move(outbound_.front());
+            send_remainder_ = std::move(outbound_.front());
             outbound_.pop_front();
         }
 
-        size_t sent = 0;
-        while (sent < packet.size())
+        while (!send_remainder_.empty())
         {
-            const int rc = ::send(sock, reinterpret_cast<const char*>(packet.data()) + sent,
-                                  static_cast<int>(packet.size() - sent), 0);
+            const int rc = ::send(sock, reinterpret_cast<const char*>(send_remainder_.data()),
+                                  static_cast<int>(send_remainder_.size()), 0);
             if (rc > 0)
             {
-                sent += static_cast<size_t>(rc);
+                send_remainder_.erase(send_remainder_.begin(),
+                                      send_remainder_.begin() + static_cast<std::ptrdiff_t>(rc));
                 continue;
             }
             if (rc == 0) return false;
             if (::WSAGetLastError() != WSAEWOULDBLOCK) return false;
 
-            // Would block. Put the remainder back at the front so ordering is
-            // preserved, and let the next writable pass finish the job.
-            std::vector<uint8_t> rest(packet.begin() + static_cast<std::ptrdiff_t>(sent), packet.end());
-            std::lock_guard<std::mutex> lock(send_mutex_);
-            outbound_.push_front(std::move(rest));
+            // Would block. The remainder stays put and the next writable pass
+            // finishes the packet before starting another one.
             return true;
         }
     }

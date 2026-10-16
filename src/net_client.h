@@ -57,13 +57,14 @@ public:
     /// Never blocks and never touches the socket on the calling thread.
     ///
     /// Appends to a bounded queue and returns true. When the queue is full the
-    /// oldest queued packet is evicted to make room, because the newest input is
-    /// the one that reflects what the player is doing now; send_dropped() counts
-    /// those evictions. Returns false only when the link is down, in which case
-    /// nothing is queued.
+    /// packet is refused and this returns false, so the caller learns that the
+    /// input will not reach the server; send_dropped() counts those refusals.
+    /// Nothing is ever evicted, because a partially transmitted packet must not
+    /// be droppable — evicting one would splice two packets together on the
+    /// wire. Returns false as well when the link is down.
     bool send(const std::vector<uint8_t>& packet);
 
-    /// Packets evicted from the outgoing queue because it was full.
+    /// Packets refused because the outgoing queue was full.
     uint32_t send_dropped() const { return send_dropped_.load(); }
 
     /// Moves every complete packet received since the last call into `out`.
@@ -88,6 +89,11 @@ private:
 
     std::mutex send_mutex_;
     std::deque<std::vector<uint8_t>> outbound_;
+
+    /// The tail of a packet that a blocking-free send could not finish. Only the
+    /// socket thread touches it, and it is deliberately not part of `outbound_`
+    /// so that no queue policy can ever drop half a packet.
+    std::vector<uint8_t> send_remainder_;
 
     std::mutex recv_mutex_;
     std::deque<std::vector<uint8_t>> inbound_;
