@@ -26,6 +26,13 @@ Companion repository: `shaped-haven-server` (Zig simulation core).
   than composing it, because Bites only delivers input events to listeners
   registered against a window it created itself. All meshes are generated from
   code at startup.
+- **Combat rendering:** enemies, weapon sweeps and projectiles are drawn from
+  the same snapshot stream as the players, interpolated by the same buffer.
+  Each draw layer is one `Manual Object` holding one section per colour, so a
+  thousand enemies cost a handful of draw calls instead of a thousand entities.
+  The colour lives in the material, not the vertex: the RTShaderSystem's
+  fixed-function emulation only feeds a vertex colour into the lighting terms,
+  and an unlit scene has no lights to tint.
 
 The full design — protocol message list, snapshot contents, interpolation rules,
 phase plan — is in [DESIGN.md](DESIGN.md).
@@ -73,12 +80,50 @@ cmake --build build --config Release
 ./build/Release/shaped-haven-client-tests.exe   # or: ctest --test-dir build
 ```
 
-The tests cover the packet encode/decode, the position and angle quantisation,
-the prediction ring buffer and both reconciliation paths, the interpolation
-buffer, and the keyboard mapping. They link no Ogre libraries.
+The tests cover the packet encode/decode and its payload validation, the
+position and angle quantisation, the prediction ring buffer and both
+reconciliation paths, the interpolation buffer, the keyboard mapping, and the
+geometry builders (primitive counts, winding, HP bar layout, and the arc fan's
+interval coverage). They link no Ogre libraries.
 
 ## Status
 
-Phase 1 — loopback skeleton. The window, orthographic camera, procedural mesh
+Phase 2 — combat rendering. The window, orthographic camera, procedural mesh
 builders, async TCP thread, 60 Hz prediction with reconciliation and the 100 ms
-interpolation buffer are in place. See `DESIGN.md` §6 for what follows.
+interpolation buffer are in place, and on top of them the client now parses and
+draws the `EnemyNet` and `ProjNet` arrays the snapshot already carries:
+
+- Enemies are circles or triangles by archetype, each with an HP bar whose
+  width tracks `hp_pct` and whose colour drains from green to red.
+- Weapon sweeps are drawn as arc wedges, the bow's arrow as a ray and the gun's
+  bullet as a travelling circle, at the level-1 reach and radius from
+  DESIGN.md §3. `ProjNet`'s `shape` byte picks the primitive, `weapon_id` the
+  size and colour; a shape byte the client does not know falls back to the
+  bullet circle rather than drawing nothing.
+- Everything is interpolated through the same 100 ms buffer the remote
+  players use, so there is no second interpolation path.
+- A snapshot whose counts do not match the bytes that arrived is rejected
+  before any vector is resized, and the frame header's `payload_len` is checked
+  against the bytes actually delivered.
+
+Measured on this machine (Release build, 1280x720), against the real
+`shaped-haven-server` phase-2 branch built from `phase-2-combat` and started
+with `--stress-enemies 1000 --stress-projectiles 500`:
+
+- The logic tests report **544 checks, 0 failures**.
+- A 600-frame run renders at **136.0 fps** (4.41 s), with 3.5–3.8 ms of
+  client-side work per frame, `malformed=0`, `stale=0` and `qdropped=0`
+  throughout.
+- The client draws exactly what the server reports: **1,000 enemies and 500
+  projectiles** per frame, matching the stress flag. A raw probe of the same
+  server confirms every snapshot on the wire carries exactly that. An entity
+  the interpolation window does not bracket yet is held at its first-seen
+  position, so nothing is dropped and the handover to interpolation is
+  continuous.
+
+The arc wedge's triangulation is pinned by a test that walks the index buffer
+and requires every interval of the ring to be covered exactly once; the
+rendered result was also checked in pixels: a probe that feeds the client one
+static axe projectile renders a 160° wedge of 5.0 u radius whose covered area
+is 8764 px against the analytic fan area of 8756 px, with no gap in the final
+interval.

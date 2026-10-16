@@ -42,6 +42,12 @@ const std::unordered_map<uint32_t, Vec2>& InterpolationBuffer::latest_positions(
     return snapshots_.empty() ? empty : snapshots_.back().data.positions;
 }
 
+const std::unordered_map<uint32_t, EntityStyle>& InterpolationBuffer::latest_styles() const
+{
+    static const std::unordered_map<uint32_t, EntityStyle> empty;
+    return snapshots_.empty() ? empty : snapshots_.back().data.styles;
+}
+
 int64_t InterpolationBuffer::render_time_ms() const
 {
     if (snapshots_.empty()) return -static_cast<int64_t>(kDelayMs);
@@ -85,6 +91,23 @@ bool InterpolationBuffer::interpolate_between(const RenderSnapshot& a, const Ren
     const float alpha = blend_alpha(t_render, static_cast<int64_t>(a.run_time_ms), static_cast<int64_t>(b.run_time_ms));
     out = lerp(it_a->second, it_b->second, alpha);
     return true;
+}
+
+bool InterpolationBuffer::first_seen_position(uint32_t entity_id, Vec2& out) const
+{
+    // Oldest first: the first snapshot that carries the entity is where it was
+    // when it appeared, which is the position the interpolation window will
+    // start from once it brackets the entity.
+    for (const Snapshot& snapshot : snapshots_)
+    {
+        const auto it = snapshot.data.positions.find(entity_id);
+        if (it != snapshot.data.positions.end())
+        {
+            out = it->second;
+            return true;
+        }
+    }
+    return false;
 }
 
 }  // namespace haven

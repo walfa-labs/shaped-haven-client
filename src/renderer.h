@@ -1,8 +1,11 @@
 #pragma once
 
 #include "game_math.h"
+#include "entity_frame.h"
 #include "input_state.h"
 #include "mesh_factory.h"
+
+#include <vector>
 
 #include <OgreApplicationContext.h>
 #include <OgreCamera.h>
@@ -67,7 +70,21 @@ public:
     void remove_player(uint8_t player_id);
     void clear_remote_players();
 
+    /// Enemies and projectiles, rebuilt from scratch every frame out of the
+    /// interpolated draw items the session hands over. One Manual Object per
+    /// draw layer holds the whole batch, so a thousand enemies cost one draw
+    /// call each instead of one entity each.
+    void render_entities(const std::vector<EntityDrawItem>& items);
+
 private:
+    /// One colour slot's worth of geometry inside its pool's Manual Object.
+    struct ColourBatch {
+        Ogre::ManualObject* object = nullptr;
+        uint32_t section = 0;
+        uint32_t capacity = 0;
+        bool created = false;
+    };
+
     void createRoot();
     bool oneTimeConfig();
     void locateResources();
@@ -77,6 +94,17 @@ private:
     void build_scene();
     void build_grid();
     void build_camera();
+    void build_combat_batches();
+
+    size_t slot_index(const ColourSlot& slot);
+    ColourBatch& batch_for(const ColourSlot& slot);
+    void slot_capacity(ColourPool pool, uint32_t& verts, uint32_t& indices);
+
+    /// The Manual Object that holds one draw layer's sections.
+    Ogre::ManualObject* pool_object(ColourPool pool);
+
+    /// Adds a section (and its material) for a colour slot on first use.
+    void create_slot(const ColourSlot& slot);
 
     /// The orthographic viewport is a fixed 80 x 45 units, so the window is
     /// forced to the matching 16:9 aspect ratio to avoid stretching.
@@ -92,6 +120,18 @@ private:
     Ogre::ManualObject* grid_ = nullptr;
     std::unique_ptr<MeshFactory> meshes_;
     InputState* input_ = nullptr;
+
+    /// One Manual Object per draw layer, each holding one section per colour
+    /// slot actually in use. See render_entities().
+    Ogre::ManualObject* enemy_bodies_ = nullptr;
+    Ogre::ManualObject* enemy_bars_ = nullptr;
+    Ogre::ManualObject* projectiles_ = nullptr;
+
+    /// Scratch storage grouping the frame's entities by colour slot, and the
+    /// slots that exist. Both are indexed pool * kMaxSlotsPerPool + slot.
+    static constexpr size_t kSlotItemCount = 3 * kMaxSlotsPerPool;
+    std::vector<const EntityDrawItem*> slot_items_[kSlotItemCount];
+    ColourBatch batches_[kSlotItemCount];
 
     std::function<void(float)> tick_;
     bool quit_ = false;

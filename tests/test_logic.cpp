@@ -3,12 +3,14 @@
 // keyboard mapping. Everything here is Ogre-free so it builds and runs as a
 // plain console test.
 
+#include "entity_frame.h"
 #include "game_math.h"
 #include "input_state.h"
 #include "interpolation.h"
 #include "prediction.h"
 #include "protocol.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -16,6 +18,8 @@
 #include <vector>
 
 namespace {
+
+constexpr float kPi = 3.14159265358979323846f;
 
 int g_failures = 0;
 int g_checks = 0;
@@ -245,6 +249,96 @@ void test_snapshot_packet()
     expect(!haven::decode_snapshot_full(truncated.data(), truncated.size(), broken), "truncated snapshot is rejected");
 }
 
+/// The counts in a snapshot header come off the wire, so they are
+/// attacker-controlled: the decoder must size-check them against the bytes it
+/// actually received before it reserves anything, and it must not accept a
+/// payload longer than the records it declares.
+void test_snapshot_decoder_validation()
+{
+    std::printf("snapshot decoder validation\n");
+
+    // A minimal but complete payload: one player and one enemy.
+    auto build = []() {
+        std::vector<uint8_t> payload;
+        auto u8 = [&](uint8_t v) { payload.push_back(v); };
+        auto u16 = [&](uint16_t v) { payload.push_back(v & 0xFF); payload.push_back((v >> 8) & 0xFF); };
+        auto i16 = [&](int16_t v) { u16(static_cast<uint16_t>(v)); };
+        auto u32 = [&](uint32_t v) { for (int s = 0; s < 32; s += 8) payload.push_back((v >> s) & 0xFF); };
+
+        u32(600); u32(0); u32(1000);
+        u32(0); u32(0); u32(0); u32(0);
+        u8(0);
+        u16(1);  // players
+        u16(1);  // enemies
+        u16(0);  // projectiles
+        u16(0);  // gems
+        // PlayerNet
+        u8(0); u8(1); i16(0); i16(0); u8(0); u8(100);
+        // EnemyNet
+        u32(7); u8(0); u8(0); i16(0); i16(0); u8(0); u8(100);
+        return payload;
+    };
+    const size_t counts_offset = 29;
+    const size_t enemy_count_offset = counts_offset + 2;
+
+    std::vector<uint8_t> payload = build();
+    expect(payload.size() == haven::kSnapshotHeaderSize + haven::kPlayerRecordSize + haven::kEnemyRecordSize,
+           "the fixture matches the documented record sizes");
+    haven::SnapshotFull good{};
+    expect(haven::decode_snapshot_full(payload.data(), payload.size(), good), "a complete payload decodes");
+    expect(good.players.size() == 1 && good.enemies.size() == 1, "the fixture arrays decode");
+
+    // One extra byte past the last record is a framing error, not padding.
+    std::vector<uint8_t> trailing = payload;
+    trailing.push_back(0);
+    haven::SnapshotFull with_trailing{};
+    expect(!haven::decode_snapshot_full(trailing.data(), trailing.size(), with_trailing),
+           "trailing garbage is rejected");
+    expect(with_trailing.enemies.empty(), "a rejected payload leaves nothing behind");
+
+    // An inflated count must be refused before the vector is resized: the
+    // decoder has to see that 65,535 enemy records are not in the payload.
+    for (uint16_t inflated : {static_cast<uint16_t>(2), static_cast<uint16_t>(1000),
+                              static_cast<uint16_t>(65535)})
+    {
+        std::vector<uint8_t> lying = payload;
+        lying[enemy_count_offset] = static_cast<uint8_t>(inflated & 0xFF);
+        lying[enemy_count_offset + 1] = static_cast<uint8_t>((inflated >> 8) & 0xFF);
+        haven::SnapshotFull rejected{};
+        expect(!haven::decode_snapshot_full(lying.data(), lying.size(), rejected),
+               "a count larger than the payload is rejected");
+        expect(rejected.enemies.capacity() == 0,
+               "the rejected count never reached a resize, so nothing was allocated for it");
+    }
+
+    // Every count is checked, not only the enemy one.
+    for (size_t field = 0; field < 4; ++field)
+    {
+        std::vector<uint8_t> lying = payload;
+        lying[counts_offset + field * 2] = 0xFF;
+        lying[counts_offset + field * 2 + 1] = 0xFF;
+        haven::SnapshotFull rejected{};
+        expect(!haven::decode_snapshot_full(lying.data(), lying.size(), rejected),
+               "an inflated count is rejected for every array");
+    }
+
+    // A header that claims fewer records than the payload carries is just as
+    // wrong as one that claims more.
+    std::vector<uint8_t> short_counts = payload;
+    short_counts[enemy_count_offset] = 0;
+    short_counts[enemy_count_offset + 1] = 0;
+    haven::SnapshotFull understated{};
+    expect(!haven::decode_snapshot_full(short_counts.data(), short_counts.size(), understated),
+           "an understated count leaves unread bytes and is rejected");
+
+    // The declared bytes must be exactly what the header describes: a payload
+    // cut short of its last record is rejected too.
+    std::vector<uint8_t> cut(payload.begin(), payload.end() - 1);
+    haven::SnapshotFull short_payload{};
+    expect(!haven::decode_snapshot_full(cut.data(), cut.size(), short_payload),
+           "a payload one byte short of its records is rejected");
+}
+
 void test_interpolation_is_continuous_between_snapshots()
 {
     std::printf("interpolation is continuous between snapshots\n");
@@ -297,6 +391,90 @@ void test_interpolation_is_continuous_between_snapshots()
     expect(after_stall - before_stall == 250, "a 10 s stall advances the clock by the 250 ms clamp");
     expect(!buffer.sample(1, again),
            "running past the newest snapshot reports nothing to draw, so the entity holds still");
+}
+
+void test_first_seen_position_hands_over_continuously()
+{
+    std::printf("an unbracketed entity hands over to interpolation without jumping\n");
+    // The window interpolates over the pair of snapshots bracketing a render
+    // time that sits 100 ms behind the newest snapshot, so an entity that
+    // appeared inside the last few intervals is in neither of that pair and
+    // cannot be interpolated. It still has to be drawn, and where it is drawn
+    // must match where interpolation starts once the window catches up.
+    //
+    // Drawing it at its *newest* position is what goes wrong: while the entity
+    // is only a snapshot or two old, the newest snapshot can be two intervals
+    // ahead of the render time, so the entity is held forward and then snaps
+    // backwards when the bracket reaches it. Holding the first-seen position
+    // instead hands over continuously, because that is exactly where
+    // interpolation starts.
+    haven::InterpolationBuffer buffer;
+    haven::RenderSnapshot a;
+    a.run_time_ms = 0;
+    a.positions = {{1, {0.0f, 0.0f}}};
+    haven::RenderSnapshot b;
+    b.run_time_ms = 50;
+    b.positions = {{1, {5.0f, 0.0f}}};
+    haven::RenderSnapshot c;
+    c.run_time_ms = 100;
+    // Entity 2 appears here and keeps moving.
+    c.positions = {{1, {10.0f, 0.0f}}, {2, {50.0f, 0.0f}}};
+    haven::RenderSnapshot d;
+    d.run_time_ms = 150;
+    d.positions = {{1, {15.0f, 0.0f}}, {2, {60.0f, 0.0f}}};
+    haven::RenderSnapshot e;
+    e.run_time_ms = 200;
+    e.positions = {{1, {20.0f, 0.0f}}, {2, {70.0f, 0.0f}}};
+
+    // Only entity 2 carries a style, so `collect_draw_items` skips entity 1 and
+    // the drawn set is exactly the entity under test.
+    haven::EntityStyle projectile;
+    projectile.kind = haven::EntityKind::Projectile;
+    c.styles.emplace(2, projectile);
+    d.styles.emplace(2, projectile);
+    e.styles.emplace(2, projectile);
+
+    buffer.push(a);
+    buffer.advance(0.100f);
+    buffer.push(b);
+    buffer.advance(0.100f);
+    buffer.push(c);
+    buffer.advance(0.100f);
+    buffer.push(d);
+    buffer.advance(0.100f);
+    buffer.push(e);
+
+    // t_render = 200 (newest) + 0 elapsed - 100 = 100, so the window brackets
+    // (b, c) and entity 2 is missing from b.
+    haven::Vec2 held{0.0f, 0.0f};
+    expect(!buffer.sample(2, held), "an unbracketed entity cannot be interpolated");
+
+    const auto newest = buffer.latest_positions().find(2);
+    expect(newest != buffer.latest_positions().end(), "the newest snapshot carries it");
+    expect_near(newest->second.x, 70.0f, 1e-6f, "its newest position is two intervals ahead");
+
+    expect(buffer.first_seen_position(2, held), "its first-seen position is available");
+    expect_near(held.x, 50.0f, 1e-6f, "held at the position it appeared at, not the newest one");
+
+    // What the renderer actually draws is what matters, so check it rather than
+    // only the buffer query: `collect_draw_items` must pick the first-seen
+    // position, not the newest one.
+    std::vector<haven::EntityDrawItem> items;
+    haven::collect_draw_items(buffer, items);
+    const haven::EntityDrawItem* drawn = nullptr;
+    for (const haven::EntityDrawItem& item : items)
+        if (item.key == 2) drawn = &item;
+    expect(drawn != nullptr, "the unbracketed entity is drawn rather than dropped");
+    expect_near(drawn->pos.x, 50.0f, 1e-6f, "drawn where it appeared, not two intervals ahead");
+
+    // The window catches up: one millisecond later the bracket is (c, d), which
+    // contains the entity, and interpolation there starts from c — the very
+    // position it was held at, so nothing moves backwards.
+    buffer.advance(0.001f);
+    haven::Vec2 bracketed{0.0f, 0.0f};
+    expect(buffer.sample(2, bracketed), "the entity is bracketed once the window reaches it");
+    expect_near(bracketed.x, 50.2f, 0.5f, "interpolation starts where the entity was held");
+    expect(bracketed.x >= held.x, "the handover never moves the entity backwards");
 }
 
 void test_reconcile_repeats_identical_acks()
@@ -450,6 +628,430 @@ void test_reconcile_blends_small_errors()
                 "a 0.05 unit error is blended 15% rather than snapped");
     expect_near(predictor.position().x, before.x - 0.05f * haven::kReconcileBlendRate, 1e-4f,
                 "the blend moves 15% of the way to the server position");
+}
+
+/// Records what a geometry builder emitted so the tests can check vertex and
+/// index counts and winding without an Ogre. The colour is not recorded: it is
+/// the material's, so the builders do not carry one.
+class RecordingSink : public haven::PrimitiveSink {
+public:
+    uint32_t base_index() const override { return static_cast<uint32_t>(vertices.size() / 3); }
+    void vertex(float x, float y, float z) override
+    {
+        vertices.push_back(x);
+        vertices.push_back(y);
+        vertices.push_back(z);
+    }
+    void index(uint32_t index) override { indices.push_back(index); }
+
+    std::vector<float> vertices;
+    std::vector<uint32_t> indices;
+};
+
+void test_entity_keys()
+{
+    std::printf("entity keys\n");
+    // An enemy and a projectile from separate server pools can share an id;
+    // the namespaced keys must not collide, and the raw id survives.
+    const uint32_t enemy_key = haven::interpolation_key(5, haven::EntityKind::Enemy);
+    const uint32_t proj_key = haven::interpolation_key(5, haven::EntityKind::Projectile);
+    expect(enemy_key != proj_key, "enemy and projectile id 5 get different keys");
+    expect(haven::key_kind(enemy_key) == haven::EntityKind::Enemy, "enemy key kind survives");
+    expect(haven::key_kind(proj_key) == haven::EntityKind::Projectile, "projectile key kind survives");
+    expect(haven::key_raw_id(enemy_key) == 5 && haven::key_raw_id(proj_key) == 5, "raw id survives");
+    const uint32_t player_key = haven::interpolation_key(2, haven::EntityKind::Player);
+    expect(haven::key_kind(player_key) == haven::EntityKind::Player, "player key kind survives");
+    expect(haven::key_raw_id(player_key) == 2, "player raw id survives");
+    // A large id is not truncated: the pools are far below 2^30 but the mask
+    // must not silently wrap one id onto another.
+    const uint32_t big = (1u << haven::kKindShift) - 1u;
+    expect(haven::key_raw_id(haven::interpolation_key(big, haven::EntityKind::Enemy)) == big,
+           "a 30 bit id is not truncated");
+}
+
+void test_circle_and_triangle_primitives()
+{
+    std::printf("primitive builders\n");
+    RecordingSink sink;
+    haven::append_circle(sink, {10.0f, -4.0f}, 0.5f, 0.03f, 4);
+    // A 4 segment circle is a centre vertex, 4 ring vertices and 4 triangles.
+    expect(sink.vertices.size() == 5 * 3, "circle emits 5 vertices");
+    expect(sink.indices.size() == 4 * 3, "circle emits 4 triangles");
+    expect_near(sink.vertices[0], 10.0f, 1e-6f, "circle centre vertex x");
+    expect_near(sink.vertices[1], -4.0f, 1e-6f, "circle centre vertex y");
+    // First ring vertex sits at angle 0, i.e. one radius to the right.
+    expect_near(sink.vertices[3], 10.5f, 1e-6f, "ring vertex 0 is at angle 0");
+    expect_near(sink.vertices[4], -4.0f, 1e-6f, "ring vertex 0 keeps the centre y");
+    // Counter-clockwise winding: the cross product of the first two edges is
+    // positive, which Ogre reads as the front face.
+    const float ax = sink.vertices[3] - sink.vertices[0];
+    const float ay = sink.vertices[4] - sink.vertices[1];
+    const float bx = sink.vertices[6] - sink.vertices[0];
+    const float by = sink.vertices[7] - sink.vertices[1];
+    expect(ax * by - ay * bx > 0.0f, "circle is wound counter-clockwise");
+
+    RecordingSink triangle;
+    haven::append_triangle(triangle, {0.0f, 0.0f}, 1.0f, kPi * 0.5f, 0.0f);
+    expect(triangle.vertices.size() == 3 * 3, "triangle emits 3 vertices");
+    expect(triangle.indices.size() == 3, "triangle emits one triangle");
+    // The first vertex is at +angle: pi/2 points up.
+    expect_near(triangle.vertices[0], 0.0f, 1e-5f, "triangle vertex 0 x at angle pi/2");
+    expect_near(triangle.vertices[1], 1.0f, 1e-5f, "triangle vertex 0 points up");
+    const float e1x = triangle.vertices[3] - triangle.vertices[0];
+    const float e1y = triangle.vertices[4] - triangle.vertices[1];
+    const float e2x = triangle.vertices[6] - triangle.vertices[0];
+    const float e2y = triangle.vertices[7] - triangle.vertices[1];
+    expect(e1x * e2y - e1y * e2x > 0.0f, "triangle is wound counter-clockwise");
+}
+
+void test_arc_and_hp_bar()
+{
+    std::printf("arcs and hp bars\n");
+    RecordingSink arc;
+    // A 90 degree arc facing +X: the ring starts at -45 degrees and ends at +45.
+    haven::append_arc(arc, {0.0f, 0.0f}, 3.5f, 0.0f, kPi * 0.5f, 0.0f, 4);
+    // A 4 interval arc is a centre vertex plus 5 ring vertices, so the last
+    // ring vertex lands exactly on the far edge of the wedge.
+    expect(arc.vertices.size() == 6 * 3, "arc emits a centre and 5 ring vertices");
+    expect_near(arc.vertices[3], 3.5f * std::cos(-kPi * 0.25f), 1e-5f, "arc starts 45 degrees left of aim");
+    expect_near(arc.vertices[4], 3.5f * std::sin(-kPi * 0.25f), 1e-5f, "arc start y");
+    const float last_x = arc.vertices[(6 - 1) * 3];
+    const float last_y = arc.vertices[(6 - 1) * 3 + 1];
+    expect_near(last_x, 3.5f * std::cos(kPi * 0.25f), 1e-5f, "arc ends 45 degrees right of aim");
+    expect_near(last_y, 3.5f * std::sin(kPi * 0.25f), 1e-5f, "arc end y");
+    // The wedge must be symmetric about the aim direction.
+    expect_near(std::fabs(arc.vertices[4]), std::fabs(arc.vertices[(6 - 1) * 3 + 1]), 1e-5f,
+               "arc is symmetric about the aim direction");
+}
+
+/// Checks the *triangles*, not just the ring they are built from.
+///
+/// An arc is a fan from the centre into `segments + 1` ring vertices, so the
+/// two ring indices of triangle `i` have to be the consecutive pair `i` and
+/// `i + 1`. The first implementation wrapped the second index with
+/// `% segments` — correct for a closed circle, wrong for an open wedge — which
+/// left the final interval unpainted and drew a stray sliver from the last ring
+/// vertex back to the first. Checking the first and last ring vertices cannot
+/// see either symptom, so this walks the index buffer.
+void test_arc_triangulation()
+{
+    std::printf("arc triangulation\n");
+    const uint32_t segments = 4;
+    const float radius = 3.5f;
+    RecordingSink arc;
+    haven::append_arc(arc, {0.0f, 0.0f}, radius, 0.0f, kPi * 0.5f, 0.0f, segments);
+
+    const uint32_t ring_vertices = segments + 1;
+    expect(arc.vertices.size() == (1 + ring_vertices) * 3, "arc emits a centre and segments+1 ring vertices");
+    expect(arc.indices.size() == segments * 3, "arc emits one triangle per interval");
+
+    // Every triangle is a fan triangle over one consecutive pair of ring
+    // vertices, and those pairs must be exactly the intervals 1..segments.
+    std::vector<uint32_t> interval_starts;
+    for (size_t t = 0; t + 2 < arc.indices.size(); t += 3)
+    {
+        const uint32_t a = arc.indices[t];
+        const uint32_t b = arc.indices[t + 1];
+        const uint32_t c = arc.indices[t + 2];
+        expect(a == 0, "every fan triangle starts at the centre vertex");
+        const uint32_t lo = std::min(b, c);
+        const uint32_t hi = std::max(b, c);
+        expect(hi <= ring_vertices, "no triangle indexes past the ring");
+        expect(hi == lo + 1, "each triangle spans one consecutive pair of ring vertices");
+        interval_starts.push_back(lo);
+    }
+    std::sort(interval_starts.begin(), interval_starts.end());
+    interval_starts.erase(std::unique(interval_starts.begin(), interval_starts.end()), interval_starts.end());
+    expect(interval_starts.size() == segments, "no interval is covered twice");
+    bool covers_every_interval = interval_starts.size() == segments;
+    for (uint32_t i = 0; covers_every_interval && i < segments; ++i)
+        covers_every_interval = interval_starts[i] == 1 + i;
+    expect(covers_every_interval, "the triangles cover ring intervals 1..segments in order");
+    expect(!interval_starts.empty() && interval_starts.back() == segments,
+           "the final interval is covered, not folded back onto the first ring vertex");
+
+    // The fan's area is the sum of its intervals, and every triangle has to turn
+    // the same way: a folded triangle would cancel part of the total out.
+    float signed_area = 0.0f;
+    for (size_t t = 0; t + 2 < arc.indices.size(); t += 3)
+    {
+        const auto vx = [&arc](uint32_t i) { return arc.vertices[static_cast<size_t>(i) * 3]; };
+        const auto vy = [&arc](uint32_t i) { return arc.vertices[static_cast<size_t>(i) * 3 + 1]; };
+        const uint32_t a = arc.indices[t];
+        const uint32_t b = arc.indices[t + 1];
+        const uint32_t c = arc.indices[t + 2];
+        signed_area += (vx(b) - vx(a)) * (vy(c) - vy(a)) - (vy(b) - vy(a)) * (vx(c) - vx(a));
+    }
+    const float step = (kPi * 0.5f) / static_cast<float>(segments);
+    expect_near(signed_area * 0.5f,
+                0.5f * radius * radius * static_cast<float>(segments) * std::sin(step), 1e-3f,
+                "the fan area is the sum of its intervals");
+}
+
+void test_enemy_body_and_hp_bar()
+{
+    std::printf("enemy body and hp bar\n");
+    RecordingSink bodies;
+    RecordingSink bars;
+    haven::EntityDrawItem item;
+    item.kind = haven::EntityKind::Enemy;
+    item.style = 3;  // Triangle T1
+    item.pos = {2.0f, 3.0f};
+    item.angle = kPi * 0.5f;
+    item.hp_pct = 40;
+    haven::append_enemy_body(bodies, item);
+    haven::append_enemy_bar_background(bars, item);
+    haven::append_enemy_bar(bars, item);
+
+    expect(bodies.vertices.size() == 3 * 3, "a triangle archetype emits one triangle");
+    // The triangle points where the enemy is moving: +Y.
+    expect_near(bodies.vertices[1], 3.0f + 0.5f, 1e-5f, "the triangle points along its facing");
+
+    // Two quads: the bar background and the fill.
+    expect(bars.vertices.size() == 8 * 3, "the hp bar emits two quads");
+    expect(bars.indices.size() == 12, "the hp bar emits two triangles pairs");
+    // The bar floats above the body: its lower edge is half a bar height
+    // below the centre it was given.
+    const float bar_low = bars.vertices[1];
+    const float bar_high = bars.vertices[2 * 3 + 1];
+    expect_near(bar_high - bar_low, 0.14f, 1e-5f, "the bar height");
+    expect_near((bar_low + bar_high) * 0.5f, 3.0f + 0.5f + 0.30f, 1e-5f, "the bar sits above the body radius");
+    const float background_width = std::fabs(bars.vertices[3] - bars.vertices[0]);
+    expect_near(background_width, haven::enemy_hp_bar_width(3), 1e-5f, "the background spans the bar width");
+    // The fill is left anchored and shrinks with hp_pct: 40% of the width.
+    const float fill_width = std::fabs(bars.vertices[5 * 3] - bars.vertices[4 * 3]);
+    expect(fill_width < background_width, "the fill is narrower than the background at 40% hp");
+    expect_near(fill_width / background_width, 0.4f, 0.02f, "the fill width tracks hp_pct");
+    // The fill starts at the left edge of the background.
+    expect_near(bars.vertices[4 * 3], bars.vertices[0], 1e-4f, "the fill is left anchored");
+}
+
+void test_enemy_radius_and_shape_tables()
+{
+    std::printf("archetype tables\n");
+    expect_near(haven::enemy_radius(0), 0.5f, 0.0f, "Circle T1 radius");
+    expect_near(haven::enemy_radius(1), 0.9f, 0.0f, "Circle T2 radius");
+    expect_near(haven::enemy_radius(3), 0.5f, 0.0f, "Triangle T1 radius");
+    expect_near(haven::enemy_radius(5), 1.0f, 0.0f, "Triangle T3 radius");
+    expect(haven::archetype_is_circle(0) && !haven::archetype_is_circle(3), "circles and triangles told apart");
+    expect(haven::archetype_colour(0).r > haven::archetype_colour(3).r, "tier 1 circle and triangle differ");
+    expect(haven::enemy_hp_bar_width(0) > 0.5f, "the hp bar is wider than the body");
+    expect(haven::enemy_hp_bar_width(2) < 3.6f, "the hp bar width is bounded for a T3");
+}
+
+void test_colour_slots()
+{
+    std::printf("colour slots\n");
+    // Each archetype gets its own slot, and unknown archetypes fall back to the
+    // first one rather than running off the table.
+    for (uint8_t archetype = 0; archetype < 7; ++archetype)
+    {
+        haven::EntityDrawItem item;
+        item.kind = haven::EntityKind::Enemy;
+        item.style = archetype;
+        const haven::ColourSlot slot = haven::slot_for_body(item);
+        expect(slot.pool == haven::ColourPool::EnemyBody, "the body slot is in the body pool");
+        expect(static_cast<uint8_t>(slot.slot) == archetype, "each archetype has its own slot");
+    }
+    haven::EntityDrawItem unknown;
+    unknown.kind = haven::EntityKind::Enemy;
+    unknown.style = 99;
+    expect(haven::slot_for_body(unknown).slot == 0, "an unknown archetype falls back to slot 0");
+
+    // HP drives the bar slot: empty and full land at opposite ends, and a
+    // middle value lands somewhere between.
+    haven::EntityDrawItem empty_enemy = unknown;
+    empty_enemy.hp_pct = 0;
+    haven::EntityDrawItem full_enemy = unknown;
+    full_enemy.hp_pct = 100;
+    haven::EntityDrawItem half_enemy = unknown;
+    half_enemy.hp_pct = 50;
+    const haven::ColourSlot empty = haven::slot_for_bar(empty_enemy);
+    const haven::ColourSlot full = haven::slot_for_bar(full_enemy);
+    const haven::ColourSlot half = haven::slot_for_bar(half_enemy);
+    expect(empty.slot == 1, "an empty bar uses the first fill slot");
+    expect(full.slot == haven::kEnemyBarSlots - 1, "a full bar uses the last fill slot");
+    expect(half.slot > empty.slot && half.slot < full.slot, "a half full bar lands between");
+    expect(empty.pool == haven::ColourPool::EnemyBar, "the bar slot is in the bar pool");
+
+    // Every slot has a colour, and the bar background is darker than any fill.
+    for (uint8_t pool = 0; pool < 3; ++pool)
+    {
+        for (uint8_t slot = 0; slot < haven::kMaxSlotsPerPool; ++slot)
+        {
+            haven::ColourSlot key{static_cast<haven::ColourPool>(pool), slot};
+            const haven::Rgba colour = haven::slot_colour(key);
+            expect(colour.r >= 0.0f && colour.r <= 1.0f, "a slot colour is in range");
+            expect(colour.a == 1.0f, "a slot colour is opaque");
+        }
+    }
+    const haven::Rgba background = haven::slot_colour(haven::ColourSlot{haven::ColourPool::EnemyBar, 0});
+    const haven::Rgba full_fill = haven::slot_colour(haven::ColourSlot{haven::ColourPool::EnemyBar, 9});
+    expect(full_fill.g > background.g, "a full bar is brighter than its background");
+}
+
+void test_projectile_shapes()
+{
+    std::printf("projectile shapes\n");
+    for (uint8_t weapon = 0; weapon < 4; ++weapon)
+    {
+        RecordingSink sink;
+        haven::EntityDrawItem item;
+        item.kind = haven::EntityKind::Projectile;
+        item.style = weapon;
+        item.pos = {0.0f, 0.0f};
+        item.angle = 0.0f;
+        // The shape byte the server's weapon table sends (shape 0 ARC, 1 CIRCLE,
+        // 2 RAY): sword and axe are arcs, the bow is a ray and the gun a
+        // travelling circle.
+        item.shape = weapon < 2 ? 0 : (weapon == 2 ? 2 : 1);
+        haven::append_projectile(sink, item);
+        expect(sink.vertices.size() > 0, "every weapon emits geometry");
+        expect(sink.indices.size() % 3 == 0, "geometry is made of whole triangles");
+    }
+
+    // The sword arc is narrower than the axe arc at the same range.
+    RecordingSink sword;
+    haven::EntityDrawItem sword_item;
+    sword_item.kind = haven::EntityKind::Projectile;
+    sword_item.style = 0;
+    sword_item.shape = 0;
+    sword_item.pos = {0.0f, 0.0f};
+    sword_item.angle = 0.0f;
+    haven::append_projectile(sword, sword_item);
+
+    RecordingSink axe;
+    haven::EntityDrawItem axe_item = sword_item;
+    axe_item.style = 1;
+    haven::append_projectile(axe, axe_item);
+
+    const auto span = [](const RecordingSink& sink) {
+        float low = 1e30f;
+        float high = -1e30f;
+        for (size_t i = 1; i < sink.vertices.size(); i += 3)
+        {
+            low = std::min(low, sink.vertices[i]);
+            high = std::max(high, sink.vertices[i]);
+        }
+        return high - low;
+    };
+    expect(span(axe) > span(sword), "the axe arc spans more than the sword arc");
+
+    // The bow's arrow is a ray: a quad running from the arrow to the end of its
+    // reach, `reach` long and twice its radius wide.
+    RecordingSink arrow;
+    haven::EntityDrawItem arrow_item = sword_item;
+    arrow_item.style = 2;
+    arrow_item.shape = 2;
+    haven::append_projectile(arrow, arrow_item);
+    expect_near(arrow.vertices.size(), 4 * 3, 0.0f, "a ray arrow emits one quad");
+    const haven::WeaponVisual& bow = haven::weapon_visual(2);
+    expect_near(arrow.vertices[0], 0.0f, 1e-4f, "the ray starts at the arrow");
+    expect_near(arrow.vertices[2 * 3], bow.reach, 1e-4f, "the ray runs a full reach ahead of it");
+
+    // The gun's bullet is a circle of its projectile radius.
+    RecordingSink bullet;
+    haven::EntityDrawItem bullet_item = arrow_item;
+    bullet_item.style = 3;
+    bullet_item.shape = 1;
+    haven::append_projectile(bullet, bullet_item);
+    expect_near(bullet.vertices.size(), 11 * 3, 0.0f, "a 10 segment bullet emits 11 vertices");
+
+    // A shape byte this client does not know must still draw something: an
+    // invisible live projectile reads as a desync. The fallback is the body
+    // circle, which the arc weapons need a radius floor for.
+    const uint8_t unknown_shapes[] = {3, 7, 200, 255};
+    for (uint8_t shape : unknown_shapes)
+    {
+        RecordingSink fallback;
+        haven::EntityDrawItem unknown_item = sword_item;
+        unknown_item.shape = shape;
+        haven::append_projectile(fallback, unknown_item);
+        expect(fallback.vertices.size() == 11 * 3, "an unknown shape draws the fallback circle");
+        expect_near(fallback.vertices[0], unknown_item.pos.x, 1e-6f, "the fallback is centred on the projectile");
+        expect(fallback.vertices[3] > 0.0f, "the fallback has a visible radius even for a zero radius weapon");
+
+        // A projectile weapon keeps its own radius in the fallback.
+        RecordingSink gun_fallback;
+        haven::EntityDrawItem gun_item = unknown_item;
+        gun_item.style = 3;
+        haven::append_projectile(gun_fallback, gun_item);
+        expect_near(gun_fallback.vertices[3], haven::weapon_visual(3).radius, 1e-6f,
+                    "a projectile weapon keeps its own radius in the fallback");
+    }
+}
+
+void test_collect_draw_items()
+{
+    std::printf("collect draw items\n");
+    haven::InterpolationBuffer buffer;
+
+    // An enemy and a projectile that share the raw id 5 must both survive.
+    haven::RenderSnapshot first;
+    first.run_time_ms = 0;
+    first.positions = {{haven::interpolation_key(5, haven::EntityKind::Enemy), {0.0f, 0.0f}},
+                       {haven::interpolation_key(5, haven::EntityKind::Projectile), {10.0f, 0.0f}}};
+    first.styles = {{haven::interpolation_key(5, haven::EntityKind::Enemy),
+                     haven::EntityStyle{haven::EntityKind::Enemy, 0, 100, 0, 0.0f}},
+                    {haven::interpolation_key(5, haven::EntityKind::Projectile),
+                     haven::EntityStyle{haven::EntityKind::Projectile, 2, 0, 1, 1.0f}}};
+
+    // 100 ms of server time between the two snapshots, so the 100 ms
+    // interpolation delay puts the render time exactly halfway between them
+    // once 50 ms of render clock has passed.
+    haven::RenderSnapshot second = first;
+    second.run_time_ms = 100;
+    second.positions = {{haven::interpolation_key(5, haven::EntityKind::Enemy), {20.0f, 0.0f}},
+                        {haven::interpolation_key(5, haven::EntityKind::Projectile), {30.0f, 0.0f}}};
+
+    buffer.push(first);
+    buffer.push(second);
+    buffer.advance(0.050f);
+
+    const std::vector<haven::EntityDrawItem> items = haven::collect_draw_items(buffer);
+    expect(items.size() == 2, "both the enemy and the projectile are drawn");
+    bool found_enemy = false;
+    bool found_projectile = false;
+    for (const haven::EntityDrawItem& item : items)
+    {
+        expect(haven::key_raw_id(item.key) == 5, "the raw id survives round the buffer");
+        if (item.kind == haven::EntityKind::Enemy)
+        {
+            found_enemy = true;
+            expect_near(item.pos.x, 10.0f, 1e-6f, "the enemy is interpolated halfway");
+            expect(item.style == 0 && item.hp_pct == 100, "the enemy style is carried");
+        }
+        else if (item.kind == haven::EntityKind::Projectile)
+        {
+            found_projectile = true;
+            expect_near(item.pos.x, 20.0f, 1e-6f, "the projectile is interpolated halfway");
+            expect(item.style == 2 && item.shape == 1, "the projectile style is carried");
+        }
+    }
+    expect(found_enemy, "the enemy is drawn");
+    expect(found_projectile, "the projectile is drawn");
+
+    // The per-frame hot path fills a caller-owned vector instead of returning a
+    // fresh one, and must clear it rather than append across frames.
+    std::vector<haven::EntityDrawItem> reused;
+    haven::collect_draw_items(buffer, reused);
+    expect(reused.size() == 2, "the in-place collector fills the caller's vector");
+    haven::collect_draw_items(buffer, reused);
+    expect(reused.size() == 2, "a second in-place collect clears rather than appends");
+}
+
+void test_empty_buffer_collects_nothing()
+{
+    std::printf("empty buffer collects nothing\n");
+    haven::InterpolationBuffer buffer;
+    expect(haven::collect_draw_items(buffer).empty(), "an empty buffer draws nothing");
+
+    // One snapshot alone cannot be interpolated, so nothing is drawn yet.
+    haven::RenderSnapshot only;
+    only.run_time_ms = 0;
+    only.positions = {{haven::interpolation_key(1, haven::EntityKind::Enemy), {1.0f, 1.0f}}};
+    buffer.push(only);
+    expect(haven::collect_draw_items(buffer).empty(), "a single snapshot is not interpolated yet");
 }
 
 void test_interpolation()
@@ -616,6 +1218,7 @@ int main()
     test_input_packet();
     test_welcome_packet();
     test_snapshot_packet();
+    test_snapshot_decoder_validation();
     test_sequence_numbers();
     test_input_history();
     test_prediction();
@@ -623,10 +1226,21 @@ int main()
     test_reconcile_blends_small_errors();
     test_interpolation();
     test_interpolation_is_continuous_between_snapshots();
+    test_first_seen_position_hands_over_continuously();
     test_reconcile_repeats_identical_acks();
     test_reconcile_tolerates_a_stale_ack();
     test_input_state();
     test_input_script();
+    test_entity_keys();
+    test_circle_and_triangle_primitives();
+    test_arc_and_hp_bar();
+    test_arc_triangulation();
+    test_enemy_body_and_hp_bar();
+    test_enemy_radius_and_shape_tables();
+    test_colour_slots();
+    test_projectile_shapes();
+    test_collect_draw_items();
+    test_empty_buffer_collects_nothing();
 
     std::printf("\n%d checks, %d failures\n", g_checks, g_failures);
     return g_failures == 0 ? 0 : 1;
