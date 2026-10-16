@@ -84,6 +84,7 @@ private:
     void drain_packets();
     void handle_welcome(const uint8_t* payload, size_t len);
     void handle_snapshot(const uint8_t* payload, size_t len);
+    void accept_snapshot(const SnapshotFull& snapshot);
     void handle_levelup_offer(const uint8_t* payload, size_t len);
     void handle_game_over(const uint8_t* payload, size_t len);
     void handle_loadout(const uint8_t* payload, size_t len);
@@ -116,6 +117,20 @@ private:
     GameOverStats game_over_{};
     uint32_t run_time_ms_ = 0;
     std::array<uint8_t, 4> last_evolved_{};
+    /// Set when C2S_RESTART goes out: the fresh run's snapshots are the new
+    /// baseline whatever tick they carry, so the staleness guard stands down
+    /// until the run's own ordering is re-established.
+    int restart_baseline_left_ = 0;
+
+    /// Server tick of the newest snapshot when the level-up offer arrived:
+    /// the pause begins at that tick, so snapshots at or below it describe the
+    /// pre-pause run even though they arrive after the offer.
+    uint32_t offer_tick_ = 0;
+
+    /// Server tick of the newest snapshot when the run ended. A snapshot at or
+    /// below it still describes the dead run, so it must not dismiss the
+    /// scoreboard the moment it arrives.
+    uint32_t game_over_tick_ = 0;
 
     /// Remote player ids drawn on the previous frame, so a player who left
     /// has its SceneNode destroyed.

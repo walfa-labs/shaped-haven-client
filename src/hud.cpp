@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <array>
 #include <cstdio>
-#include <cstdlib>
 #include <map>
 #include <string>
 #include <vector>
@@ -218,10 +217,6 @@ void Hud::set_run_time(uint32_t run_time_ms)
             Ogre::Node* node = xp_fill_->getParentNode();
             node->setScale(width, kXpBarHeight, 1.0f);
             node->setPosition(kXpBarX + width * 0.5f, kXpBarY, 0.07f);
-            if (getenv("HUD_DEBUG"))
-                std::printf("haven: xp_fill visible=%d scale=%.1f pos=(%.1f,%.1f) mat=%s\n",
-                            xp_fill_->getVisible(), width, kXpBarX + width * 0.5f, kXpBarY,
-                            material_for(Rgba{0.35f, 0.85f, 0.55f, 0.95f})->getName().c_str());
         }
         else
         {
@@ -515,14 +510,6 @@ void Hud::rebuild_batch(QuadBatch& batch)
     object->setBoundingBox(Ogre::AxisAlignedBox(-kViewportHalfWidth, -kViewportHalfHeight, 0.4f,
                                                 kViewportHalfWidth, kViewportHalfHeight, 0.6f));
     batch.object = object;
-
-    if (getenv("HUD_DEBUG"))
-    {
-        uint32_t quads = 0;
-        for (const QuadBatch::Section& s : batch.sections) quads += s.verts / 4;
-        std::printf("haven: hud batch %s: %zu sections, %u quads\n", batch.name.c_str(),
-                    batch.sections.size(), quads);
-    }
 }
 
 void Hud::clear_batch(QuadBatch& batch)

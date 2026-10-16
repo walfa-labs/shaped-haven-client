@@ -66,12 +66,20 @@ so the server can still be starting up. Escape closes the window.
 | `--frames <n>` | Quit after `n` rendered frames. |
 | `--screenshot <path>` | Write the framebuffer to `path` on exit (implies `--frames 120`). |
 | `--input-script <path>` | Feed move vectors from a file instead of the keyboard. |
+| `--choice-script <path>` | Answer level-ups and restarts from a file. |
 | `--verbose` | Print one status line per 60 frames. |
 
 `--input-script` exists so the input path can be exercised without a focused
 window, which matters for automated runs. Each non-comment line is
 `<move_x> <move_y> <ticks>`, one move per 60 Hz tick; see
 `tests/data/input_script.txt`.
+
+`--choice-script` drives the upgrade draft without a human. Each non-comment
+line is one run event in chronological order: a choice index `0..2` for a
+level-up offer, or the literal `restart` at a game over; see
+`tests/data/choice_script.txt`. The keyboard always works and wins over the
+script: `1`/`2`/`3` pick a card, `R` restarts. With no input at all the
+server's 15 s timeout auto-selects option 0.
 
 ## Tests
 
@@ -80,50 +88,48 @@ cmake --build build --config Release
 ./build/Release/shaped-haven-client-tests.exe   # or: ctest --test-dir build
 ```
 
-The tests cover the packet encode/decode and its payload validation, the
-position and angle quantisation, the prediction ring buffer and both
-reconciliation paths, the interpolation buffer, the keyboard mapping, and the
-geometry builders (primitive counts, winding, HP bar layout, and the arc fan's
+The tests cover the packet encode/decode and its payload validation (including
+the phase-3 messages), the position and angle quantisation, the prediction ring
+buffer and both reconciliation paths, the interpolation buffer, the keyboard
+mapping, the item catalog, the bitmap font, the choice input, and the geometry
+builders (primitive counts, winding, HP bar layout, and the arc fan's
 interval coverage). They link no Ogre libraries.
 
 ## Status
 
-Phase 2 — combat rendering. The window, orthographic camera, procedural mesh
-builders, async TCP thread, 60 Hz prediction with reconciliation and the 100 ms
-interpolation buffer are in place, and on top of them the client now parses and
-draws the `EnemyNet` and `ProjNet` arrays the snapshot already carries:
+Phase 3 — level-up and HUD. The client now speaks the phase-3 protocol from
+`PROTOCOL.md` (the authoritative byte layout for both repos):
 
-- Enemies are circles or triangles by archetype, each with an HP bar whose
-  width tracks `hp_pct` and whose colour drains from green to red.
-- Weapon sweeps are drawn as arc wedges, the bow's arrow as a ray and the gun's
-  bullet as a travelling circle, at the level-1 reach and radius from
-  DESIGN.md §3. `ProjNet`'s `shape` byte picks the primitive, `weapon_id` the
-  size and colour; a shape byte the client does not know falls back to the
-  bullet circle rather than drawing nothing.
-- Everything is interpolated through the same 100 ms buffer the remote
-  players use, so there is no second interpolation path.
-- A snapshot whose counts do not match the bytes that arrived is rejected
-  before any vector is resized, and the frame header's `payload_len` is checked
-  against the bytes actually delivered.
+- **XP gems.** The `GemNet` array the snapshot already carries is drawn as
+  diamonds through the same batched primitive renderer and the same 100 ms
+  interpolation buffer as players, enemies and projectiles — one more
+  `EntityKind`, one more colour pool, no second render path. Size and colour
+  follow the DESIGN.md §1 gem tiers: small cyan, medium green, large violet,
+  boss cache gold.
+- **Level-up draft.** `S2C_LEVELUP_OFFER` (0x84) raises a three-card modal over
+  a dimmed, input-frozen game; the pick goes out as `C2S_LEVELUP_CHOICE` (0x03)
+  with the offer's `event_id`, from the `1`/`2`/`3` keys or `--choice-script`.
+  An evolution card names its two components; the server's 15 s timeout
+  auto-selects option 0 when no input arrives.
+- **HUD.** `S2C_LOADOUT` (0x86) drives an XP bar with the level label and run
+  clock, and an item tray: up to four weapon boxes (level pips, or an `EVOLVED`
+  tag) and up to ten passive boxes. Text is a baked 5x7 bitmap font drawn as
+  quads through the same immediate-mode sink — the Ogre SDK ships no font and
+  the design allows no art assets.
+- **Evolution banner.** A weapon slot whose `evolved` byte just became 1 raises
+  an `EVOLUTION!` banner naming the new weapon for 2.5 s.
+- **Game over and restart.** `S2C_GAME_OVER` (0x85) freezes input and shows a
+  scoreboard (time survived, score, kills); `R` or a `restart` line in the
+  choice script sends `C2S_RESTART` (0x05), and the next snapshot starts a
+  fresh run — the interpolation buffer and HUD reset with it, and the
+  staleness guard restarts with the run.
 
-Measured on this machine (Release build, 1280x720), against the real
-`shaped-haven-server` phase-2 branch built from `phase-2-combat` and started
-with `--stress-enemies 1000 --stress-projectiles 500`:
+Measured on this machine (Release build, 1280x720) against the real
+`shaped-haven-server` `phase-3-upgrades` branch:
 
-- The logic tests report **544 checks, 0 failures**.
-- A 600-frame run renders at **136.0 fps** (4.41 s), with 3.5–3.8 ms of
-  client-side work per frame, `malformed=0`, `stale=0` and `qdropped=0`
-  throughout.
-- The client draws exactly what the server reports: **1,000 enemies and 500
-  projectiles** per frame, matching the stress flag. A raw probe of the same
-  server confirms every snapshot on the wire carries exactly that. An entity
-  the interpolation window does not bracket yet is held at its first-seen
-  position, so nothing is dropped and the handover to interpolation is
-  continuous.
-
-The arc wedge's triangulation is pinned by a test that walks the index buffer
-and requires every interval of the ring to be covered exactly once; the
-rendered result was also checked in pixels: a probe that feeds the client one
-static axe projectile renders a 160° wedge of 5.0 u radius whose covered area
-is 8764 px against the analytic fan area of 8756 px, with no gap in the final
-interval.
+- The logic tests report **772 checks, 0 failures**.
+- A 4,800-frame run renders at **141.3 fps**, with 0.3 ms of client-side work
+  per frame, `stale=0`, `malformed=0` and `qdropped=0` throughout, while the
+  server offers two level-ups (both answered), the run ends at 0 HP, and a
+  scripted restart starts a fresh one. Against a `--stress-enemies 200` server
+  the same client draws **200 enemies** at **2.4 ms/frame** of update work.

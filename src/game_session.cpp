@@ -188,6 +188,7 @@ void GameSession::handle_levelup_offer(const uint8_t* payload, size_t len)
     // modal goes up now and input freezes until the run resumes.
     pending_offer_ = offer;
     run_state_ = RunState::LevelUp;
+    offer_tick_ = stats_.server_tick;
     hud_.show_offer(offer);
     std::printf("haven: level-up offer event=%u level=%u options=[%u %u %u] [%u %u %u] [%u %u %u]\n",
                 static_cast<unsigned>(offer.event_id), static_cast<unsigned>(offer.new_level),
@@ -210,6 +211,7 @@ void GameSession::handle_game_over(const uint8_t* payload, size_t len)
 
     game_over_ = stats;
     run_state_ = RunState::GameOver;
+    game_over_tick_ = stats_.server_tick;
     std::printf("haven: game over after %u s, score %u, kills %u\n", static_cast<unsigned>(stats.seconds_survived),
                 static_cast<unsigned>(stats.score), static_cast<unsigned>(stats.kills));
 }
@@ -246,16 +248,25 @@ void GameSession::handle_loadout(const uint8_t* payload, size_t len)
 
 void GameSession::apply_run_state()
 {
-    // The snapshot header's game_state outranks the packets above: it is what
-    // the simulation is actually doing right now.
-    if (stats_.game_state == GameState::Running && run_state_ != RunState::Running)
+    // The snapshot header's game_state outranks the packets above when it
+    // describes a newer moment of the run. A snapshot that predates the last
+    // transition is a leftover from before it: the server pauses the
+    // simulation the instant it sends the level-up offer, so the first
+    // snapshot arriving after the offer can still carry the pre-pause
+    // game_state, and acting on it would cancel the offer that just opened.
+    const bool stale_after_offer = run_state_ == RunState::LevelUp && stats_.server_tick <= offer_tick_;
+    const bool stale_after_game_over = run_state_ == RunState::GameOver && stats_.server_tick <= game_over_tick_;
+
+    if (stats_.game_state == GameState::Running && run_state_ != RunState::Running && !stale_after_offer &&
+        !stale_after_game_over)
     {
         pending_offer_.reset();
         run_state_ = RunState::Running;
         hud_.hide_offer();
         hud_.hide_game_over();
     }
-    else if (stats_.game_state == GameState::GameOver && run_state_ != RunState::GameOver)
+    else if (stats_.game_state == GameState::GameOver && run_state_ != RunState::GameOver &&
+             !stale_after_offer)
     {
         run_state_ = RunState::GameOver;
         hud_.show_game_over(game_over_);
@@ -319,6 +330,10 @@ void GameSession::maybe_restart()
     interpolation_.clear();
     renderer_.clear_remote_players();
     hud_.reset();
+    // A fresh run's snapshots may well carry a server tick below the dead
+    // run's last one, so the staleness guard has to restart with the run.
+    stats_.server_tick = 0;
+    restart_baseline_left_ = 4;
     stats_.level = 1;
     stats_.xp = 0;
     stats_.xp_next = 0;
@@ -357,12 +372,25 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
 
     // Snapshots must arrive in order. A stale one carries an older
     // authoritative position, and applying it would drag the prediction
-    // backwards.
+    // backwards — unless the run has just restarted, in which case the next
+    // few snapshots re-establish the baseline whatever ticks they carry (the
+    // server may reset its tick to 0, or keep counting from the dead run).
+    if (restart_baseline_left_ > 0)
+    {
+        --restart_baseline_left_;
+        accept_snapshot(snapshot);
+        return;
+    }
     if (stats_.server_tick != 0 && snapshot.server_tick < stats_.server_tick)
     {
         ++stats_.stale_snapshots;
         return;
     }
+    accept_snapshot(snapshot);
+}
+
+void GameSession::accept_snapshot(const SnapshotFull& snapshot)
+{
     stats_.server_tick = snapshot.server_tick;
 
     // Reused, not rebuilt: clearing the maps keeps their buckets, so the only
