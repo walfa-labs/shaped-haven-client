@@ -308,10 +308,14 @@ void collect_draw_items(const InterpolationBuffer& buffer, std::vector<EntityDra
         const auto style = styles.find(entry.first);
         if (style == styles.end()) continue;
 
-        // An entity the buffer cannot bracket yet is simply not drawn this
-        // frame; it appears once the older snapshot carrying it arrives.
+        // The bracketing pair the buffer interpolates over sits 100 ms behind
+        // the newest snapshot, so an entity that appeared inside the last
+        // snapshot interval is not in either of them. Draw it where the newest
+        // snapshot put it: at 20 Hz a short-lived projectile can otherwise be
+        // spawned and killed without ever being drawn, and the on-screen count
+        // silently trails the count the server is actually sending.
         Vec2 pos;
-        if (!buffer.sample(entry.first, pos)) continue;
+        if (!buffer.sample(entry.first, pos)) pos = entry.second;
 
         EntityDrawItem item;
         item.key = entry.first;
