@@ -1,7 +1,7 @@
 # Protocol v1 — byte layout
 
-Authoritative layout for the phase 1 wire protocol. DESIGN.md §5 gives the
-message list and §2 the snapshot header; where the two disagree this file wins.
+Authoritative layout for the wire protocol. DESIGN.md §5 gives the message
+list and §2 the snapshot header; where the two disagree this file wins.
 
 Both repos must agree on it. If you change anything here, change it in both.
 
@@ -39,6 +39,15 @@ All multi-byte fields are little-endian. `TCP_NODELAY` is set by the client.
 | 9 | i1 | `move_y`, −100..100 |
 | 10 | u2 | `aim_angle` |
 | 12 | u1 | `buttons` |
+
+## `C2S_ACK_SNAPSHOT` (0x04) — 4 byte payload
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | u4 | `last_recv_server_tick` |
+
+Sent at most once per snapshot. It is what lets the server pick a baseline:
+the client is telling it which tick it holds a complete state for.
 
 ## `S2C_WELCOME` (0x81) — 17 byte payload
 
@@ -99,9 +108,6 @@ Positions are `i16` in 0.05 unit steps, so `[-1000, 1000]` maps to
 `[-20000, 20000]` exactly as DESIGN.md §2 specifies. Angles are `u8`, 0..255
 mapping 0..2π.
 
-`S2C_SNAPSHOT_DELTA` (0x83) is not implemented yet — phase 4. Everything below
-is the phase 3 addition.
-
 ## `game_state` values
 
 Carried in the snapshot header. `0` running, `1` level-up pause, `2` game over.
@@ -109,8 +115,8 @@ Carried in the snapshot header. `0` running, `1` level-up pause, `2` game over.
 ## Item ids
 
 One id space covers weapons, passives, evolutions and the endless Overclock
-upgrades, so an upgrade option, a loadout entry and a weapon id all name the
-same thing the same way.
+upgrades, so an upgrade option, a loadout entry and a projectile's weapon id
+all name the same thing the same way.
 
 | Range | Meaning |
 | --- | --- |
@@ -174,3 +180,78 @@ this message is only about progression.
 
 Slots beyond the count are filled with `0xFF` rather than being omitted, so the
 payload is always 45 bytes.
+
+## `S2C_SNAPSHOT_DELTA` (0x83) — phase 4
+
+A delta carries the same 37-byte header as a full snapshot, with the counts
+meaning something different, followed by three variable-length arrays.
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | u32 | `server_tick` |
+| 4 | u32 | `baseline_tick` — the tick this delta is relative to |
+| 8 | u32 | `run_time_ms` |
+| 12 | 4 × u32 | `acked_seq[4]` |
+| 28 | u8 | `game_state` |
+| 29 | 4 × u16 | `counts` = **spawned, updated, destroyed, reserved (0)** |
+| 37 | … | the three arrays, in that order |
+
+`kind` bytes name the record type that follows:
+
+| Value | Meaning | Record |
+| --- | --- | --- |
+| 0 | player | `PlayerNet`, 8 bytes |
+| 1 | enemy | `EnemyNet`, 12 bytes |
+| 2 | projectile | `ProjNet`, 12 bytes |
+| 3 | gem | `GemNet`, 12 bytes |
+
+**Spawned** — `counts[0]` records, each `kind` u8 followed by that kind's full
+record. An entity the client has never seen.
+
+**Updated** — `counts[1]` records, each `kind` u8, `id` u32, then that kind's
+full record. The full record rather than a dirty mask: every moving entity
+changes position every tick, so a mask would cost a byte to save nothing.
+
+**Destroyed** — `counts[2]` records, each `kind` u8, `id` u32.
+
+### Baseline rules
+
+The client holds exactly one complete state: the one it last acknowledged with
+`C2S_ACK_SNAPSHOT`. A delta is applied on top of that state and must carry
+`baseline_tick` equal to it.
+
+- The server sends `S2C_SNAPSHOT_FULL` when the client has no acknowledged
+  baseline, or when the requested baseline has fallen out of the server's
+  32-snapshot history ring (1.6 s).
+- Otherwise it sends a delta against the acknowledged tick.
+- A client that receives a delta whose `baseline_tick` is not the tick it
+  holds **must not apply it**; it should keep sending `C2S_ACK_SNAPSHOT` for
+  the state it does hold, and the server will answer with a full snapshot.
+- `S2C_SNAPSHOT_FULL` also carries `baseline_tick = 0`, which is never a valid
+  delta baseline, so the two are never ambiguous.
+
+### Interest management
+
+The snapshot — full or delta — carries only entities within `interest_radius`
+of the receiving player, not the whole arena. An entity that leaves that radius
+appears in `destroyed`; one that enters it appears in `spawned`. The client
+therefore renders a complete world in its own neighbourhood and nothing
+outside it.
+
+`interest_radius` is a server constant, sent to the client in `S2C_WELCOME`
+as a `u16` in world units (offset 13 replaces the old `server_tick` field,
+which moves to offset 15; the payload grows from 17 to 21 bytes).
+
+| Offset | Size | Field |
+| --- | --- | --- |
+| 0 | u1 | `player_id` |
+| 1 | u8 | `session_token` (echoed) |
+| 9 | u1 | `tick_hz` = 60 |
+| 10 | u1 | `snap_hz` = 20 |
+| 11 | u2 | `arena_half_size` = 1000 |
+| 13 | u2 | `interest_radius`, world units |
+| 15 | u2 | `reserved` = 0 |
+| 17 | u4 | `server_tick` |
+
+This is the one change to an existing message in phase 4. Both halves must move
+together.
