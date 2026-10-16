@@ -70,3 +70,8 @@ add_executable(shaped-haven-client-tests tests/test_logic.cpp
 target_include_directories(shaped-haven-client-tests PRIVATE src)
 
 add_test(NAME logic COMMAND shaped-haven-client-tests)
+
+# The tests load their fixtures from `tests/data/` by relative path, so they have
+# to run from the source directory rather than from the build tree ctest
+# defaults to.
+set_tests_properties(logic PROPERTIES WORKING_DIRECTORY "${CMAKE_SOURCE_DIR}")
