@@ -1,0 +1,4 @@
+# one second of movement right, then half a second up, then idle
+1 0 1
+0 1 2
+0 0 2

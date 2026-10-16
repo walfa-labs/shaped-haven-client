@@ -3,3 +3,6 @@ out/
 .vs/
 *.user
 CMakeUserPresets.json
+
+# Ogre writes its log next to the working directory the client was started from.
+*.log
