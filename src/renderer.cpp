@@ -15,7 +15,6 @@
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
-#include <memory>
 
 namespace haven {
 
@@ -449,20 +448,6 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items)
             }
             object->end();
             any = true;
-
-            if (getenv("HAVEN_DEBUG_BATCH") != nullptr && !slot_items_[slot_index(key)].empty())
-            {
-                std::printf("haven:   pool %u slot %u entities %zu\n", pool, slot,
-                            slot_items_[slot_index(key)].size());
-                if (getenv("HAVEN_DEBUG_COORDS") != nullptr)
-                {
-                    const Ogre::AxisAlignedBox box = object->getBoundingBox();
-                    std::printf("haven:     aabb min=(%.1f,%.1f,%.1f) max=(%.1f,%.1f,%.1f) radius=%.1f\n",
-                                box.getMinimum().x, box.getMinimum().y, box.getMinimum().z,
-                                box.getMaximum().x, box.getMaximum().y, box.getMaximum().z,
-                                object->getBoundingRadius());
-                }
-            }
         }
 
         // Every slot is rewritten each frame, even the empty ones: a section
@@ -470,21 +455,6 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items)
         // section draws nothing, and the object as a whole is hidden when no
         // slot in it produced anything this frame.
         object->setVisible(any);
-
-        if (getenv("HAVEN_DEBUG_BATCH") != nullptr)
-        {
-            for (uint8_t slot = 0; slot < kMaxSlotsPerPool; ++slot)
-            {
-                ColourBatch& batch = batches_[pool * kMaxSlotsPerPool + slot];
-                if (!batch.created) continue;
-                const auto& sections = object->getSections();
-                if (batch.section >= sections.size()) continue;
-                const Ogre::RenderOperation* op = sections[batch.section]->getRenderOperation();
-                std::printf("haven:   pool %u slot %u visible=%d v=%u i=%u\n", pool, slot,
-                            static_cast<int>(object->isVisible()), op->vertexData->vertexCount,
-                            op->useIndexes && op->indexData ? op->indexData->indexCount : 0u);
-            }
-        }
     }
 }
 
