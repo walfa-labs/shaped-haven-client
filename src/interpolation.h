@@ -73,6 +73,13 @@ public:
     /// unknown.
     bool sample(uint32_t entity_id, Vec2& out) const;
 
+    /// Position of `entity_id` from the oldest buffered snapshot that carries
+    /// it, i.e. where it was when it first appeared. Used to draw an entity the
+    /// interpolation window does not bracket yet: holding it at its newest
+    /// position instead would make it jump backwards once it becomes bracketed,
+    /// because the window renders 100 ms in the past.
+    bool first_seen_position(uint32_t entity_id, Vec2& out) const;
+
     /// Interpolates between two explicit snapshots; exposed for testing.
     static bool interpolate_between(const RenderSnapshot& a, const RenderSnapshot& b, int64_t t_render,
                                     uint32_t entity_id, Vec2& out);

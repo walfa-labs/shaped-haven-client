@@ -93,4 +93,21 @@ bool InterpolationBuffer::interpolate_between(const RenderSnapshot& a, const Ren
     return true;
 }
 
+bool InterpolationBuffer::first_seen_position(uint32_t entity_id, Vec2& out) const
+{
+    // Oldest first: the first snapshot that carries the entity is where it was
+    // when it appeared, which is the position the interpolation window will
+    // start from once it brackets the entity.
+    for (const Snapshot& snapshot : snapshots_)
+    {
+        const auto it = snapshot.data.positions.find(entity_id);
+        if (it != snapshot.data.positions.end())
+        {
+            out = it->second;
+            return true;
+        }
+    }
+    return false;
+}
+
 }  // namespace haven

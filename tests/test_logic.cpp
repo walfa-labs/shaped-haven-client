@@ -393,6 +393,90 @@ void test_interpolation_is_continuous_between_snapshots()
            "running past the newest snapshot reports nothing to draw, so the entity holds still");
 }
 
+void test_first_seen_position_hands_over_continuously()
+{
+    std::printf("an unbracketed entity hands over to interpolation without jumping\n");
+    // The window interpolates over the pair of snapshots bracketing a render
+    // time that sits 100 ms behind the newest snapshot, so an entity that
+    // appeared inside the last few intervals is in neither of that pair and
+    // cannot be interpolated. It still has to be drawn, and where it is drawn
+    // must match where interpolation starts once the window catches up.
+    //
+    // Drawing it at its *newest* position is what goes wrong: while the entity
+    // is only a snapshot or two old, the newest snapshot can be two intervals
+    // ahead of the render time, so the entity is held forward and then snaps
+    // backwards when the bracket reaches it. Holding the first-seen position
+    // instead hands over continuously, because that is exactly where
+    // interpolation starts.
+    haven::InterpolationBuffer buffer;
+    haven::RenderSnapshot a;
+    a.run_time_ms = 0;
+    a.positions = {{1, {0.0f, 0.0f}}};
+    haven::RenderSnapshot b;
+    b.run_time_ms = 50;
+    b.positions = {{1, {5.0f, 0.0f}}};
+    haven::RenderSnapshot c;
+    c.run_time_ms = 100;
+    // Entity 2 appears here and keeps moving.
+    c.positions = {{1, {10.0f, 0.0f}}, {2, {50.0f, 0.0f}}};
+    haven::RenderSnapshot d;
+    d.run_time_ms = 150;
+    d.positions = {{1, {15.0f, 0.0f}}, {2, {60.0f, 0.0f}}};
+    haven::RenderSnapshot e;
+    e.run_time_ms = 200;
+    e.positions = {{1, {20.0f, 0.0f}}, {2, {70.0f, 0.0f}}};
+
+    // Only entity 2 carries a style, so `collect_draw_items` skips entity 1 and
+    // the drawn set is exactly the entity under test.
+    haven::EntityStyle projectile;
+    projectile.kind = haven::EntityKind::Projectile;
+    c.styles.emplace(2, projectile);
+    d.styles.emplace(2, projectile);
+    e.styles.emplace(2, projectile);
+
+    buffer.push(a);
+    buffer.advance(0.100f);
+    buffer.push(b);
+    buffer.advance(0.100f);
+    buffer.push(c);
+    buffer.advance(0.100f);
+    buffer.push(d);
+    buffer.advance(0.100f);
+    buffer.push(e);
+
+    // t_render = 200 (newest) + 0 elapsed - 100 = 100, so the window brackets
+    // (b, c) and entity 2 is missing from b.
+    haven::Vec2 held{0.0f, 0.0f};
+    expect(!buffer.sample(2, held), "an unbracketed entity cannot be interpolated");
+
+    const auto newest = buffer.latest_positions().find(2);
+    expect(newest != buffer.latest_positions().end(), "the newest snapshot carries it");
+    expect_near(newest->second.x, 70.0f, 1e-6f, "its newest position is two intervals ahead");
+
+    expect(buffer.first_seen_position(2, held), "its first-seen position is available");
+    expect_near(held.x, 50.0f, 1e-6f, "held at the position it appeared at, not the newest one");
+
+    // What the renderer actually draws is what matters, so check it rather than
+    // only the buffer query: `collect_draw_items` must pick the first-seen
+    // position, not the newest one.
+    std::vector<haven::EntityDrawItem> items;
+    haven::collect_draw_items(buffer, items);
+    const haven::EntityDrawItem* drawn = nullptr;
+    for (const haven::EntityDrawItem& item : items)
+        if (item.key == 2) drawn = &item;
+    expect(drawn != nullptr, "the unbracketed entity is drawn rather than dropped");
+    expect_near(drawn->pos.x, 50.0f, 1e-6f, "drawn where it appeared, not two intervals ahead");
+
+    // The window catches up: one millisecond later the bracket is (c, d), which
+    // contains the entity, and interpolation there starts from c — the very
+    // position it was held at, so nothing moves backwards.
+    buffer.advance(0.001f);
+    haven::Vec2 bracketed{0.0f, 0.0f};
+    expect(buffer.sample(2, bracketed), "the entity is bracketed once the window reaches it");
+    expect_near(bracketed.x, 50.2f, 0.5f, "interpolation starts where the entity was held");
+    expect(bracketed.x >= held.x, "the handover never moves the entity backwards");
+}
+
 void test_reconcile_repeats_identical_acks()
 {
     std::printf("reconciliation applies repeated identical acks\n");
@@ -1142,6 +1226,7 @@ int main()
     test_reconcile_blends_small_errors();
     test_interpolation();
     test_interpolation_is_continuous_between_snapshots();
+    test_first_seen_position_hands_over_continuously();
     test_reconcile_repeats_identical_acks();
     test_reconcile_tolerates_a_stale_ack();
     test_input_state();

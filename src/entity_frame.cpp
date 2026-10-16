@@ -310,12 +310,14 @@ void collect_draw_items(const InterpolationBuffer& buffer, std::vector<EntityDra
 
         // The bracketing pair the buffer interpolates over sits 100 ms behind
         // the newest snapshot, so an entity that appeared inside the last
-        // snapshot interval is not in either of them. Draw it where the newest
-        // snapshot put it: at 20 Hz a short-lived projectile can otherwise be
-        // spawned and killed without ever being drawn, and the on-screen count
-        // silently trails the count the server is actually sending.
+        // snapshot interval is in neither of them. Draw it where it was when it
+        // first appeared — not at its newest position, which would make it jump
+        // backwards the moment the window catches up and starts interpolating
+        // from that same first-seen position. Holding the first-seen position
+        // makes the handover continuous.
         Vec2 pos;
-        if (!buffer.sample(entry.first, pos)) pos = entry.second;
+        if (!buffer.sample(entry.first, pos) && !buffer.first_seen_position(entry.first, pos))
+            pos = entry.second;
 
         EntityDrawItem item;
         item.key = entry.first;
