@@ -456,24 +456,20 @@ void test_reconcile_blends_small_errors()
 }
 
 /// Records what a geometry builder emitted so the tests can check vertex and
-/// index counts, winding and colours without an Ogre.
+/// index counts and winding without an Ogre. The colour is not recorded: it is
+/// the material's, so the builders do not carry one.
 class RecordingSink : public haven::PrimitiveSink {
 public:
     uint32_t base_index() const override { return static_cast<uint32_t>(vertices.size() / 3); }
-    void vertex(float x, float y, float z, const haven::Rgba& colour) override
+    void vertex(float x, float y, float z) override
     {
         vertices.push_back(x);
         vertices.push_back(y);
         vertices.push_back(z);
-        colours.push_back(colour.r);
-        colours.push_back(colour.g);
-        colours.push_back(colour.b);
-        colours.push_back(colour.a);
     }
     void index(uint32_t index) override { indices.push_back(index); }
 
     std::vector<float> vertices;
-    std::vector<float> colours;
     std::vector<uint32_t> indices;
 };
 
@@ -502,7 +498,7 @@ void test_circle_and_triangle_primitives()
 {
     std::printf("primitive builders\n");
     RecordingSink sink;
-    haven::append_circle(sink, {10.0f, -4.0f}, 0.5f, {1.0f, 0.5f, 0.25f, 1.0f}, 0.03f, 4);
+    haven::append_circle(sink, {10.0f, -4.0f}, 0.5f, 0.03f, 4);
     // A 4 segment circle is a centre vertex, 4 ring vertices and 4 triangles.
     expect(sink.vertices.size() == 5 * 3, "circle emits 5 vertices");
     expect(sink.indices.size() == 4 * 3, "circle emits 4 triangles");
@@ -518,13 +514,9 @@ void test_circle_and_triangle_primitives()
     const float bx = sink.vertices[6] - sink.vertices[0];
     const float by = sink.vertices[7] - sink.vertices[1];
     expect(ax * by - ay * bx > 0.0f, "circle is wound counter-clockwise");
-    // Every vertex carries the same colour.
-    expect(sink.colours.size() == 5 * 4, "one colour per vertex");
-    for (size_t i = 0; i < 5; ++i)
-        expect_near(sink.colours[i * 4 + 1], 0.5f, 1e-6f, "vertex colour is passed through");
 
     RecordingSink triangle;
-    haven::append_triangle(triangle, {0.0f, 0.0f}, 1.0f, kPi * 0.5f, {1.0f, 1.0f, 1.0f, 1.0f}, 0.0f);
+    haven::append_triangle(triangle, {0.0f, 0.0f}, 1.0f, kPi * 0.5f, 0.0f);
     expect(triangle.vertices.size() == 3 * 3, "triangle emits 3 vertices");
     expect(triangle.indices.size() == 3, "triangle emits one triangle");
     // The first vertex is at +angle: pi/2 points up.
@@ -542,7 +534,7 @@ void test_arc_and_hp_bar()
     std::printf("arcs and hp bars\n");
     RecordingSink arc;
     // A 90 degree arc facing +X: the ring starts at -45 degrees and ends at +45.
-    haven::append_arc(arc, {0.0f, 0.0f}, 3.5f, 0.0f, kPi * 0.5f, {1.0f, 0.0f, 0.0f, 1.0f}, 0.0f, 4);
+    haven::append_arc(arc, {0.0f, 0.0f}, 3.5f, 0.0f, kPi * 0.5f, 0.0f, 4);
     // A 4 interval arc is a centre vertex plus 5 ring vertices, so the last
     // ring vertex lands exactly on the far edge of the wedge.
     expect(arc.vertices.size() == 6 * 3, "arc emits a centre and 5 ring vertices");
@@ -568,7 +560,9 @@ void test_enemy_body_and_hp_bar()
     item.pos = {2.0f, 3.0f};
     item.angle = kPi * 0.5f;
     item.hp_pct = 40;
-    haven::append_enemy(bodies, bars, item);
+    haven::append_enemy_body(bodies, item);
+    haven::append_enemy_bar_background(bars, item);
+    haven::append_enemy_bar(bars, item);
 
     expect(bodies.vertices.size() == 3 * 3, "a triangle archetype emits one triangle");
     // The triangle points where the enemy is moving: +Y.
@@ -604,6 +598,57 @@ void test_enemy_radius_and_shape_tables()
     expect(haven::archetype_colour(0).r > haven::archetype_colour(3).r, "tier 1 circle and triangle differ");
     expect(haven::enemy_hp_bar_width(0) > 0.5f, "the hp bar is wider than the body");
     expect(haven::enemy_hp_bar_width(2) < 3.6f, "the hp bar width is bounded for a T3");
+}
+
+void test_colour_slots()
+{
+    std::printf("colour slots\n");
+    // Each archetype gets its own slot, and unknown archetypes fall back to the
+    // first one rather than running off the table.
+    for (uint8_t archetype = 0; archetype < 7; ++archetype)
+    {
+        haven::EntityDrawItem item;
+        item.kind = haven::EntityKind::Enemy;
+        item.style = archetype;
+        const haven::ColourSlot slot = haven::slot_for_body(item);
+        expect(slot.pool == haven::ColourPool::EnemyBody, "the body slot is in the body pool");
+        expect(static_cast<uint8_t>(slot.slot) == archetype, "each archetype has its own slot");
+    }
+    haven::EntityDrawItem unknown;
+    unknown.kind = haven::EntityKind::Enemy;
+    unknown.style = 99;
+    expect(haven::slot_for_body(unknown).slot == 0, "an unknown archetype falls back to slot 0");
+
+    // HP drives the bar slot: empty and full land at opposite ends, and a
+    // middle value lands somewhere between.
+    haven::EntityDrawItem empty_enemy = unknown;
+    empty_enemy.hp_pct = 0;
+    haven::EntityDrawItem full_enemy = unknown;
+    full_enemy.hp_pct = 100;
+    haven::EntityDrawItem half_enemy = unknown;
+    half_enemy.hp_pct = 50;
+    const haven::ColourSlot empty = haven::slot_for_bar(empty_enemy);
+    const haven::ColourSlot full = haven::slot_for_bar(full_enemy);
+    const haven::ColourSlot half = haven::slot_for_bar(half_enemy);
+    expect(empty.slot == 1, "an empty bar uses the first fill slot");
+    expect(full.slot == haven::kEnemyBarSlots - 1, "a full bar uses the last fill slot");
+    expect(half.slot > empty.slot && half.slot < full.slot, "a half full bar lands between");
+    expect(empty.pool == haven::ColourPool::EnemyBar, "the bar slot is in the bar pool");
+
+    // Every slot has a colour, and the bar background is darker than any fill.
+    for (uint8_t pool = 0; pool < 3; ++pool)
+    {
+        for (uint8_t slot = 0; slot < haven::kMaxSlotsPerPool; ++slot)
+        {
+            haven::ColourSlot key{static_cast<haven::ColourPool>(pool), slot};
+            const haven::Rgba colour = haven::slot_colour(key);
+            expect(colour.r >= 0.0f && colour.r <= 1.0f, "a slot colour is in range");
+            expect(colour.a == 1.0f, "a slot colour is opaque");
+        }
+    }
+    const haven::Rgba background = haven::slot_colour(haven::ColourSlot{haven::ColourPool::EnemyBar, 0});
+    const haven::Rgba full_fill = haven::slot_colour(haven::ColourSlot{haven::ColourPool::EnemyBar, 9});
+    expect(full_fill.g > background.g, "a full bar is brighter than its background");
 }
 
 void test_projectile_shapes()
@@ -906,6 +951,7 @@ int main()
     test_arc_and_hp_bar();
     test_enemy_body_and_hp_bar();
     test_enemy_radius_and_shape_tables();
+    test_colour_slots();
     test_projectile_shapes();
     test_collect_draw_items();
     test_empty_buffer_collects_nothing();

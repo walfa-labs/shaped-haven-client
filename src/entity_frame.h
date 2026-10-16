@@ -60,8 +60,10 @@ struct EntityDrawItem {
 };
 
 /// Immediate-mode triangle sink. `vertex()` starts a new vertex and `index()`
-/// refers to vertices by insertion order. The renderer uploads into a Manual
-/// Object through one of these; the tests record into a plain vector.
+/// refers to vertices by insertion order. Vertices carry no colour: the colour
+/// is the material's, so one section of the batch per colour holds every entity
+/// drawn in that colour. The renderer uploads into a Manual Object through one
+/// of these; the tests record into a plain vector.
 class PrimitiveSink {
 public:
     virtual ~PrimitiveSink() = default;
@@ -70,7 +72,7 @@ public:
     /// this sink has already emitted.
     virtual uint32_t base_index() const = 0;
 
-    virtual void vertex(float x, float y, float z, const Rgba& colour) = 0;
+    virtual void vertex(float x, float y, float z) = 0;
     virtual void index(uint32_t index) = 0;
 
     void triangle(uint32_t a, uint32_t b, uint32_t c)
@@ -82,7 +84,7 @@ public:
 
     /// Two counter-clockwise triangles forming the rectangle centred on
     /// (cx, cy) with half extents (hx, hy), rotated by `angle`.
-    void quad(float cx, float cy, float hx, float hy, float z, const Rgba& colour, float angle = 0.0f)
+    void quad(float cx, float cy, float hx, float hy, float z, float angle = 0.0f)
     {
         const uint32_t base = base_index();
         const float ca = std::cos(angle);
@@ -92,7 +94,7 @@ public:
         {
             const float lx = corner[0];
             const float ly = corner[1];
-            vertex(cx + lx * ca - ly * sa, cy + lx * sa + ly * ca, z, colour);
+            vertex(cx + lx * ca - ly * sa, cy + lx * sa + ly * ca, z);
         }
         triangle(base + 0, base + 1, base + 2);
         triangle(base + 0, base + 2, base + 3);
@@ -112,24 +114,65 @@ constexpr float kZHpBar = 0.05f;
 /// Filled circle: a centre vertex plus a `segments` vertex ring and one
 /// triangle per segment. Wound counter-clockwise, which Ogre treats as the
 /// front face.
-void append_circle(PrimitiveSink& sink, Vec2 centre, float radius, const Rgba& colour, float z,
-                    uint32_t segments);
+void append_circle(PrimitiveSink& sink, Vec2 centre, float radius, float z, uint32_t segments);
 
 /// Equilateral triangle with circumradius `radius`; its first vertex sits at
 /// `angle`, so passing a facing direction points the triangle that way.
-void append_triangle(PrimitiveSink& sink, Vec2 centre, float radius, float angle, const Rgba& colour,
-                     float z);
+void append_triangle(PrimitiveSink& sink, Vec2 centre, float radius, float angle, float z);
 
 /// The wedge of a circle of `radius` centred on `direction`, spanning `arc`
 /// radians symmetrically around it.
-void append_arc(PrimitiveSink& sink, Vec2 centre, float radius, float direction, float arc,
-                const Rgba& colour, float z, uint32_t segments);
+void append_arc(PrimitiveSink& sink, Vec2 centre, float radius, float direction, float arc, float z,
+                uint32_t segments);
 
-/// One enemy: its body primitive plus the HP bar floating above it.
-void append_enemy(PrimitiveSink& bodies, PrimitiveSink& bars, const EntityDrawItem& item);
+/// A rectangle rotated by `angle`, for the RAY projectile fallback.
+void append_quad(PrimitiveSink& sink, Vec2 centre, Vec2 half_extents, float angle, float z);
 
-/// One projectile, shaped by its ProjNet shape byte.
-void append_projectile(PrimitiveSink& projectiles, const EntityDrawItem& item);
+/// The three draw layers the renderer keeps. Each is a separate Manual Object,
+/// so an entity's z never has to change to be drawn in the right order.
+enum class ColourPool : uint8_t {
+    EnemyBody = 0,
+    EnemyBar = 1,
+    Projectile = 2,
+};
+
+/// One material colour inside one pool. The renderer builds one Manual Object
+/// section per slot, which is how a thousand differently coloured entities still
+/// cost a handful of draw calls: the colour lives in the material, not the
+/// vertex.
+struct ColourSlot {
+    ColourPool pool = ColourPool::EnemyBody;
+    uint8_t slot = 0;
+};
+
+/// Slots per pool. The bar pool holds a background colour plus one fill colour
+/// per HP bucket.
+constexpr uint8_t kEnemyBodySlots = 7;                  // one per archetype
+constexpr uint8_t kHpFillBuckets = 8;
+constexpr uint8_t kEnemyBarSlots = 1 + kHpFillBuckets;  // background + fills
+constexpr uint8_t kProjectileSlots = 4;                 // one per weapon
+
+/// The widest pool, in colour slots.
+constexpr uint8_t kMaxSlotsPerPool = kEnemyBarSlots;
+
+ColourSlot slot_for_body(const EntityDrawItem& item);
+ColourSlot slot_for_bar(const EntityDrawItem& item);
+ColourSlot slot_for_projectile(const EntityDrawItem& item);
+
+/// The colour a slot is created for.
+Rgba slot_colour(const ColourSlot& slot);
+
+/// One enemy body, in the pool its archetype's colour lives in.
+void append_enemy_body(PrimitiveSink& sink, const EntityDrawItem& item);
+
+/// The dark bar an enemy's HP fill sits on, in the background slot.
+void append_enemy_bar_background(PrimitiveSink& sink, const EntityDrawItem& item);
+
+/// One enemy HP bar fill, in the pool its current fill colour lives in.
+void append_enemy_bar(PrimitiveSink& sink, const EntityDrawItem& item);
+
+/// One projectile, shaped by its ProjNet shape byte, in its weapon's pool.
+void append_projectile(PrimitiveSink& sink, const EntityDrawItem& item);
 
 // ---------------------------------------------------------------------------
 // Wire-derived visual tables. The protocol carries ids only, so the client
@@ -181,6 +224,10 @@ Rgba archetype_colour(uint8_t archetype);
 
 /// HP bar geometry, shared by the builder and the tests.
 float enemy_hp_bar_width(uint8_t archetype);
+
+/// Bucket an HP percentage into one of the `kHpFillBuckets` fill colours, so
+/// the bar drains through a fixed palette instead of a per-vertex gradient.
+uint8_t hp_fill_bucket(float hp_pct);
 
 /// Pulls the entities the newest snapshot knows about out of the interpolation
 /// buffer, sampled at the render time. Only the position is interpolated; the

@@ -27,43 +27,41 @@ uint32_t arc_segments(float arc)
 /// at `start`, stepping by `span / segments`. Used for closed circles, where
 /// the last vertex is not repeated.
 void emit_ring(PrimitiveSink& sink, Vec2 centre, float radius, float z, uint32_t segments, float start,
-               float span, const Rgba& colour)
+               float span)
 {
     for (uint32_t i = 0; i < segments; ++i)
     {
         const float a = start + span * (static_cast<float>(i) / static_cast<float>(segments));
-        sink.vertex(centre.x + radius * std::cos(a), centre.y + radius * std::sin(a), z, colour);
+        sink.vertex(centre.x + radius * std::cos(a), centre.y + radius * std::sin(a), z);
     }
 }
 
 /// Ring for an open wedge: `segments + 1` vertices, so the last one lands
 /// exactly on `start + span` instead of one step short of it.
 void emit_arc_ring(PrimitiveSink& sink, Vec2 centre, float radius, float z, uint32_t segments, float start,
-                   float span, const Rgba& colour)
+                   float span)
 {
     for (uint32_t i = 0; i <= segments; ++i)
     {
         const float a = start + span * (static_cast<float>(i) / static_cast<float>(segments));
-        sink.vertex(centre.x + radius * std::cos(a), centre.y + radius * std::sin(a), z, colour);
+        sink.vertex(centre.x + radius * std::cos(a), centre.y + radius * std::sin(a), z);
     }
 }
 
 }  // namespace
 
-void append_circle(PrimitiveSink& sink, Vec2 centre, float radius, const Rgba& colour, float z,
-                    uint32_t segments)
+void append_circle(PrimitiveSink& sink, Vec2 centre, float radius, float z, uint32_t segments)
 {
     const uint32_t base = sink.base_index();
-    sink.vertex(centre.x, centre.y, z, colour);
-    emit_ring(sink, centre, radius, z, segments, 0.0f, kTwoPi, colour);
+    sink.vertex(centre.x, centre.y, z);
+    emit_ring(sink, centre, radius, z, segments, 0.0f, kTwoPi);
     for (uint32_t i = 0; i < segments; ++i)
     {
         sink.triangle(base, base + 1 + i, base + 1 + ((i + 1) % segments));
     }
 }
 
-void append_triangle(PrimitiveSink& sink, Vec2 centre, float radius, float angle, const Rgba& colour,
-                     float z)
+void append_triangle(PrimitiveSink& sink, Vec2 centre, float radius, float angle, float z)
 {
     // Three vertices 120 degrees apart, counter-clockwise, the first one at
     // `angle`.
@@ -72,21 +70,26 @@ void append_triangle(PrimitiveSink& sink, Vec2 centre, float radius, float angle
     for (uint32_t i = 0; i < kSides; ++i)
     {
         const float a = angle + static_cast<float>(i) * (kTwoPi / static_cast<float>(kSides));
-        sink.vertex(centre.x + radius * std::cos(a), centre.y + radius * std::sin(a), z, colour);
+        sink.vertex(centre.x + radius * std::cos(a), centre.y + radius * std::sin(a), z);
     }
     sink.triangle(base, base + 1, base + 2);
 }
 
-void append_arc(PrimitiveSink& sink, Vec2 centre, float radius, float direction, float arc,
-                const Rgba& colour, float z, uint32_t segments)
+void append_arc(PrimitiveSink& sink, Vec2 centre, float radius, float direction, float arc, float z,
+                uint32_t segments)
 {
     const uint32_t base = sink.base_index();
-    sink.vertex(centre.x, centre.y, z, colour);
-    emit_arc_ring(sink, centre, radius, z, segments, direction - arc * 0.5f, arc, colour);
+    sink.vertex(centre.x, centre.y, z);
+    emit_arc_ring(sink, centre, radius, z, segments, direction - arc * 0.5f, arc);
     for (uint32_t i = 0; i < segments; ++i)
     {
         sink.triangle(base, base + 1 + i, base + 1 + ((i + 1) % segments));
     }
+}
+
+void append_quad(PrimitiveSink& sink, Vec2 centre, Vec2 half_extents, float angle, float z)
+{
+    sink.quad(centre.x, centre.y, half_extents.x, half_extents.y, z, angle);
 }
 
 const WeaponVisual& weapon_visual(uint8_t weapon_id)
@@ -142,34 +145,93 @@ float enemy_hp_bar_width(uint8_t archetype)
     return std::max(1.0f, std::min(width, 3.5f));
 }
 
-void append_enemy(PrimitiveSink& bodies, PrimitiveSink& bars, const EntityDrawItem& item)
+uint8_t hp_fill_bucket(float hp_pct)
+{
+    const float clamped = std::max(0.0f, std::min(100.0f, hp_pct)) * 0.01f;
+    const uint8_t bucket = static_cast<uint8_t>(clamped * static_cast<float>(kHpFillBuckets));
+    return bucket >= kHpFillBuckets ? kHpFillBuckets - 1 : bucket;
+}
+
+ColourSlot slot_for_body(const EntityDrawItem& item)
+{
+    ColourSlot slot;
+    slot.pool = ColourPool::EnemyBody;
+    slot.slot = item.style < 7 ? item.style : 0;
+    return slot;
+}
+
+ColourSlot slot_for_bar(const EntityDrawItem& item)
+{
+    ColourSlot slot;
+    slot.pool = ColourPool::EnemyBar;
+    slot.slot = 1 + hp_fill_bucket(static_cast<float>(item.hp_pct));
+    return slot;
+}
+
+ColourSlot slot_for_projectile(const EntityDrawItem& item)
+{
+    ColourSlot slot;
+    slot.pool = ColourPool::Projectile;
+    slot.slot = item.style < 4 ? item.style : 0;
+    return slot;
+}
+
+Rgba slot_colour(const ColourSlot& slot)
+{
+    switch (slot.pool)
+    {
+        case ColourPool::EnemyBody:
+            return archetype_colour(slot.slot);
+        case ColourPool::EnemyBar:
+            if (slot.slot == 0) return Rgba{0.10f, 0.10f, 0.12f, 1.0f};
+            // Drain from red at empty to green at full.
+            {
+                const float t = static_cast<float>(slot.slot - 1) /
+                                static_cast<float>(kHpFillBuckets - 1);
+                return Rgba{1.0f - 0.70f * t, 0.15f + 0.75f * t, 0.20f, 1.0f};
+            }
+        case ColourPool::Projectile:
+            return weapon_visual(slot.slot).colour;
+    }
+    return Rgba{1.0f, 1.0f, 1.0f, 1.0f};
+}
+
+void append_enemy_body(PrimitiveSink& sink, const EntityDrawItem& item)
 {
     const float radius = enemy_radius(item.style);
-    const Rgba colour = archetype_colour(item.style);
 
     if (archetype_is_circle(item.style))
-        append_circle(bodies, item.pos, radius, colour, kZEnemy, kCircleSegments);
+        append_circle(sink, item.pos, radius, kZEnemy, kCircleSegments);
     else
-        append_triangle(bodies, item.pos, radius, item.angle, colour, kZEnemy);
+        append_triangle(sink, item.pos, radius, item.angle, kZEnemy);
+}
 
-    // HP bar above the body, background first so the fill sits on top of it.
+/// The dark bar the fill sits on. Own slot, because it is a different colour.
+void append_enemy_bar_background(PrimitiveSink& sink, const EntityDrawItem& item)
+{
+    const float radius = enemy_radius(item.style);
     const float width = enemy_hp_bar_width(item.style);
     const float height = 0.14f;
     const Vec2 centre{item.pos.x, item.pos.y + radius + 0.30f};
-    const Rgba background{0.10f, 0.10f, 0.12f, 1.0f};
-    const float fraction = std::max(0.0f, std::min(100.0f, static_cast<float>(item.hp_pct))) * 0.01f;
-
-    bars.quad(centre.x, centre.y, width * 0.5f, height * 0.5f, kZHpBar, background);
-
-    const Rgba fill{1.0f - 0.75f * fraction, 0.15f + 0.70f * fraction, 0.20f, 1.0f};
-    // Left anchored so the bar drains from the right as HP drops.
-    const float fill_width = width * fraction;
-    const Vec2 fill_centre{centre.x - width * 0.5f + fill_width * 0.5f, centre.y};
-    bars.quad(fill_centre.x, fill_centre.y, std::max(fill_width, 0.001f) * 0.5f, height * 0.5f, kZHpBar,
-              fill);
+    sink.quad(centre.x, centre.y, width * 0.5f, height * 0.5f, kZHpBar);
 }
 
-void append_projectile(PrimitiveSink& projectiles, const EntityDrawItem& item)
+/// The fill, whose width tracks HP and whose slot tracks how full the bar is.
+void append_enemy_bar(PrimitiveSink& sink, const EntityDrawItem& item)
+{
+    const float radius = enemy_radius(item.style);
+    const float width = enemy_hp_bar_width(item.style);
+    const float height = 0.14f;
+    const Vec2 centre{item.pos.x, item.pos.y + radius + 0.30f};
+
+    const float fraction = std::max(0.0f, std::min(100.0f, static_cast<float>(item.hp_pct))) * 0.01f;
+    const float fill_width = width * fraction;
+    // Left anchored so the bar drains from the right as HP drops.
+    const Vec2 fill_centre{centre.x - width * 0.5f + fill_width * 0.5f, centre.y};
+    sink.quad(fill_centre.x, fill_centre.y, std::max(fill_width, 0.001f) * 0.5f, height * 0.5f, kZHpBar);
+}
+
+void append_projectile(PrimitiveSink& sink, const EntityDrawItem& item)
 {
     const WeaponVisual& weapon = weapon_visual(item.style);
     const ProjShape shape = static_cast<ProjShape>(item.shape);
@@ -180,22 +242,20 @@ void append_projectile(PrimitiveSink& projectiles, const EntityDrawItem& item)
         {
             // The wedge is centred on the projectile's own position and faces
             // the direction it was fired in.
-            append_arc(projectiles, item.pos, weapon.reach, item.angle, weapon.arc, weapon.colour,
-                      kZProjectile, arc_segments(weapon.arc));
+            append_arc(sink, item.pos, weapon.reach, item.angle, weapon.arc, kZProjectile,
+                      arc_segments(weapon.arc));
             break;
         }
         case ProjShape::Circle:
-            append_circle(projectiles, item.pos, weapon.radius, weapon.colour, kZProjectile, 10);
+            append_circle(sink, item.pos, weapon.radius, kZProjectile, 10);
             break;
         case ProjShape::Ray:
-        {
             // A rectangle running from the muzzle to the end of its reach.
             const float half_length = weapon.reach * 0.5f;
-            projectiles.quad(item.pos.x + std::cos(item.angle) * half_length,
-                             item.pos.y + std::sin(item.angle) * half_length, half_length,
-                             weapon.radius, kZProjectile, weapon.colour, item.angle);
+            append_quad(sink, Vec2{item.pos.x + std::cos(item.angle) * half_length,
+                                   item.pos.y + std::sin(item.angle) * half_length},
+                        Vec2{half_length, weapon.radius}, item.angle, kZProjectile);
             break;
-        }
     }
 }
 
