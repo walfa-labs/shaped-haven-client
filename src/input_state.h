@@ -35,6 +35,9 @@ public:
     /// The menu's confirm key. SDL2 delivers the return key as SDLK_RETURN.
     static constexpr int kKeyEnter = 13;
 
+    /// SDLK_BACKSPACE, which the character select's name field deletes with.
+    static constexpr int kKeyBackspace = 8;
+
     // OgreBites hands us SDL2 keycodes, but the SDK ships SDL2.dll without the
     // SDL headers, so the arrow keys are restated here. SDL2 defines
     // SDLK_*ARROW as SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_*ARROW) with
@@ -59,6 +62,19 @@ public:
 
     /// Last keycode seen, for the verbose key log.
     int last_key() const { return last_key_; }
+
+    /// Escape quits the client. The character select screen uses escape as its
+    /// back key instead, so it turns this off while it is up.
+    void set_escape_quits(bool enabled) { escape_quits_ = enabled; }
+
+    /// Turns collection of printable keycodes on for take_typed_text(). The
+    /// character select's name field is the one caller; it is off by default so
+    /// a run's movement keys do not accumulate in the buffer.
+    void set_text_capture(bool enabled) { capture_text_ = enabled; }
+
+    /// The printable characters typed since the last call, and clears them.
+    /// main() drains this once per frame while the name field is on screen.
+    std::string take_typed_text();
 
     /// When set, move_vector() returns scripted moves instead of reading the
     /// keyboard, one per call. Used by automated verification runs so the input
@@ -98,9 +114,27 @@ public:
     /// exhausted.
     bool take_scripted_restart();
 
+    /// A script of key presses: the same idea as the move script, for the
+    /// screens a run has not reached yet. The main menu and the character select
+    /// read held() and the typed-text buffer, and this feeds both, so a menu
+    /// flow can be driven without a focused window. See --key-script.
+    void set_key_script(const std::vector<int>& keys);
+
+    /// True once a script that was armed has run out of entries.
+    bool key_script_finished() const;
+
+    /// Advances the script by one frame: each entry is pressed on one frame and
+    /// released on the next, so two presses of the same key in a row are two
+    /// presses as the menu's edge detection sees them. Called once per rendered
+    /// frame while a script is armed.
+    void advance_key_script();
+
 private:
     std::unordered_map<int, bool> held_;
     bool quit_ = false;
+    bool escape_quits_ = true;
+    bool capture_text_ = false;
+    std::string typed_text_;
     int last_key_ = 0;
     int pending_choice_ = -1;
     bool restart_ = false;
@@ -108,6 +142,9 @@ private:
     mutable size_t script_index_ = 0;
     const std::vector<int8_t>* choice_script_ = nullptr;
     size_t choice_index_ = 0;
+    const std::vector<int>* key_script_ = nullptr;
+    size_t key_script_index_ = 0;
+    bool key_script_releasing_ = false;
 };
 
 /// Expands an input script into one move vector per tick. Each non-comment line
@@ -119,5 +156,12 @@ bool load_input_script(const std::string& path, std::vector<Vec2>& out);
 /// literal `restart`, one line per run event in chronological order. Returns
 /// false if the file cannot be read or parsed.
 bool load_choice_script(const std::string& path, std::vector<int8_t>& out);
+
+/// Loads a key script: one key press per non-comment line, each held for one
+/// rendered frame and released on the next. A line is a key name — `up`,
+/// `down`, `left`, `right`, `enter`, `escape`, `backspace`, `space` — or a
+/// single printable character, which is what the name field is typed with.
+/// Returns false if the file cannot be read or parsed.
+bool load_key_script(const std::string& path, std::vector<int>& out);
 
 }  // namespace haven

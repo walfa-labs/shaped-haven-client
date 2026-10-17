@@ -1,5 +1,6 @@
 #include "hud.h"
 
+#include "character_catalog.h"
 #include "hud_model.h"
 #include "hud_text.h"
 #include "mesh_factory.h"
@@ -54,6 +55,42 @@ constexpr float kCardX[3] = {-21.5f, 0.0f, 21.5f};
 
 constexpr float kPipSize = 0.30f;
 constexpr float kPipSpacing = 0.44f;
+
+/// Character select geometry. The screen is one panel over the whole viewport:
+/// the name field across the top, the ten races down the left, the chosen
+/// race's stats and the four weapons on the right, and START at the bottom.
+constexpr int kSelectFieldName = 0;
+constexpr int kSelectFieldRace = 1;
+constexpr int kSelectFieldWeapon = 2;
+constexpr int kSelectFieldStart = 3;
+
+constexpr float kSelectNameY = 16.0f;     // centre line of the name field
+constexpr float kSelectNameX = -25.0f;    // left edge of the name's value
+constexpr float kSelectNamePixel = 0.40f;
+constexpr float kSelectRowLeft = -34.0f;  // left edge of the race list
+constexpr float kSelectRaceTop = 13.5f;   // top edge of the first race row
+constexpr float kSelectRaceStep = 1.75f;
+constexpr float kSelectRacePixel = 0.24f;
+/// The ten rows as one block, derived from the rows themselves so the box
+/// always covers them.
+constexpr float kSelectRaceBottom = kSelectRaceTop - 9.0f * kSelectRaceStep - 7.0f * kSelectRacePixel;
+constexpr float kSelectRaceBoxY = (kSelectRaceTop + kSelectRaceBottom) * 0.5f;
+constexpr float kSelectRaceBoxHalfH = (kSelectRaceTop - kSelectRaceBottom) * 0.5f + 0.5f;
+constexpr float kSelectDetailX = 1.0f;    // left edge of the right column
+constexpr float kSelectWeaponY = -8.5f;   // centre line of the weapon row
+constexpr float kSelectWeaponHalfW = 8.2f;
+constexpr float kSelectWeaponHalfH = 2.5f;
+constexpr float kSelectWeaponX[4] = {-27.0f, -9.0f, 9.0f, 27.0f};
+constexpr float kSelectStartY = -16.0f;   // centre line of the START button
+
+// The blocks run top to bottom, so each has to clear the one below it: an
+// overlap draws the last race names over the weapon row.
+static_assert(kSelectNameY - 1.5f > kSelectRaceTop, "the name field runs into the race list");
+static_assert(kSelectRaceBoxY + kSelectRaceBoxHalfH < kSelectNameY - 1.5f, "the race box runs into the name field");
+static_assert(kSelectRaceBottom > kSelectWeaponY + kSelectWeaponHalfH,
+              "the race list runs into the weapon row");
+static_assert(kSelectWeaponY - kSelectWeaponHalfH > kSelectStartY + 1.5f, "the weapon row runs into START");
+static_assert(kSelectStartY - 1.5f > -23.0f, "START falls off the bottom of the screen");
 
 /// Uploads into a ManualObject through the same immediate-mode sink the
 /// geometry builders write to, so HUD text and the tested builders are one
@@ -125,6 +162,10 @@ Hud::Hud(Ogre::SceneManager* scene_manager, MeshFactory* meshes, Ogre::SceneNode
     tray_.name = "haven/hud_tray";
     modal_.name = "haven/hud_modal";
     menu_.name = "haven/hud_menu";
+    select_fields_.name = "haven/hud_select_fields";
+    select_fields_.z = 0.488f;
+    select_.name = "haven/hud_select";
+    select_.z = 0.490f;
     attach_node_ = camera_node_->createChildSceneNode();
     attach_node_->setPosition(0.0f, 0.0f, -kCameraZ);
     build_persistent_elements();
@@ -147,6 +188,13 @@ Hud::~Hud()
     destroy_layer(menu_options_);
     destroy_layer(menu_footer_);
     destroy_layer(menu_error_);
+    destroy_layer(select_title_);
+    destroy_layer(select_name_);
+    destroy_layer(select_races_);
+    destroy_layer(select_detail_);
+    destroy_layer(select_weapons_);
+    destroy_layer(select_start_);
+    destroy_layer(select_hints_);
 }
 
 Ogre::MaterialPtr Hud::material_for(Rgba colour)
@@ -378,6 +426,70 @@ void Hud::clear_menu_error()
     if (menu_visible_) layout_main_menu();
 }
 
+// ---------------------------------------------------------------------------
+// Character select.
+// ---------------------------------------------------------------------------
+
+void Hud::show_character_select()
+{
+    if (!initialised_) return;
+    layout_character_select();
+    select_visible_ = true;
+    // The XP bar is run-bound; it comes back when the screen goes away.
+    xp_bg_->setVisible(false);
+    xp_fill_->setVisible(false);
+    dim_->setVisible(true);
+    panel_->setVisible(true);
+    Ogre::Node* panel_node = panel_->getParentNode();
+    panel_node->setScale(82.0f, 46.0f, 1.0f);
+    panel_node->setPosition(0.0f, 0.0f, 0.485f);
+}
+
+void Hud::hide_character_select()
+{
+    if (!initialised_) return;
+    clear_batch(select_);
+    clear_batch(select_fields_);
+    destroy_layer(select_title_);
+    destroy_layer(select_name_);
+    destroy_layer(select_races_);
+    destroy_layer(select_detail_);
+    destroy_layer(select_weapons_);
+    destroy_layer(select_start_);
+    destroy_layer(select_hints_);
+    select_visible_ = false;
+    dim_->setVisible(false);
+    panel_->setVisible(false);
+}
+
+void Hud::set_character_select_selection(int selection)
+{
+    if (!initialised_ || selection == select_selection_) return;
+    select_selection_ = selection;
+    if (select_visible_) layout_character_select();
+}
+
+void Hud::set_character_select_name(const std::string& name)
+{
+    if (!initialised_ || name == select_name_text_) return;
+    select_name_text_ = name;
+    if (select_visible_) layout_character_select();
+}
+
+void Hud::set_character_select_race(int race_id)
+{
+    if (!initialised_ || race_id == select_race_) return;
+    select_race_ = race_id;
+    if (select_visible_) layout_character_select();
+}
+
+void Hud::set_character_select_weapon(int weapon_id)
+{
+    if (!initialised_ || weapon_id == select_weapon_) return;
+    select_weapon_ = weapon_id;
+    if (select_visible_) layout_character_select();
+}
+
 void Hud::shutdown()
 {
     if (!initialised_) return;
@@ -385,6 +497,7 @@ void Hud::shutdown()
     hide_offer();
     hide_game_over();
     hide_main_menu();
+    hide_character_select();
     clear_batch(tray_);
     destroy_layer(tray_text_);
     destroy_layer(hud_lines_);
@@ -553,7 +666,7 @@ void Hud::rebuild_batch(QuadBatch& batch)
         {
             for (int corner = 0; corner < 4; ++corner)
             {
-                object->position(section.xs[quad + corner], section.ys[quad + corner], 0.49f);
+                object->position(section.xs[quad + corner], section.ys[quad + corner], batch.z);
                 object->normal(0.0f, 0.0f, 1.0f);
             }
             const uint32_t base = static_cast<uint32_t>(quad);
@@ -996,6 +1109,199 @@ void Hud::layout_main_menu()
         error->lines.push_back(error_line);
     }
     rebuild_layer(*error);
+}
+
+void Hud::layout_character_select()
+{
+    const Rgba kGold{1.00f, 0.80f, 0.30f, 1.0f};
+    const Rgba kWhite{0.92f, 0.94f, 0.98f, 1.0f};
+    const Rgba kDim{0.55f, 0.60f, 0.70f, 1.0f};
+    const Rgba kFieldActive{0.22f, 0.27f, 0.42f, 0.85f};
+    const Rgba kFieldIdle{0.10f, 0.11f, 0.16f, 0.80f};
+    const Rgba kRowActive{0.30f, 0.36f, 0.55f, 0.90f};
+    const Rgba kBoxInner{0.07f, 0.08f, 0.12f, 0.90f};
+
+    const RaceInfo& race = race_info(select_race_);
+    const StartingWeaponInfo& weapon = starting_weapon_info(select_weapon_);
+
+    clear_batch(select_fields_);
+    clear_batch(select_);
+
+    // The four fields, each a box. The one the highlight is on is lit and the
+    // rest stay dark, so the screen reads as four places Up/Down can be. They
+    // go in their own batch, below the highlights that mark the chosen race and
+    // weapon: two quads at the same z have no order between them, and a
+    // highlight that landed behind the box it marks would be invisible.
+    const Rgba race_field =
+        select_selection_ == kSelectFieldRace ? kFieldActive : kFieldIdle;
+    const Rgba weapon_field =
+        select_selection_ == kSelectFieldWeapon ? kFieldActive : kFieldIdle;
+    const Rgba start_field =
+        select_selection_ == kSelectFieldStart ? kFieldActive : kFieldIdle;
+
+    quad_into(select_fields_, select_selection_ == kSelectFieldName ? kFieldActive : kFieldIdle, 0.0f,
+              kSelectNameY, 35.0f, 1.5f);
+    quad_into(select_fields_, race_field, -20.0f, kSelectRaceBoxY, 15.0f, kSelectRaceBoxHalfH);
+    quad_into(select_fields_, weapon_field, 0.0f, kSelectWeaponY, 35.0f, kSelectWeaponHalfH + 0.4f);
+    quad_into(select_fields_, start_field, 0.0f, kSelectStartY, 9.0f, 1.5f);
+    rebuild_batch(select_fields_);
+
+    // The chosen race's row, so it stays visible while the highlight is on
+    // another field, and the four weapon boxes, the chosen one carrying its
+    // tray colour.
+    const float race_centre = kSelectRaceTop - kSelectRacePixel * 3.5f;
+    quad_into(select_, kRowActive, -20.0f, race_centre - static_cast<float>(select_race_) * kSelectRaceStep,
+              14.5f, 0.9f);
+
+    for (int i = 0; i < kStartingWeaponCount; ++i)
+    {
+        const bool chosen = i == select_weapon_;
+        quad_into(select_, chosen ? item_colour(static_cast<uint8_t>(i)) : kFieldIdle,
+                  kSelectWeaponX[i], kSelectWeaponY, kSelectWeaponHalfW, kSelectWeaponHalfH);
+        quad_into(select_, kBoxInner, kSelectWeaponX[i], kSelectWeaponY, kSelectWeaponHalfW - 0.35f,
+                  kSelectWeaponHalfH - 0.35f);
+    }
+
+    // The caret sits just past the name while the name field is selected. The
+    // font has no glyph for one, so it is a quad rather than a character.
+    if (select_selection_ == kSelectFieldName)
+    {
+        const float caret_x = kSelectNameX +
+                              static_cast<float>(text_pixel_width(select_name_text_)) * kSelectNamePixel + 0.5f;
+        quad_into(select_, kWhite, caret_x, kSelectNameY, 0.12f, 0.85f);
+    }
+    rebuild_batch(select_);
+
+    TextLayer* title = ensure_layer(select_title_);
+    title->lines.clear();
+    TextLine title_line;
+    title_line.text = "CHOOSE YOUR CHARACTER";
+    title_line.pixel = fit_text_pixel(title_line.text, 70.0f, 0.0f, 0.52f);
+    title_line.x = -static_cast<float>(text_pixel_width(title_line.text)) * title_line.pixel * 0.5f;
+    title_line.y = 21.0f;
+    title_line.colour = kGold;
+    title->lines.push_back(title_line);
+    rebuild_layer(*title);
+
+    TextLayer* name = ensure_layer(select_name_);
+    name->lines.clear();
+    TextLine name_label;
+    name_label.text = "NAME";
+    name_label.pixel = 0.34f;
+    name_label.x = kSelectRowLeft;
+    name_label.y = kSelectNameY + 0.34f * 3.5f;
+    name_label.colour = kDim;
+    name->lines.push_back(name_label);
+    TextLine name_value;
+    name_value.text = select_name_text_;
+    name_value.pixel = kSelectNamePixel;
+    name_value.x = kSelectNameX;
+    name_value.y = kSelectNameY + kSelectNamePixel * 3.5f;
+    name_value.colour = select_selection_ == kSelectFieldName ? kWhite : kDim;
+    name->lines.push_back(name_value);
+    rebuild_layer(*name);
+
+    TextLayer* races = ensure_layer(select_races_);
+    races->lines.clear();
+    for (int i = 0; i < kRaceCount; ++i)
+    {
+        TextLine line;
+        line.text = race_table()[i].name;
+        line.pixel = kSelectRacePixel;
+        line.x = kSelectRowLeft;
+        line.y = kSelectRaceTop - static_cast<float>(i) * kSelectRaceStep;
+        line.colour = i == select_race_ ? kWhite : kDim;
+        races->lines.push_back(line);
+    }
+    rebuild_layer(*races);
+
+    TextLayer* detail = ensure_layer(select_detail_);
+    detail->lines.clear();
+    TextLine race_name;
+    race_name.text = race.name;
+    race_name.pixel = fit_text_pixel(race_name.text, 34.0f, 0.0f, 0.42f);
+    race_name.x = kSelectDetailX;
+    race_name.y = kSelectRaceTop;
+    race_name.colour = kGold;
+    detail->lines.push_back(race_name);
+
+    const std::string stats[5] = {
+        "HP " + std::to_string(race.max_hp),
+        "SHIELD " + std::to_string(race.max_shield),
+        "MANA " + std::to_string(race.max_mana),
+        "SPEED " + format_multiplier(race.move_speed_mult),
+        "ATK " + format_multiplier(race.damage_mult),
+    };
+    for (int i = 0; i < 5; ++i)
+    {
+        TextLine line;
+        line.text = stats[i];
+        line.pixel = 0.30f;
+        line.x = kSelectDetailX;
+        line.y = 9.8f - static_cast<float>(i) * 1.7f;
+        line.colour = kWhite;
+        detail->lines.push_back(line);
+    }
+
+    TextLine weapon_header;
+    weapon_header.text = "WEAPON";
+    weapon_header.pixel = 0.30f;
+    weapon_header.x = kSelectDetailX;
+    weapon_header.y = -0.2f;
+    weapon_header.colour = kDim;
+    detail->lines.push_back(weapon_header);
+
+    TextLine weapon_blurb;
+    weapon_blurb.text = std::string(weapon.name) + " - " + weapon.description;
+    weapon_blurb.pixel = fit_text_pixel(weapon_blurb.text, 40.0f, 0.0f, 0.30f);
+    weapon_blurb.x = -static_cast<float>(text_pixel_width(weapon_blurb.text)) * weapon_blurb.pixel * 0.5f;
+    weapon_blurb.y = -12.2f;
+    weapon_blurb.colour = kWhite;
+    detail->lines.push_back(weapon_blurb);
+    rebuild_layer(*detail);
+
+    TextLayer* weapons = ensure_layer(select_weapons_);
+    weapons->lines.clear();
+    for (int i = 0; i < kStartingWeaponCount; ++i)
+    {
+        TextLine line;
+        line.text = starting_weapon_table()[i].name;
+        line.pixel = 0.36f;
+        line.x = kSelectWeaponX[i] - static_cast<float>(text_pixel_width(line.text)) * line.pixel * 0.5f;
+        line.y = kSelectWeaponY + line.pixel * 3.5f;
+        line.colour = i == select_weapon_ ? kWhite : kDim;
+        weapons->lines.push_back(line);
+    }
+    rebuild_layer(*weapons);
+
+    TextLayer* start = ensure_layer(select_start_);
+    start->lines.clear();
+    TextLine start_line;
+    start_line.text = "START";
+    start_line.pixel = 0.42f;
+    start_line.x = -static_cast<float>(text_pixel_width(start_line.text)) * start_line.pixel * 0.5f;
+    start_line.y = kSelectStartY + start_line.pixel * 3.5f;
+    start_line.colour = select_selection_ == kSelectFieldStart ? kGold : kWhite;
+    start->lines.push_back(start_line);
+    rebuild_layer(*start);
+
+    TextLayer* hints = ensure_layer(select_hints_);
+    hints->lines.clear();
+    const char* const kHints[2] = {
+        "UP/DOWN FIELD - LEFT/RIGHT CHANGE VALUE",
+        "TYPE NAME - ENTER CONFIRM - ESC BACK",
+    };
+    for (int i = 0; i < 2; ++i)
+    {
+        TextLine line;
+        line.text = kHints[i];
+        line.pixel = fit_text_pixel(line.text, 74.0f, 0.0f, 0.26f);
+        line.x = -static_cast<float>(text_pixel_width(line.text)) * line.pixel * 0.5f;
+        line.y = -18.4f - static_cast<float>(i) * 2.2f;
+        line.colour = kDim;
+        hints->lines.push_back(line);
+    }
+    rebuild_layer(*hints);
 }
 
 }  // namespace haven

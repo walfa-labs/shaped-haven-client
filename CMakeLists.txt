@@ -14,6 +14,8 @@ set(OGRE_SDK_DIR "D:/src/ogre3d" CACHE PATH "Path to the Ogre3D SDK root")
 find_package(OGRE 14.6.1 REQUIRED CONFIG PATHS "${OGRE_SDK_DIR}/CMake" NO_DEFAULT_PATH)
 
 set(HAVEN_SOURCES
+  src/character_catalog.cpp
+  src/character_select.cpp
   src/entity_frame.cpp
   src/game_session.cpp
   src/hud.cpp
@@ -61,6 +63,8 @@ set_target_properties(shaped-haven-client PROPERTIES
 enable_testing()
 
 add_executable(shaped-haven-client-tests tests/test_logic.cpp
+  src/character_catalog.cpp
+  src/character_select.cpp
   src/entity_frame.cpp
   src/hud_model.cpp
   src/hud_text.cpp

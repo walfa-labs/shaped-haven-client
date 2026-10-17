@@ -1,0 +1,18 @@
+# The same choices as charselect_keys.txt, and then START: the client connects
+# with name=havenz race=3 weapon=2 and plays the run --frames asks for.
+#
+#   shaped-haven-client.exe --key-script charselect_start_keys.txt \
+#       --server-path <shaped-haven-server.exe> --screenshot run.png
+enter
+z
+q
+backspace
+down
+right
+right
+right
+down
+right
+right
+down           # weapon -> START
+enter          # START: connect with the choices above

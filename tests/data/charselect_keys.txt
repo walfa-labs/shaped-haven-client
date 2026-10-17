@@ -1,0 +1,18 @@
+# Character select: pick a name, a race and a weapon, then stop on the screen
+# so --screenshot captures it.
+#
+#   shaped-haven-client.exe --key-script charselect_keys.txt \
+#       --screenshot charselect.png
+#
+# One key per line, held for one rendered frame.
+enter          # main menu -> character select
+z              # type into the name field: "havenzq"...
+q
+backspace      # ...then delete the q: "havenz"
+down           # name -> race
+right          # Terran Kin -> Mantid Vex
+right          # -> Cephalon Tide
+right          # -> Aerie Seraph (race id 3)
+down           # race -> weapon
+right          # Sword -> Axe
+right          # -> Bow (weapon id 2)

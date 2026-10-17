@@ -23,7 +23,10 @@ void InputState::key_down(int key_code)
 {
     last_key_ = key_code;
     held_[key_code] = true;
-    if (key_code == kKeyEscape) quit_ = true;
+    if (key_code == kKeyEscape && escape_quits_) quit_ = true;
+    // SDL2's printable keycodes are their ASCII values, and every key the game
+    // binds — the arrows, enter, escape, backspace — sits below or above them.
+    if (capture_text_ && key_code >= 32 && key_code <= 126) typed_text_.push_back(static_cast<char>(key_code));
     if (key_code == kKey1) pending_choice_ = 0;
     if (key_code == kKey2) pending_choice_ = 1;
     if (key_code == kKey3) pending_choice_ = 2;
@@ -39,6 +42,13 @@ bool InputState::held(int key_code) const
 {
     const auto it = held_.find(key_code);
     return it != held_.end() && it->second;
+}
+
+std::string InputState::take_typed_text()
+{
+    std::string text;
+    text.swap(typed_text_);
+    return text;
 }
 
 void InputState::set_script(const std::vector<Vec2>& script)
@@ -74,6 +84,36 @@ bool InputState::take_scripted_restart()
     if (peek_scripted_line() != -1) return false;
     ++choice_index_;
     return true;
+}
+
+void InputState::set_key_script(const std::vector<int>& keys)
+{
+    key_script_ = &keys;
+    key_script_index_ = 0;
+    key_script_releasing_ = false;
+}
+
+bool InputState::key_script_finished() const
+{
+    return key_script_ != nullptr && key_script_index_ >= key_script_->size();
+}
+
+void InputState::advance_key_script()
+{
+    if (key_script_ == nullptr || key_script_index_ >= key_script_->size()) return;
+    // Each entry takes two frames — the press, then the release. One frame per
+    // entry would leave a key that repeats held across both, and the edge
+    // detection the menu and the character select do would see one press where
+    // the script asked for two.
+    if (key_script_releasing_)
+    {
+        key_up((*key_script_)[key_script_index_]);
+        ++key_script_index_;
+        key_script_releasing_ = false;
+        return;
+    }
+    key_down((*key_script_)[key_script_index_]);
+    key_script_releasing_ = true;
 }
 
 bool load_input_script(const std::string& path, std::vector<Vec2>& out)
@@ -159,6 +199,61 @@ bool load_choice_script(const std::string& path, std::vector<int8_t>& out)
             return false;
         }
         out.push_back(static_cast<int8_t>(value));
+    }
+    return !out.empty();
+}
+
+bool load_key_script(const std::string& path, std::vector<int>& out)
+{
+    std::ifstream file(path);
+    if (!file.is_open())
+    {
+        std::fprintf(stderr, "haven: cannot open key script %s\n", path.c_str());
+        return false;
+    }
+
+    const auto is_space = [](char c) { return c == ' ' || c == '\t' || c == '\r'; };
+    const auto named_key = [](const std::string& token) -> int {
+        if (token == "up") return InputState::kKeyUp;
+        if (token == "down") return InputState::kKeyDown;
+        if (token == "left") return InputState::kKeyLeft;
+        if (token == "right") return InputState::kKeyRight;
+        if (token == "enter") return InputState::kKeyEnter;
+        if (token == "escape") return InputState::kKeyEscape;
+        if (token == "backspace") return InputState::kKeyBackspace;
+        if (token == "space") return ' ';
+        return 0;
+    };
+
+    std::string line;
+    int line_number = 0;
+    while (std::getline(file, line))
+    {
+        ++line_number;
+        const size_t comment = line.find('#');
+        if (comment != std::string::npos) line = line.substr(0, comment);
+
+        size_t begin = 0;
+        size_t end = line.size();
+        while (begin < end && is_space(line[begin])) ++begin;
+        while (end > begin && is_space(line[end - 1])) --end;
+        if (begin == end) continue;  // blank line or comment only
+
+        line = line.substr(begin, end - begin);
+        const int named = named_key(line);
+        if (named != 0)
+        {
+            out.push_back(named);
+            continue;
+        }
+        if (line.size() == 1 && line[0] >= 32 && line[0] <= 126)
+        {
+            out.push_back(line[0]);
+            continue;
+        }
+
+        std::fprintf(stderr, "haven: %s:%d is not a key name or a single character\n", path.c_str(), line_number);
+        return false;
     }
     return !out.empty();
 }

@@ -92,13 +92,16 @@ class GameSession {
 public:
     GameSession(HavenRenderer& renderer, ITransport& net, InputState& input, Hud& hud);
 
-    /// Connects and sends C2S_HELLO. The transport owns the connect policy —
-    /// its timeout, and for single-player the server spawn and readiness wait —
-    /// so there is no retry loop here: a transport that has reported failure
-    /// has already waited as long as it is going to. On failure `outError`
-    /// carries the transport's own reason, for the menu to show.
-    bool connect(const std::string& host, uint16_t port, const std::string& name,
-                  std::string* outError = nullptr);
+    /// Connects and sends C2S_HELLO, which carries the name and the two ids the
+    /// character select produced: `race_id` picks the server's stat row and
+    /// `starting_weapon_id` the one weapon the run begins with. The transport
+    /// owns the connect policy — its timeout, and for single-player the server
+    /// spawn and readiness wait — so there is no retry loop here: a transport
+    /// that has reported failure has already waited as long as it is going to.
+    /// On failure `outError` carries the transport's own reason, for the menu
+    /// to show.
+    bool connect(const std::string& host, uint16_t port, const std::string& name, uint8_t race_id,
+                 uint8_t starting_weapon_id, std::string* outError = nullptr);
 
     void update(float dt_seconds);
     void shutdown();

@@ -35,7 +35,8 @@ GameSession::GameSession(HavenRenderer& renderer, ITransport& net, InputState& i
     session_token_ = 0x53484156454E31ULL;
 }
 
-bool GameSession::connect(const std::string& host, uint16_t port, const std::string& name, std::string* outError)
+bool GameSession::connect(const std::string& host, uint16_t port, const std::string& name, uint8_t race_id,
+                          uint8_t starting_weapon_id, std::string* outError)
 {
     std::string error;
     if (!net_.connect(host, port, error))
@@ -45,7 +46,7 @@ bool GameSession::connect(const std::string& host, uint16_t port, const std::str
         return false;
     }
 
-    const std::vector<uint8_t> hello = encode_hello(0, 0, name);
+    const std::vector<uint8_t> hello = encode_hello(race_id, starting_weapon_id, name);
     if (!net_.sendPacket(hello.data(), hello.size()))
     {
         std::fprintf(stderr, "haven: could not send C2S_HELLO\n");
@@ -54,6 +55,8 @@ bool GameSession::connect(const std::string& host, uint16_t port, const std::str
         return false;
     }
     std::printf("haven: connected to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
+    std::printf("haven: C2S_HELLO name=%s race=%u weapon=%u\n", name.c_str(),
+                static_cast<unsigned>(race_id), static_cast<unsigned>(starting_weapon_id));
     return true;
 }
 
