@@ -68,6 +68,19 @@ public:
     /// C2S_RESTART goes out, so the next snapshot starts from a clean HUD.
     void reset();
 
+    // Main menu, shown before a run exists and therefore before any server
+    // connection has been made.
+    void show_main_menu();
+    void hide_main_menu();
+    bool menu_visible() const { return menu_visible_; }
+
+    /// Which entry is highlighted: 0 for the first, 1 for the second.
+    void set_menu_selection(int selection);
+
+    /// The connection-failure banner. Empty means no banner.
+    void set_menu_error(const std::string& error);
+    void clear_menu_error();
+
     /// Destroys every HUD scene object while Ogre is still alive. Must be
     /// called before renderer.closeApp(); the destructor has nothing left to
     /// do afterwards.
@@ -134,6 +147,7 @@ private:
     void layout_offer(const LevelUpOffer& offer);
     void layout_game_over(const GameOverStats& stats);
     void layout_banner(const std::string& name);
+    void layout_main_menu();
 
     Ogre::SceneManager* scene_ = nullptr;
     MeshFactory* meshes_ = nullptr;
@@ -151,6 +165,7 @@ private:
 
     QuadBatch tray_;
     QuadBatch modal_;
+    QuadBatch menu_;
     TextLayer* hud_lines_ = nullptr;    // level label, xp numbers, run clock
     TextLayer* tray_text_ = nullptr;    // weapon/passive names
     TextLayer* modal_title_ = nullptr;  // "LEVEL UP!" header
@@ -161,12 +176,19 @@ private:
     TextLayer* score_footer_ = nullptr;
     TextLayer* banner_tag_ = nullptr;
     TextLayer* banner_name_ = nullptr;
+    TextLayer* menu_title_ = nullptr;   // "SHAPED HAVEN" / "MAIN MENU"
+    TextLayer* menu_options_ = nullptr; // the two entries
+    TextLayer* menu_footer_ = nullptr;  // the key hints
+    TextLayer* menu_error_ = nullptr;   // the connection-failure banner
 
     uint32_t last_run_second_ = 0xFFFFFFFFu;
     bool banner_visible_ = false;
     float banner_timer_ = 0.0f;
     bool offer_visible_ = false;
     bool game_over_visible_ = false;
+    bool menu_visible_ = false;
+    int menu_selection_ = 0;
+    std::string menu_error_text_;
     bool initialised_ = false;
 
     struct ColourLess {

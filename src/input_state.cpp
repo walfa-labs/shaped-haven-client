@@ -35,6 +35,12 @@ void InputState::key_up(int key_code)
     held_[key_code] = false;
 }
 
+bool InputState::held(int key_code) const
+{
+    const auto it = held_.find(key_code);
+    return it != held_.end() && it->second;
+}
+
 void InputState::set_script(const std::vector<Vec2>& script)
 {
     script_ = &script;

@@ -124,6 +124,7 @@ Hud::Hud(Ogre::SceneManager* scene_manager, MeshFactory* meshes, Ogre::SceneNode
 {
     tray_.name = "haven/hud_tray";
     modal_.name = "haven/hud_modal";
+    menu_.name = "haven/hud_menu";
     attach_node_ = camera_node_->createChildSceneNode();
     attach_node_->setPosition(0.0f, 0.0f, -kCameraZ);
     build_persistent_elements();
@@ -142,6 +143,10 @@ Hud::~Hud()
     destroy_layer(score_footer_);
     destroy_layer(banner_tag_);
     destroy_layer(banner_name_);
+    destroy_layer(menu_title_);
+    destroy_layer(menu_options_);
+    destroy_layer(menu_footer_);
+    destroy_layer(menu_error_);
 }
 
 Ogre::MaterialPtr Hud::material_for(Rgba colour)
@@ -319,12 +324,67 @@ void Hud::reset()
     banner_timer_ = 0.0f;
 }
 
+// ---------------------------------------------------------------------------
+// Main menu.
+// ---------------------------------------------------------------------------
+
+void Hud::show_main_menu()
+{
+    if (!initialised_) return;
+    layout_main_menu();
+    menu_visible_ = true;
+    // The XP bar is run-bound; it comes back when the menu goes away.
+    xp_bg_->setVisible(false);
+    xp_fill_->setVisible(false);
+    dim_->setVisible(true);
+    panel_->setVisible(true);
+    Ogre::Node* panel_node = panel_->getParentNode();
+    panel_node->setScale(46.0f, 33.0f, 1.0f);
+    panel_node->setPosition(0.0f, 0.0f, 0.485f);
+}
+
+void Hud::hide_main_menu()
+{
+    if (!initialised_) return;
+    clear_batch(menu_);
+    destroy_layer(menu_title_);
+    destroy_layer(menu_options_);
+    destroy_layer(menu_footer_);
+    destroy_layer(menu_error_);
+    menu_visible_ = false;
+    xp_bg_->setVisible(true);
+    dim_->setVisible(false);
+    panel_->setVisible(false);
+}
+
+void Hud::set_menu_selection(int selection)
+{
+    if (!initialised_) return;
+    menu_selection_ = selection;
+    if (menu_visible_) layout_main_menu();
+}
+
+void Hud::set_menu_error(const std::string& error)
+{
+    if (!initialised_) return;
+    menu_error_text_ = error;
+    if (menu_visible_) layout_main_menu();
+}
+
+void Hud::clear_menu_error()
+{
+    if (!initialised_) return;
+    menu_error_text_.clear();
+    if (menu_visible_) layout_main_menu();
+}
+
 void Hud::shutdown()
 {
     if (!initialised_) return;
     loadout_.reset();
     hide_offer();
     hide_game_over();
+    hide_main_menu();
     clear_batch(tray_);
     destroy_layer(tray_text_);
     destroy_layer(hud_lines_);
@@ -858,6 +918,84 @@ void Hud::layout_banner(const std::string& name)
     item_line.colour = kWhite;
     item->lines.push_back(item_line);
     rebuild_layer(*item);
+}
+
+void Hud::layout_main_menu()
+{
+    const Rgba kGold{1.00f, 0.80f, 0.30f, 1.0f};
+    const Rgba kWhite{0.92f, 0.94f, 0.98f, 1.0f};
+    const Rgba kDim{0.70f, 0.74f, 0.82f, 1.0f};
+    const Rgba kRed{0.95f, 0.35f, 0.35f, 1.0f};
+    const Rgba kHighlight{0.20f, 0.22f, 0.30f, 0.85f};
+
+    // The two entries, top to bottom, and the highlight that marks the
+    // selected one.
+    constexpr const char* kOptions[2] = {"SINGLE PLAYER", "MULTIPLAYER"};
+    constexpr float kOptionY[2] = {3.5f, -2.0f};
+    constexpr float kOptionPixel = 0.48f;
+
+    clear_batch(menu_);
+    const float highlight_width =
+        static_cast<float>(text_pixel_width(kOptions[menu_selection_])) * kOptionPixel + 2.5f;
+    quad_into(menu_, kHighlight, 0.0f, kOptionY[menu_selection_], highlight_width * 0.5f, 1.3f);
+    rebuild_batch(menu_);
+
+    TextLayer* title = ensure_layer(menu_title_);
+    title->lines.clear();
+    TextLine title_line;
+    title_line.text = "SHAPED HAVEN";
+    title_line.pixel = 0.60f;
+    title_line.x = -static_cast<float>(text_pixel_width(title_line.text)) * title_line.pixel * 0.5f;
+    title_line.y = 14.0f;
+    title_line.colour = kGold;
+    title->lines.push_back(title_line);
+    TextLine subtitle;
+    subtitle.text = "MAIN MENU";
+    subtitle.pixel = 0.30f;
+    subtitle.x = -static_cast<float>(text_pixel_width(subtitle.text)) * subtitle.pixel * 0.5f;
+    subtitle.y = 10.5f;
+    subtitle.colour = kDim;
+    title->lines.push_back(subtitle);
+    rebuild_layer(*title);
+
+    TextLayer* options = ensure_layer(menu_options_);
+    options->lines.clear();
+    for (int i = 0; i < 2; ++i)
+    {
+        TextLine line;
+        line.text = kOptions[i];
+        line.pixel = kOptionPixel;
+        line.x = -static_cast<float>(text_pixel_width(line.text)) * line.pixel * 0.5f;
+        line.y = kOptionY[i];
+        line.colour = (i == menu_selection_) ? kWhite : kDim;
+        options->lines.push_back(line);
+    }
+    rebuild_layer(*options);
+
+    TextLayer* footer = ensure_layer(menu_footer_);
+    footer->lines.clear();
+    TextLine footer_line;
+    footer_line.text = "UP/DOWN SELECT - ENTER CONFIRM";
+    footer_line.pixel = 0.28f;
+    footer_line.x = -static_cast<float>(text_pixel_width(footer_line.text)) * footer_line.pixel * 0.5f;
+    footer_line.y = -9.0f;
+    footer_line.colour = kDim;
+    footer->lines.push_back(footer_line);
+    rebuild_layer(*footer);
+
+    TextLayer* error = ensure_layer(menu_error_);
+    error->lines.clear();
+    if (!menu_error_text_.empty())
+    {
+        TextLine error_line;
+        error_line.text = menu_error_text_;
+        error_line.pixel = fit_text_pixel(error_line.text, 44.0f, 0.0f, 0.30f);
+        error_line.x = -static_cast<float>(text_pixel_width(error_line.text)) * error_line.pixel * 0.5f;
+        error_line.y = -13.0f;
+        error_line.colour = kRed;
+        error->lines.push_back(error_line);
+    }
+    rebuild_layer(*error);
 }
 
 }  // namespace haven

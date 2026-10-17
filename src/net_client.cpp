@@ -25,43 +25,11 @@ NetClient::~NetClient()
     if (sock != kInvalidSocket) ::closesocket(sock);
 }
 
-bool NetClient::connect(const std::string& host, uint16_t port)
+void NetClient::adopt(int sock)
 {
-    const int sock = ::socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-    if (sock == kInvalidSocket)
-    {
-        std::fprintf(stderr, "haven: socket() failed: %d\n", ::WSAGetLastError());
-        return false;
-    }
-
-    sockaddr_in addr{};
-    addr.sin_family = AF_INET;
-    addr.sin_port = ::htons(port);
-    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1)
-    {
-        std::fprintf(stderr, "haven: inet_pton('%s') failed\n", host.c_str());
-        ::closesocket(sock);
-        return false;
-    }
-
-    if (::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == SOCKET_ERROR)
-    {
-        std::fprintf(stderr, "haven: connect(%s:%u) failed: %d\n", host.c_str(), static_cast<unsigned>(port),
-                     ::WSAGetLastError());
-        ::closesocket(sock);
-        return false;
-    }
-
-    // Loopback traffic is tiny and latency sensitive; Nagle only adds delay.
-    BOOL no_delay = TRUE;
-    ::setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
-
-    u_long non_blocking = 1;
-    ::ioctlsocket(sock, FIONBIO, &non_blocking);
-
     socket_.store(sock);
     connected_.store(true);
-    return true;
+    start();
 }
 
 void NetClient::start()
