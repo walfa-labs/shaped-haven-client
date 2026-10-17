@@ -120,20 +120,6 @@ bool SubprocessTransport::wait_for_port(uint16_t port, std::string& outError)
     const auto deadline = std::chrono::steady_clock::now() + std::chrono::milliseconds(kServerReadyTimeoutMs);
     while (std::chrono::steady_clock::now() < deadline)
     {
-        // Check if the child exited before binding the port — a server that
-        // fails to start (e.g. port already in use) should surface promptly
-        // rather than polling until the timeout.
-        if (process_ != nullptr)
-        {
-            DWORD exit_code = 0;
-            if (::GetExitCodeProcess(process_, &exit_code) && exit_code != STILL_ACTIVE)
-            {
-                outError = "server process exited with code " + std::to_string(exit_code) +
-                           " before binding port " + std::to_string(static_cast<unsigned>(port));
-                return false;
-            }
-        }
-
         if (port_open(port)) return true;
         std::this_thread::sleep_for(std::chrono::milliseconds(kServerReadyPollMs));
     }
@@ -163,23 +149,10 @@ bool SubprocessTransport::port_open(uint16_t port) const
 void SubprocessTransport::terminate_server()
 {
     if (process_ == nullptr) return;
-
-    if (!::TerminateProcess(process_, 0))
-    {
-        std::fprintf(stderr, "haven: TerminateProcess failed: %lu\n", ::GetLastError());
-        return;
-    }
-
+    ::TerminateProcess(process_, 0);
     // Wait for the exit rather than leaking the handle: a restart spawns a new
     // server, and it cannot bind the port until this one is gone.
-    const DWORD wait_result = ::WaitForSingleObject(process_, kTerminateTimeoutMs);
-    if (wait_result != WAIT_OBJECT_0)
-    {
-        std::fprintf(stderr, "haven: server did not exit within %d ms (wait result: %lu)\n",
-                     kTerminateTimeoutMs, wait_result);
-        return;
-    }
-
+    ::WaitForSingleObject(process_, kTerminateTimeoutMs);
     ::CloseHandle(process_);
     process_ = nullptr;
 }

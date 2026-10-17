@@ -100,8 +100,6 @@ void print_usage(const char* argv0)
 enum class AppState {
     MainMenu,
     Connecting,
-    /// Waiting for the server's S2C_WELCOME after a successful TCP connect.
-    AwaitingWelcome,
     Playing,
     /// The menu again, with the reason the last connect failed on it.
     ConnectionFailed,
@@ -125,7 +123,6 @@ int main(int argc, char** argv)
     std::string server_path = default_server_path();
     int frame_limit = 0;
     bool verbose = false;
-    bool auto_single_player = false;
 
     for (int i = 1; i < argc; ++i)
     {
@@ -140,7 +137,6 @@ int main(int argc, char** argv)
         else if (arg == "--choice-script") choice_script = next();
         else if (arg == "--server-path") server_path = next();
         else if (arg == "--verbose") verbose = true;
-        else if (arg == "--auto-single-player") auto_single_player = true;
         else if (arg == "--help" || arg == "-h") { print_usage(argv[0]); return 0; }
         else { print_usage(argv[0]); return 1; }
     }
@@ -191,18 +187,8 @@ int main(int argc, char** argv)
     std::unique_ptr<haven::ITransport> transport;
     std::unique_ptr<haven::GameSession> session;
     bool connect_attempted = false;
-    float welcome_wait_seconds_ = 0.0f;
-    constexpr float kWelcomeTimeoutSeconds = 5.0f;
 
     hud.show_main_menu();
-
-    // For headless testing: auto-start single-player without waiting for input.
-    if (auto_single_player)
-    {
-        menu_selection = 0;
-        state = AppState::Connecting;
-        connect_attempted = false;
-    }
 
     // Edge detection for the menu keys: a press is a key that is held now and
     // was not held on the previous frame, so holding a key does not repeat.
@@ -234,11 +220,7 @@ int main(int argc, char** argv)
                 menu_selection = (menu_selection + 1) % 2;
                 hud.set_menu_selection(menu_selection);
             }
-            if (enter && !prev_enter)
-            {
-                state = AppState::Connecting;
-                connect_attempted = false;
-            }
+            if (enter && !prev_enter) state = AppState::Connecting;
             prev_up = up;
             prev_down = down;
             prev_enter = enter;
@@ -268,8 +250,7 @@ int main(int argc, char** argv)
                 if (session->connect(host, port, name, &connect_error))
                 {
                     hud.hide_main_menu();
-                    state = AppState::AwaitingWelcome;
-                    welcome_wait_seconds_ = 0.0f;
+                    state = AppState::Playing;
                 }
                 else
                 {
@@ -282,43 +263,8 @@ int main(int argc, char** argv)
             }
             break;
 
-        case AppState::AwaitingWelcome:
-            session->update(dt);
-            welcome_wait_seconds_ += dt;
-
-            if (session->stats().welcomed)
-            {
-                state = AppState::Playing;
-            }
-            else if (welcome_wait_seconds_ >= kWelcomeTimeoutSeconds || !transport->isConnected())
-            {
-                menu_error = !transport->isConnected()
-                    ? "Connection lost during handshake"
-                    : "Server did not respond";
-                state = AppState::ConnectionFailed;
-                hud.show_main_menu();
-                hud.set_menu_error(menu_error);
-                session.reset();
-                transport->disconnect();
-                transport.reset();
-            }
-            break;
-
         case AppState::Playing:
             session->update(dt);
-
-            if (!transport->isConnected())
-            {
-                menu_error = "Connection lost";
-                state = AppState::ConnectionFailed;
-                hud.show_main_menu();
-                hud.set_menu_error(menu_error);
-                session.reset();
-                transport->disconnect();
-                transport.reset();
-                break;
-            }
-
             ++frames;
 
             if (verbose && (frames % 60 == 0))
