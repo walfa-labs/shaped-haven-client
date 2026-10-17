@@ -104,7 +104,7 @@ std::vector<uint8_t> encode_packet(uint8_t msg_type, uint32_t seq, const std::ve
     return packet;
 }
 
-std::vector<uint8_t> encode_hello(uint64_t session_token, uint8_t race_id, uint8_t starting_weapon_id, const std::string& name)
+std::vector<uint8_t> encode_hello(uint8_t race_id, uint8_t starting_weapon_id, const std::string& name)
 {
     ByteWriter w;
     w.u8(kProtocolVersion);
@@ -269,7 +269,7 @@ bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out)
         e.vel_angle = decode_angle(vel_angle);
         if (!r.u8(e.hp_pct)) return false;
         if (!r.u8(e.telegraph_progress) || !r.u8(e.telegraph_shape)) return false;
-        if (!r.u16(e.telegraph_angle) || !r.u16(e.telegraph_radius)) return false;
+        if (!r.i16(e.telegraph_angle) || !r.u16(e.telegraph_radius)) return false;
     }
 
     out.projs.resize(out.proj_count);
@@ -335,7 +335,7 @@ bool read_delta_record(ByteReader& r, uint8_t kind_byte, SnapshotDelta& out, boo
                 return false;
             if (!r.u8(e.hp_pct)) return false;
             if (!r.u8(e.telegraph_progress) || !r.u8(e.telegraph_shape)) return false;
-            if (!r.u16(e.telegraph_angle) || !r.u16(e.telegraph_radius)) return false;
+            if (!r.i16(e.telegraph_angle) || !r.u16(e.telegraph_radius)) return false;
             if (!spawned && e.id != external_id) return false;
             e.vel_angle = decode_angle(vel_angle);
             (spawned ? out.spawned_enemies : out.updated_enemies).push_back(e);
