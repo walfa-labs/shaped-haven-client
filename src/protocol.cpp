@@ -104,35 +104,27 @@ std::vector<uint8_t> encode_packet(uint8_t msg_type, uint32_t seq, const std::ve
     return packet;
 }
 
-std::vector<uint8_t> encode_hello(uint64_t session_token, uint8_t requested_slot, const std::string& name)
+std::vector<uint8_t> encode_hello(uint64_t session_token, uint8_t race_id, uint8_t starting_weapon_id, const std::string& name)
 {
     ByteWriter w;
     w.u8(kProtocolVersion);
-    w.u8(requested_slot);
-    w.u64(session_token);
+    w.u8(race_id);
+    w.u8(starting_weapon_id);
+    w.u8(0);  // reserved
     w.str_fixed(name, kMaxNameLength);
 
     std::vector<uint8_t> payload(w.data(), w.data() + w.size());
     return encode_packet(static_cast<uint8_t>(MsgType::C2S_HELLO), 0, payload);
 }
 
-std::vector<uint8_t> encode_input(uint32_t input_seq, uint32_t client_tick, Vec2 move, uint16_t aim_angle, uint8_t buttons)
+std::vector<uint8_t> encode_input(uint32_t input_seq, uint32_t client_tick, uint8_t buttons, int8_t axis_x, int8_t axis_y)
 {
-    // move_x / move_y are i8 in [-100, 100]; diagonals are normalised first so
-    // the quantized magnitude never exceeds the field.
-    const Vec2 clamped{std::max(-1.0f, std::min(1.0f, move.x)),
-                        std::max(-1.0f, std::min(1.0f, move.y))};
-    const auto to_i8 = [](float v) {
-        return static_cast<int8_t>(std::lround(std::max(-100, std::min(100, static_cast<int>(std::lround(v * 100.0f))))));
-    };
-
     ByteWriter w;
     w.u32(input_seq);
     w.u32(client_tick);
-    w.u8(static_cast<uint8_t>(to_i8(clamped.x)));
-    w.u8(static_cast<uint8_t>(to_i8(clamped.y)));
-    w.u16(aim_angle);
     w.u8(buttons);
+    w.u8(static_cast<uint8_t>(axis_x));
+    w.u8(static_cast<uint8_t>(axis_y));
 
     std::vector<uint8_t> payload(w.data(), w.data() + w.size());
     return encode_packet(static_cast<uint8_t>(MsgType::C2S_INPUT), input_seq, payload);
@@ -259,9 +251,13 @@ bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out)
     for (PlayerNet& p : out.players)
     {
         uint8_t vel_angle = 0;
-        if (!r.u8(p.id) || !r.u8(p.state_flags) || !r.vec2(p.pos) || !r.u8(vel_angle)) return false;
+        if (!r.u8(p.id) || !r.u8(p.state_flags) || !r.u8(p.race_id) || !r.vec2(p.pos) || !r.u8(vel_angle))
+            return false;
         p.vel_angle = decode_angle(vel_angle);
-        if (!r.u8(p.hp_pct)) return false;
+        if (!r.u8(p.hp_pct) || !r.u8(p.shield_pct) || !r.u8(p.mana_pct)) return false;
+        if (!r.u16(p.dash_cd_remaining) || !r.u16(p.dash_cd_total)) return false;
+        if (!r.u8(p.is_dashing)) return false;
+        if (!r.u16(p.max_hp) || !r.u16(p.max_shield)) return false;
     }
 
     out.enemies.resize(out.enemy_count);
@@ -272,6 +268,8 @@ bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out)
         if (!r.u8(vel_angle)) return false;
         e.vel_angle = decode_angle(vel_angle);
         if (!r.u8(e.hp_pct)) return false;
+        if (!r.u8(e.telegraph_progress) || !r.u8(e.telegraph_shape)) return false;
+        if (!r.u16(e.telegraph_angle) || !r.u16(e.telegraph_radius)) return false;
     }
 
     out.projs.resize(out.proj_count);
@@ -318,8 +316,12 @@ bool read_delta_record(ByteReader& r, uint8_t kind_byte, SnapshotDelta& out, boo
         {
             PlayerNet p;
             uint8_t vel_angle = 0;
-            if (!r.u8(p.id) || !r.u8(p.state_flags) || !r.vec2(p.pos) || !r.u8(vel_angle) || !r.u8(p.hp_pct))
+            if (!r.u8(p.id) || !r.u8(p.state_flags) || !r.u8(p.race_id) || !r.vec2(p.pos) || !r.u8(vel_angle))
                 return false;
+            if (!r.u8(p.hp_pct) || !r.u8(p.shield_pct) || !r.u8(p.mana_pct)) return false;
+            if (!r.u16(p.dash_cd_remaining) || !r.u16(p.dash_cd_total)) return false;
+            if (!r.u8(p.is_dashing)) return false;
+            if (!r.u16(p.max_hp) || !r.u16(p.max_shield)) return false;
             if (!spawned && static_cast<uint32_t>(p.id) != external_id) return false;
             p.vel_angle = decode_angle(vel_angle);
             (spawned ? out.spawned_players : out.updated_players).push_back(p);
@@ -329,9 +331,11 @@ bool read_delta_record(ByteReader& r, uint8_t kind_byte, SnapshotDelta& out, boo
         {
             EnemyNet e;
             uint8_t vel_angle = 0;
-            if (!r.u32(e.id) || !r.u8(e.archetype) || !r.u8(e.elite_mask) || !r.vec2(e.pos) || !r.u8(vel_angle) ||
-                !r.u8(e.hp_pct))
+            if (!r.u32(e.id) || !r.u8(e.archetype) || !r.u8(e.elite_mask) || !r.vec2(e.pos) || !r.u8(vel_angle))
                 return false;
+            if (!r.u8(e.hp_pct)) return false;
+            if (!r.u8(e.telegraph_progress) || !r.u8(e.telegraph_shape)) return false;
+            if (!r.u16(e.telegraph_angle) || !r.u16(e.telegraph_radius)) return false;
             if (!spawned && e.id != external_id) return false;
             e.vel_angle = decode_angle(vel_angle);
             (spawned ? out.spawned_enemies : out.updated_enemies).push_back(e);
@@ -426,16 +430,18 @@ bool decode_snapshot_delta(const uint8_t* payload, size_t len, SnapshotDelta& ou
 
 bool decode_levelup_offer(const uint8_t* payload, size_t len, LevelUpOffer& out)
 {
-    // player_id(1) + event_id(2) + new_level(2) + 3 x option(3) = 14, exactly
-    // as PROTOCOL.md fixes it; the arrays are fixed length, so the length is
-    // part of the format.
-    if (len != 14) return false;
+    // player_id(1) + event_id(2) + new_level(2) + 3 x option(8) = 29, exactly
+    // as the protocol v2 spec fixes it; the arrays are fixed length, so the
+    // length is part of the format.
+    if (len != 29) return false;
 
     ByteReader r(payload, len);
     if (!r.u8(out.player_id) || !r.u16(out.event_id) || !r.u16(out.new_level)) return false;
     for (UpgradeOptionNet& option : out.options)
     {
         if (!r.u8(option.item_id) || !r.u8(option.next_level) || !r.u8(option.is_evo)) return false;
+        if (!r.u8(option.stat_type)) return false;
+        if (!r.i16(option.current_stat_fp) || !r.i16(option.upgraded_stat_fp)) return false;
     }
     return true;
 }

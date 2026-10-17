@@ -44,7 +44,7 @@ bool GameSession::connect(const std::string& host, uint16_t port, const std::str
         if (net_.connect(host, port))
         {
             net_.start();
-            if (!net_.send(encode_hello(session_token_, 0, name)))
+            if (!net_.send(encode_hello(session_token_, 0, 0, name)))
                 std::fprintf(stderr, "haven: could not queue C2S_HELLO\n");
             std::printf("haven: connected to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
             return true;
@@ -145,7 +145,15 @@ void GameSession::step_fixed()
     // Reserve the sequence number the predictor is about to use, so the packet
     // describes exactly the step that is about to be taken.
     const uint32_t seq = predictor_.next_seq();
-    if (!net_.send(encode_input(seq, client_tick_, move, 0, 0)))
+
+    // Convert the normalized move vector to analog axis values for the v2 protocol.
+    const auto to_i8 = [](float v) {
+        return static_cast<int8_t>(std::lround(std::max(-1.0f, std::min(1.0f, v)) * 100.0f));
+    };
+    const int8_t axis_x = to_i8(move.x);
+    const int8_t axis_y = to_i8(move.y);
+
+    if (!net_.send(encode_input(seq, client_tick_, 0, axis_x, axis_y)))
     {
         // The link went away between the connected() check above and the send.
         // The move is lost, so do not advance the prediction either: a step the

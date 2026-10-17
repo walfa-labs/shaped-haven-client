@@ -453,6 +453,18 @@ void collect_draw_items(const InterpolationBuffer& buffer, std::vector<EntityDra
         item.hp_pct = style->second.hp_pct;
         item.shape = style->second.shape;
         item.elite_mask = style->second.elite_mask;
+        item.race_id = style->second.race_id;
+        item.shield_pct = style->second.shield_pct;
+        item.mana_pct = style->second.mana_pct;
+        item.dash_cd_remaining = style->second.dash_cd_remaining;
+        item.dash_cd_total = style->second.dash_cd_total;
+        item.is_dashing = style->second.is_dashing;
+        item.max_hp = style->second.max_hp;
+        item.max_shield = style->second.max_shield;
+        item.telegraph_progress = style->second.telegraph_progress;
+        item.telegraph_shape = style->second.telegraph_shape;
+        item.telegraph_angle = style->second.telegraph_angle;
+        item.telegraph_radius = style->second.telegraph_radius;
         items.push_back(item);
     }
 }

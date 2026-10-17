@@ -21,6 +21,22 @@ struct EntityStyle {
     uint8_t shape = 0;   // projectiles only; ProjNet shape byte
     float angle = 0.0f;  // facing, in radians
     uint8_t elite_mask = 0;  // enemies only; one bit per elite modifier
+
+    // Player fields (protocol v2)
+    uint8_t race_id = 0;
+    uint8_t shield_pct = 0;
+    uint8_t mana_pct = 0;
+    uint16_t dash_cd_remaining = 0;
+    uint16_t dash_cd_total = 0;
+    uint8_t is_dashing = 0;
+    uint16_t max_hp = 0;
+    uint16_t max_shield = 0;
+
+    // Enemy telegraph fields (protocol v2)
+    uint8_t telegraph_progress = 0;
+    uint8_t telegraph_shape = 0;
+    uint16_t telegraph_angle = 0;
+    uint16_t telegraph_radius = 0;
 };
 
 /// A snapshot reduced to what the renderer needs, keyed by the namespaced

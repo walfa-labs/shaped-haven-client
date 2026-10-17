@@ -106,31 +106,30 @@ void test_angle_quantisation()
 void test_hello_packet()
 {
     std::printf("C2S_HELLO\n");
-    std::vector<uint8_t> packet = haven::encode_hello(0x1122334455667788ULL, 0, "haven");
-    // proto_ver(1) + requested_slot(1) + session_token(8) + name(16) = 26.
-    expect(packet.size() == haven::kHeaderSize + 26, "hello is 7 byte header + 26 byte payload");
+    std::vector<uint8_t> packet = haven::encode_hello(0x1122334455667788ULL, 3, 2, "haven");
+    // proto_ver(1) + race_id(1) + starting_weapon_id(1) + reserved(1) + name(16) = 20.
+    expect(packet.size() == haven::kHeaderSize + 20, "hello is 7 byte header + 20 byte payload");
 
     haven::PacketHeader header{};
     expect(haven::decode_header(packet.data(), packet.size(), header), "header decodes");
     expect(header.msg_type == 0x01, "msg_type is C2S_HELLO");
-    expect(header.payload_len == 26, "payload_len is 26");
+    expect(header.payload_len == 20, "payload_len is 20");
 
-    expect(packet[7] == 1, "proto_ver is 1");
-    expect(packet[8] == 0, "requested_slot is 0");
-    uint64_t token = 0;
-    for (int i = 0; i < 8; ++i) token |= static_cast<uint64_t>(packet[9 + i]) << (8 * i);
-    expect(token == 0x1122334455667788ULL, "session_token is little-endian");
-    expect(packet[17] == 'h' && packet[18] == 'a' && packet[19] == 'v' && packet[20] == 'e' && packet[21] == 'n',
+    expect(packet[7] == 2, "proto_ver is 2");
+    expect(packet[8] == 3, "race_id is 3");
+    expect(packet[9] == 2, "starting_weapon_id is 2");
+    expect(packet[10] == 0, "reserved is 0");
+    expect(packet[11] == 'h' && packet[12] == 'a' && packet[13] == 'v' && packet[14] == 'e' && packet[15] == 'n',
            "name is copied");
-    expect(packet[22] == 0 && packet[26] == 0, "name is zero padded to 16 bytes");
+    expect(packet[16] == 0 && packet[20] == 0, "name is zero padded to 16 bytes");
 }
 
 void test_input_packet()
 {
     std::printf("C2S_INPUT\n");
-    std::vector<uint8_t> packet = haven::encode_input(42, 7, {0.5f, -0.5f}, 1000, 0);
-    // input_seq(4) + client_tick(4) + move_x(1) + move_y(1) + aim_angle(2) + buttons(1) = 13.
-    expect(packet.size() == haven::kHeaderSize + 13, "input is 7 byte header + 13 byte payload");
+    std::vector<uint8_t> packet = haven::encode_input(42, 7, 0x1F, 50, -50);
+    // input_seq(4) + client_tick(4) + buttons(1) + axis_x(1) + axis_y(1) = 11.
+    expect(packet.size() == haven::kHeaderSize + 11, "input is 7 byte header + 11 byte payload");
 
     haven::PacketHeader header{};
     expect(haven::decode_header(packet.data(), packet.size(), header), "header decodes");
@@ -140,16 +139,11 @@ void test_input_packet()
     expect(packet[7] == 42 && packet[8] == 0 && packet[9] == 0 && packet[10] == 0, "input_seq is little-endian");
     expect(packet[11] == 7, "client_tick follows");
 
-    const auto move_x = static_cast<int8_t>(packet[15]);
-    const auto move_y = static_cast<int8_t>(packet[16]);
-    expect(move_x == 50, "move_x 0.5 -> 50");
-    expect(move_y == -50, "move_y -0.5 -> -50");
-    expect(std::abs(static_cast<int>(move_x)) <= 100 && std::abs(static_cast<int>(move_y)) <= 100,
-           "move components stay inside [-100, 100]");
-
-    const uint16_t aim = static_cast<uint16_t>(packet[17] | (packet[18] << 8));
-    expect(aim == 1000, "aim_angle round-trips");
-    expect(packet[19] == 0, "buttons is 0");
+    expect(packet[15] == 0x1F, "buttons bitmask");
+    const auto axis_x = static_cast<int8_t>(packet[16]);
+    const auto axis_y = static_cast<int8_t>(packet[17]);
+    expect(axis_x == 50, "axis_x 50");
+    expect(axis_y == -50, "axis_y -50");
 }
 
 void test_welcome_packet()
@@ -258,17 +252,33 @@ void test_snapshot_packet()
 
     append_u8(0);                 // player id
     append_u8(1);                 // state_flags
+    append_u8(3);                 // race_id
     append_i16(haven::encode_pos(12.34f));
     append_i16(haven::encode_pos(-5.6f));
     append_u8(haven::encode_angle(1.5f));
-    append_u8(100);
+    append_u8(100);               // hp_pct
+    append_u8(80);                // shield_pct
+    append_u8(60);                // mana_pct
+    append_u16(0);                // dash_cd_remaining
+    append_u16(3000);             // dash_cd_total
+    append_u8(0);                 // is_dashing
+    append_u16(100);              // max_hp
+    append_u16(50);               // max_shield
 
-    append_u8(1);
-    append_u8(0);
+    append_u8(1);                 // player id
+    append_u8(1);                 // state_flags
+    append_u8(0);                 // race_id
     append_i16(haven::encode_pos(-40.0f));
     append_i16(haven::encode_pos(20.0f));
     append_u8(haven::encode_angle(0.0f));
-    append_u8(50);
+    append_u8(90);                // hp_pct
+    append_u8(0);                 // shield_pct
+    append_u8(100);               // mana_pct
+    append_u16(1500);             // dash_cd_remaining
+    append_u16(3000);             // dash_cd_total
+    append_u8(1);                 // is_dashing
+    append_u16(120);              // max_hp
+    append_u16(0);                // max_shield
 
     append_u32(77);               // enemy id
     append_u8(1);                 // archetype
@@ -276,7 +286,11 @@ void test_snapshot_packet()
     append_i16(haven::encode_pos(30.0f));
     append_i16(haven::encode_pos(30.0f));
     append_u8(haven::encode_angle(0.5f));
-    append_u8(75);
+    append_u8(75);                // hp_pct
+    append_u8(0);                 // telegraph_progress
+    append_u8(0);                 // telegraph_shape
+    append_u16(0);                // telegraph_angle
+    append_u16(0);                // telegraph_radius
 
     append_u32(9);                // gem id
     append_i16(haven::encode_pos(1.0f));
@@ -328,10 +342,12 @@ void test_snapshot_decoder_validation()
         u16(1);  // enemies
         u16(0);  // projectiles
         u16(0);  // gems
-        // PlayerNet
-        u8(0); u8(1); i16(0); i16(0); u8(0); u8(100);
-        // EnemyNet
+        // PlayerNet (20 bytes)
+        u8(0); u8(1); u8(0); i16(0); i16(0); u8(0); u8(100);
+        u8(0); u8(0); u16(0); u16(0); u8(0); u16(100); u16(0);
+        // EnemyNet (18 bytes)
         u32(7); u8(0); u8(0); i16(0); i16(0); u8(0); u8(100);
+        u8(0); u8(0); u16(0); u16(0);
         return payload;
     };
     const size_t counts_offset = 29;
@@ -422,10 +438,18 @@ std::vector<uint8_t> build_delta_payload()
     u8(0);                 // kind = player
     u8(0);                 // id
     u8(1);                 // state_flags
+    u8(2);                 // race_id
     i16(haven::encode_pos(1.0f));
     i16(haven::encode_pos(-2.0f));
     u8(haven::encode_angle(0.25f));
-    u8(100);
+    u8(100);               // hp_pct
+    u8(50);                // shield_pct
+    u8(75);                // mana_pct
+    u16(0);                // dash_cd_remaining
+    u16(2000);             // dash_cd_total
+    u8(0);                 // is_dashing
+    u16(100);              // max_hp
+    u16(50);               // max_shield
 
     u8(1);                 // kind = enemy
     u32(55);               // id
@@ -434,10 +458,14 @@ std::vector<uint8_t> build_delta_payload()
     i16(haven::encode_pos(30.0f));
     i16(haven::encode_pos(-30.0f));
     u8(haven::encode_angle(0.5f));
-    u8(75);
+    u8(75);                // hp_pct
+    u8(128);               // telegraph_progress
+    u8(1);                 // telegraph_shape (CircleAoE)
+    u16(1500);             // telegraph_angle
+    u16(500);              // telegraph_radius
 
     // Updated: one enemy, carrying its id then the full record. The full
-    // record is the 12 byte EnemyNet, whose own id field follows the separate
+    // record is the 18 byte EnemyNet, whose own id field follows the separate
     // id — the spec sends the id twice for an updated entity.
     u8(1);                 // kind = enemy
     u32(55);               // id
@@ -447,7 +475,11 @@ std::vector<uint8_t> build_delta_payload()
     i16(haven::encode_pos(31.0f));
     i16(haven::encode_pos(-31.0f));
     u8(haven::encode_angle(0.6f));
-    u8(70);
+    u8(70);                // hp_pct
+    u8(200);               // telegraph_progress
+    u8(2);                 // telegraph_shape (ConeSlash)
+    u16(2000);             // telegraph_angle
+    u16(800);              // telegraph_radius
 
     // Destroyed: one gem.
     u8(3);                 // kind = gem
@@ -1938,6 +1970,7 @@ void test_levelup_offer_packet()
     std::vector<uint8_t> payload;
     auto append_u8 = [&](uint8_t v) { payload.push_back(v); };
     auto append_u16 = [&](uint16_t v) { payload.push_back(v & 0xFF); payload.push_back((v >> 8) & 0xFF); };
+    auto append_i16 = [&](int16_t v) { append_u16(static_cast<uint16_t>(v)); };
     append_u8(0);        // player_id
     append_u16(0x1020);  // event_id
     append_u16(7);       // new_level
@@ -1946,6 +1979,9 @@ void test_levelup_offer_packet()
         append_u8(i);        // item_id
         append_u8(i + 1);    // next_level
         append_u8(i == 2);   // is_evo
+        append_u8(0);        // stat_type (Damage)
+        append_i16(500);     // current_stat_fp (5.00)
+        append_i16(600);     // upgraded_stat_fp (6.00)
     }
 
     haven::LevelUpOffer offer{};
@@ -1955,6 +1991,9 @@ void test_levelup_offer_packet()
     expect(offer.new_level == 7, "new_level");
     expect(offer.options[0].item_id == 0 && offer.options[0].next_level == 1 && offer.options[0].is_evo == 0,
            "option 0");
+    expect(offer.options[0].stat_type == 0 && offer.options[0].current_stat_fp == 500 &&
+               offer.options[0].upgraded_stat_fp == 600,
+           "option 0 stat fields");
     expect(offer.options[2].item_id == 2 && offer.options[2].next_level == 3 && offer.options[2].is_evo == 1,
            "option 2 is the evolution");
 
