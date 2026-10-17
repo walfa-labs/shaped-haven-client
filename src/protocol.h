@@ -108,7 +108,7 @@ private:
 
 std::vector<uint8_t> encode_packet(uint8_t msg_type, uint32_t seq, const std::vector<uint8_t>& payload);
 
-std::vector<uint8_t> encode_hello(uint8_t race_id, uint8_t starting_weapon_id, const std::string& name);
+std::vector<uint8_t> encode_hello(uint64_t session_token, uint8_t race_id, uint8_t starting_weapon_id, const std::string& name);
 std::vector<uint8_t> encode_input(uint32_t input_seq, uint32_t client_tick, uint8_t buttons, int8_t axis_x, int8_t axis_y);
 
 /// C2S_LEVELUP_CHOICE (0x03): event_id u16, choice_idx u8 — 3 byte payload.
@@ -173,7 +173,7 @@ struct EnemyNet {
     uint8_t hp_pct = 0;
     uint8_t telegraph_progress = 0;
     uint8_t telegraph_shape = 0;
-    int16_t telegraph_angle = 0;
+    uint16_t telegraph_angle = 0;
     uint16_t telegraph_radius = 0;
 };
 
