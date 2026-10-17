@@ -5,6 +5,7 @@
 
 #include <chrono>
 #include <cstdio>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -14,6 +15,7 @@ namespace haven {
 namespace {
 
 constexpr int kMaxStepsPerFrame = 8;
+constexpr int kConnectAttempts = 10;
 
 /// Finds the client's own player record in a list of decoded player records,
 /// or nullptr when the snapshot did not carry one. A stationary player can be
@@ -28,43 +30,34 @@ const PlayerNet* find_self_in(const std::vector<PlayerNet>& players, uint8_t pla
 
 }  // namespace
 
-GameSession::GameSession(HavenRenderer& renderer, ITransport& net, InputManager& input, Hud& hud)
+GameSession::GameSession(HavenRenderer& renderer, NetClient& net, InputState& input, Hud& hud)
     : renderer_(renderer), net_(net), input_(input), hud_(hud)
 {
     // Stable per-process token; phase 1 never reconnects with it.
     session_token_ = 0x53484156454E31ULL;
 }
 
-bool GameSession::connect(const std::string& host, uint16_t port, const std::string& name, std::string* outError)
+bool GameSession::connect(const std::string& host, uint16_t port, const std::string& name)
 {
-    std::string error;
-    if (!net_.connect(host, port, error))
+    for (int attempt = 1; attempt <= kConnectAttempts; ++attempt)
     {
-        std::fprintf(stderr, "haven: %s\n", error.c_str());
-        if (outError != nullptr) *outError = error;
-        return false;
+        if (net_.connect(host, port))
+        {
+            net_.start();
+            if (!net_.send(encode_hello(session_token_, 0, 0, name)))
+                std::fprintf(stderr, "haven: could not queue C2S_HELLO\n");
+            std::printf("haven: connected to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
+            return true;
+        }
+        std::printf("haven: connect attempt %d/%d failed\n", attempt, kConnectAttempts);
+        std::this_thread::sleep_for(std::chrono::milliseconds(250));
     }
-
-    const std::vector<uint8_t> hello = encode_hello(0, 0, name);
-    if (!net_.sendPacket(hello.data(), hello.size()))
-    {
-        std::fprintf(stderr, "haven: could not send C2S_HELLO\n");
-        if (outError != nullptr) *outError = "failed to send initial handshake";
-        net_.disconnect();
-        return false;
-    }
-    std::printf("haven: connected to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
-    return true;
+    return false;
 }
 
 void GameSession::update(float dt_seconds)
 {
     const auto update_started = std::chrono::steady_clock::now();
-
-    // Pump whatever background I/O the transport has. For the TCP link this is
-    // a no-op — NetClient's socket thread already reads and writes — but it is
-    // the one call site every transport shares.
-    net_.update(dt_seconds);
 
     // Fixed 60 Hz simulation steps, decoupled from the render rate so the
     // prediction matches the server's integrator exactly.
@@ -140,7 +133,7 @@ void GameSession::step_fixed()
 
     // Without a live link the integrator would run away from any state
     // reconciliation could correct, so hold position instead.
-    if (!net_.isConnected())
+    if (!net_.connected())
     {
         ++stats_.disconnected_steps;
         return;
@@ -160,8 +153,7 @@ void GameSession::step_fixed()
     const int8_t axis_x = to_i8(move.x);
     const int8_t axis_y = to_i8(move.y);
 
-    const std::vector<uint8_t> input_packet = encode_input(seq, client_tick_, 0, axis_x, axis_y);
-    if (!net_.sendPacket(input_packet.data(), input_packet.size()))
+    if (!net_.send(encode_input(seq, client_tick_, 0, axis_x, axis_y)))
     {
         // The link went away between the connected() check above and the send.
         // The move is lost, so do not advance the prediction either: a step the
@@ -179,15 +171,7 @@ void GameSession::step_fixed()
 void GameSession::drain_packets()
 {
     packets_.clear();
-    // One buffer large enough for the largest packet the protocol allows (a
-    // 7 byte header plus a u16 payload length), so a read never splits a packet.
-    uint8_t buffer[kHeaderSize + 0x10000];
-    for (;;)
-    {
-        const size_t n = net_.receiveBytes(buffer, sizeof(buffer));
-        if (n == 0) break;
-        packets_.emplace_back(buffer, buffer + n);
-    }
+    net_.poll(packets_);
     for (const std::vector<uint8_t>& packet : packets_)
     {
         PacketHeader header{};
@@ -367,8 +351,7 @@ void GameSession::resolve_levelup_choice()
     }
     if (pick < 0 || pick > 2) return;  // wait for a keypress or the script
 
-    const std::vector<uint8_t> choice = encode_levelup_choice(pending_offer_->event_id, static_cast<uint8_t>(pick));
-    if (!net_.sendPacket(choice.data(), choice.size()))
+    if (!net_.send(encode_levelup_choice(pending_offer_->event_id, static_cast<uint8_t>(pick))))
     {
         ++stats_.send_failures;
         return;
@@ -397,15 +380,11 @@ void GameSession::report_script_mismatch(const char* event, const char* marker)
 void GameSession::maybe_restart()
 {
     bool script_mismatch = false;
-    // The gate reads the keyboard side of the manager: the R key and the
-    // choice script are InputState's, and the gamepad's Start button reaches
-    // it as a request on the same wrapped state (InputManager::update).
-    const bool queued = restart_gate_.take(input_.keyboard(), script_mismatch);
+    const bool queued = restart_gate_.take(input_, script_mismatch);
     if (script_mismatch) report_script_mismatch("the game over", "choice");
     if (!queued) return;
 
-    const std::vector<uint8_t> restart = encode_restart();
-    if (!net_.sendPacket(restart.data(), restart.size()))
+    if (!net_.send(encode_restart()))
     {
         // The request never went out, so this game over is still unanswered and
         // the next frame is free to try again.
@@ -560,8 +539,7 @@ void GameSession::flush_ack()
     const std::optional<uint32_t> tick = ack_retry_.pending();
     if (!tick.has_value()) return;
 
-    const std::vector<uint8_t> ack = encode_ack_snapshot(*tick);
-    if (net_.sendPacket(ack.data(), ack.size()))
+    if (net_.send(encode_ack_snapshot(*tick)))
     {
         ack_retry_.sent();
         ++stats_.acks_sent;
@@ -656,7 +634,7 @@ void GameSession::update_entities()
 
 void GameSession::shutdown()
 {
-    net_.disconnect();
+    net_.stop();
 }
 
 }  // namespace haven
