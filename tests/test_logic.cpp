@@ -1494,6 +1494,17 @@ void test_projectile_shapes()
     };
     expect(span(axe) > span(sword), "the axe arc spans more than the sword arc");
 
+    // An enemy shot arrives as a circle carrying `weapon_id` 0 — the sword,
+    // whose radius is zero — so it must not collapse to a zero-radius circle
+    // and vanish from the screen.
+    RecordingSink hostile;
+    haven::EntityDrawItem hostile_item = sword_item;
+    hostile_item.style = 0;
+    hostile_item.shape = 1;
+    haven::append_projectile(hostile, hostile_item);
+    expect(hostile.vertices.size() > 0, "a hostile shot emits geometry");
+    expect(span(hostile) > 0.1f, "a hostile shot is drawn with a real radius");
+
     // The bow's arrow is a ray: a quad running from the arrow to the end of its
     // reach, `reach` long and twice its radius wide.
     RecordingSink arrow;

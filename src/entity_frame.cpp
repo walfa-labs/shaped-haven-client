@@ -343,7 +343,12 @@ void append_projectile(PrimitiveSink& sink, const EntityDrawItem& item)
             return;
         }
         case ProjShape::Circle:
-            append_circle(sink, item.pos, weapon.radius, kZProjectile, 10);
+            // An enemy shot carries `weapon_id` 0, which is the sword — a melee
+            // weapon with a radius of zero — so a zero-radius circle would draw
+            // nothing and hostile fire would be invisible. Fall back to the same
+            // floor the unknown-shape path uses.
+            append_circle(sink, item.pos,
+                          weapon.radius > 0.0f ? weapon.radius : kUnknownShapeRadius, kZProjectile, 10);
             return;
         case ProjShape::Ray:
         {
