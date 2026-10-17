@@ -114,10 +114,17 @@ wireframe-rect builder.
 
 The review fixes are covered too: `SnapshotIngest` proves a refused delta
 advances none of the run state and does not disarm the restart boundary,
-`AckRetry` proves a refused acknowledgement send stays owed until one succeeds,
-the 64 bit entity key is shown to survive the whole 32 bit id space, and
+`AckRetry` proves a refused acknowledgement send stays owed until one succeeds
+and that a restart leaves nothing owed for the dead run's tick, the 64 bit
+entity key is shown to survive the whole 32 bit id space, and
 `InterpolationBuffer::push_replacing` is shown to drop the history only when a
-full snapshot's run clock went backwards.
+full snapshot's run clock went backwards. The last review round is covered as
+well: a full snapshot the client did not ask for, at a tick below the one it
+holds, is accepted as an unsolicited new run (a lower-tick delta is still
+refused), because over TCP a snapshot that arrives after the one that set the
+held tick was sent after it, so a tick below the held one cannot be a delayed
+snapshot of the run the client is on — the server's counter only goes backwards
+on a restart.
 
 The pure parts of the run logic live in their own translation units so they can
 be tested without Ogre: `run_events` holds the restart boundary, the level-up
@@ -175,7 +182,7 @@ either server:
 
 Measured on this machine (Release build, 1280x720):
 
-- The logic tests report **1042 checks, 0 failures** (Release and Debug).
+- The logic tests report **1057 checks, 0 failures** (Release and Debug).
 - Against a mock delta server (21 byte welcome, full baseline, then deltas):
   `interest_radius=75`, **27 deltas applied, 0 rejected**, 28 `C2S_ACK_SNAPSHOT`
   sent, entities spawning and leaving the radius, `stale=0 malformed=0
@@ -193,6 +200,18 @@ Measured on this machine (Release build, 1280x720):
   (`restart requested`, new run at `srv_tick=6`, `restarts=1`, `stale=0`
   throughout), so the restart boundary still disarms on the new run's first
   snapshot. The run is playable start to finish.
+- Against the current `phase-4-delta` server (which carries the corrected
+  first-disagreement acknowledgement predicate), a scripted run of 7000 frames
+  (48.8 s) at **143.3 fps** survived to a game over at 159 s, answered it with a
+  scripted restart and came back into a fresh run: `restarts=1`, the server's
+  tick reset to a low value and the client accepted that recovery full snapshot
+  rather than refusing it as stale, with `stale=0` throughout. Level-ups, the
+  level-up pause and game over are all observed. Across two runs the client
+  refused **2 and 5** deltas out of 662 and 653 (under 1%), every refusal the
+  baseline-one-broadcast-stale case the protocol expects, and reported
+  `stale=0 malformed=0 ackretry=0 sendfail=0 qdropped=0` in both — it never
+  wedged. The restart also cleared the old run's still-pending acknowledgement
+  (a refused send), which the unit test proves cannot then be emitted.
 - The retry path and the recovery-full-snapshot path did not come up in these
   runs — on loopback the outgoing queue never fills (`qdropped=0 ackretry=0`)
   and the server's baseline model held, so no recovery full snapshot was needed.

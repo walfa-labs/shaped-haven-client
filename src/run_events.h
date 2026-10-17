@@ -162,6 +162,13 @@ public:
     /// The send succeeded, so nothing is owed any more.
     void sent() { pending_.reset(); }
 
+    /// A new run begins, so the old run's tick names nothing any more. The server
+    /// forgets its whole baseline model on a restart, so an acknowledgement still
+    /// owed for a tick of the dead run could only drag the new run's model onto a
+    /// tick of a run that no longer exists; the new run's first snapshot
+    /// acknowledges itself instead. `GameSession::maybe_restart` runs this.
+    void clear() { pending_.reset(); }
+
 private:
     std::optional<uint32_t> pending_;
 };

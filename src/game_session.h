@@ -116,8 +116,10 @@ private:
     /// `baseline_tick` is the tick the client holds, and false for a delta the
     /// client refuses. A refusal must advance nothing at all (PROTOCOL.md
     /// "Baseline rules"), so the caller computes `baseline_ok` *before* this and
-    /// returns on a false without reconciling or rendering.
-    bool ingest_header(uint32_t server_tick, uint32_t run_time_ms, GameState game_state, bool baseline_ok);
+    /// returns on a false without reconciling or rendering. `is_full` is true only
+    /// for a full snapshot, which is the one header that can carry an
+    /// unsolicited new run; see SnapshotIngest::offer.
+    bool ingest_header(uint32_t server_tick, uint32_t run_time_ms, GameState game_state, bool baseline_ok, bool is_full);
 
     /// Answers a snapshot with C2S_ACK_SNAPSHOT for `tick`, which is what lets
     /// the server pick a baseline to diff against. The tick is remembered until

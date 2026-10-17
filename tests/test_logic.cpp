@@ -680,7 +680,7 @@ void test_snapshot_ingest_refuses_without_advancing()
 
     // A full snapshot always matches what the client holds, so it sets the run
     // state.
-    expect(ingest.offer(600, 10000, haven::GameState::Running, /*baseline_ok=*/true),
+    expect(ingest.offer(600, 10000, haven::GameState::Running, /*baseline_ok=*/true, /*is_full=*/true),
            "a full snapshot is accepted");
     expect(ingest.server_tick() == 600, "the accepted tick is the run tick");
     expect(ingest.run_time_ms() == 10000, "the accepted run clock is the run clock");
@@ -688,7 +688,7 @@ void test_snapshot_ingest_refuses_without_advancing()
 
     // A delta whose baseline is not the tick the client holds is refused, and it
     // must not advance anything.
-    expect(!ingest.offer(660, 20000, haven::GameState::GameOver, /*baseline_ok=*/false),
+    expect(!ingest.offer(660, 20000, haven::GameState::GameOver, /*baseline_ok=*/false, /*is_full=*/false),
            "a refused delta is not accepted");
     expect(ingest.server_tick() == 600, "a refused delta does not move the run tick");
     expect(ingest.run_time_ms() == 10000, "a refused delta does not move the run clock");
@@ -696,7 +696,7 @@ void test_snapshot_ingest_refuses_without_advancing()
     expect(ingest.stale_snapshots() == 0, "and it is not counted as a stale snapshot");
 
     // An applicable delta advances all three.
-    expect(ingest.offer(660, 12000, haven::GameState::LevelUpPause, /*baseline_ok=*/true),
+    expect(ingest.offer(660, 12000, haven::GameState::LevelUpPause, /*baseline_ok=*/true, /*is_full=*/false),
            "an applicable delta is accepted");
     expect(ingest.server_tick() == 660 && ingest.run_time_ms() == 12000 &&
                ingest.game_state() == haven::GameState::LevelUpPause,
@@ -707,14 +707,61 @@ void test_snapshot_ingest_refuses_without_advancing()
     // snapshot may disarm it.
     ingest.begin_run(ingest.run_time_ms());
     expect(ingest.server_tick() == 0 && ingest.run_time_ms() == 0, "begin_run clears the tick and the clock");
-    expect(!ingest.offer(10, 12000, haven::GameState::GameOver, /*baseline_ok=*/false),
+    expect(!ingest.offer(10, 12000, haven::GameState::GameOver, /*baseline_ok=*/false, /*is_full=*/false),
            "a refused delta during a restart is refused");
-    expect(!ingest.offer(11, 13000, haven::GameState::GameOver, /*baseline_ok=*/true),
+    expect(!ingest.offer(11, 13000, haven::GameState::GameOver, /*baseline_ok=*/true, /*is_full=*/true),
            "the boundary is still armed, so the dead run's tail is refused");
     expect(ingest.stale_snapshots() == 1, "and the boundary rejection is counted as stale");
-    expect(ingest.offer(12, 0, haven::GameState::Running, /*baseline_ok=*/true),
+    expect(ingest.offer(12, 0, haven::GameState::Running, /*baseline_ok=*/true, /*is_full=*/true),
            "the new run's first snapshot is accepted and disarms the boundary");
     expect(ingest.game_state() == haven::GameState::Running, "and its game state is the run's");
+}
+
+/// A full snapshot the client did not ask for, at a tick below the one it
+/// holds, is the server having restarted its run on its own. The client must
+/// accept it as a new run rather than wedge on the ordering check. Over TCP
+/// such a snapshot cannot be a delayed leftover of the run the client is on —
+/// the byte stream is in send order, so anything that arrived after the snapshot
+/// that set the held tick was sent after it, and a tick below it can only mean
+/// the server's counter went backwards, i.e. a restart. A delta at a lower tick
+/// is still refused: only a full snapshot restarts a run.
+void test_snapshot_ingest_unsolicited_restart()
+{
+    std::printf("snapshot ingest accepts an unsolicited restart\n");
+    haven::SnapshotIngest ingest;
+
+    // The client is mid-run and holds tick 5000 of the dead run, whose clock has
+    // frozen at 1650 ms. The dead run's tail keeps arriving in order.
+    expect(ingest.offer(5000, 1650, haven::GameState::GameOver, /*baseline_ok=*/true, /*is_full=*/true),
+           "the dead run's last snapshot is accepted");
+    expect(ingest.offer(5001, 1650, haven::GameState::GameOver, /*baseline_ok=*/true, /*is_full=*/true),
+           "the dead run's in-flight tail is accepted in order");
+    expect(ingest.server_tick() == 5001, "the client holds the dead run's newest tick");
+
+    // The server restarts without the client asking; its first broadcast is a
+    // full snapshot at a tick below the one the client holds. Over TCP this
+    // cannot be a delayed snapshot of the run the client is on — the byte
+    // stream is in send order, so anything that arrived after the snapshot that
+    // set the held tick was sent after it, and a tick below it can only mean
+    // the server's counter went backwards, i.e. a restart. It is a new run.
+    expect(ingest.offer(3, 50, haven::GameState::Running, /*baseline_ok=*/true, /*is_full=*/true),
+           "the new run's full snapshot is accepted as a new run");
+    expect(ingest.server_tick() == 3 && ingest.run_time_ms() == 50 &&
+               ingest.game_state() == haven::GameState::Running,
+           "the run state moves onto the new run");
+
+    // The new run continues normally.
+    expect(ingest.offer(4, 100, haven::GameState::Running, /*baseline_ok=*/true, /*is_full=*/true),
+           "the new run's next snapshot is accepted");
+    expect(ingest.server_tick() == 4, "and advances the new run's tick");
+
+    // A delta is never a new-run signal: one at a tick below the held one is
+    // still refused, and it resets nothing.
+    expect(!ingest.offer(2, 150, haven::GameState::Running, /*baseline_ok=*/true, /*is_full=*/false),
+           "a lower-tick delta is refused");
+    expect(ingest.server_tick() == 4 && ingest.run_time_ms() == 100,
+           "and it leaves the run state untouched");
+    expect(ingest.stale_snapshots() == 1, "the refused delta is counted stale");
 }
 
 /// A refused acknowledgement send must not be forgotten: the tick stays owed
@@ -741,6 +788,26 @@ void test_ack_retry()
     ack.sent();
     expect(!ack.owes(), "a successful send clears the debt");
     expect(!ack.pending().has_value(), "and there is nothing left to send");
+}
+
+/// A new run begins with nothing owed for the dead run's tick. The restart path
+/// runs `AckRetry::clear()`, so a tick whose send the bounded queue refused in
+/// the old run cannot be emitted in the new one: the server forgets its baseline
+/// model on a restart, and an old-run acknowledgement could only drag the new
+/// run's model onto a tick of a run that no longer exists.
+void test_ack_retry_cleared_on_restart()
+{
+    std::printf("ack retry cleared on restart\n");
+    haven::AckRetry ack;
+    // The old run's last snapshot arrived and its acknowledgement was refused,
+    // so the tick stayed owed and a later frame would retry it.
+    ack.request(100);
+    expect(ack.owes() && *ack.pending() == 100, "the old run's tick is still owed");
+
+    // The run restarts, which clears the debt; nothing is emitted for it.
+    ack.clear();
+    expect(!ack.owes(), "a restart leaves nothing owed");
+    expect(!ack.pending().has_value(), "so flush_ack() would emit no old-run ack");
 }
 
 /// A full snapshot is the server's recovery path, and it is the one place the
@@ -2476,7 +2543,9 @@ int main()
     test_snapshot_state_baseline();
     test_snapshot_state_baseline_match();
     test_snapshot_ingest_refuses_without_advancing();
+    test_snapshot_ingest_unsolicited_restart();
     test_ack_retry();
+    test_ack_retry_cleared_on_restart();
     test_full_snapshot_recovery_and_clock_reset();
     test_sequence_numbers();
     test_input_history();

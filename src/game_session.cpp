@@ -397,6 +397,11 @@ void GameSession::maybe_restart()
     renderer_.clear_remote_players();
     hud_.reset();
     evolution_watch_.reset();
+    // An acknowledgement still owed names a tick of the dead run, which the
+    // server forgets on a restart; sending it there could drag the new run's
+    // baseline onto a dead-run tick, so the debt is dropped with the run. The
+    // new run's first snapshot acknowledges itself.
+    ack_retry_.clear();
     // The server renumbers its offers from 1 with the run, so the gate starts
     // over too; otherwise the new run's first offer would look like an old one.
     levelup_gate_.reset();
@@ -449,7 +454,8 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
     // new baseline the next delta is diffed against. A full snapshot always
     // matches whatever the client holds, so the header is never refused for a
     // baseline reason.
-    if (!ingest_header(snapshot.server_tick, snapshot.run_time_ms, snapshot.game_state, /*baseline_ok=*/true))
+    if (!ingest_header(snapshot.server_tick, snapshot.run_time_ms, snapshot.game_state, /*baseline_ok=*/true,
+                       /*is_full=*/true))
         return;
 
     send_ack(snapshot_state_.apply_full(snapshot));
@@ -484,7 +490,9 @@ void GameSession::handle_delta(const uint8_t* payload, size_t len)
         return;
     }
 
-    if (!ingest_header(delta.server_tick, delta.run_time_ms, delta.game_state, /*baseline_ok=*/true)) return;
+    if (!ingest_header(delta.server_tick, delta.run_time_ms, delta.game_state, /*baseline_ok=*/true,
+                       /*is_full=*/false))
+        return;
 
     // The baseline matched, so the apply cannot fail; the tick it returns is
     // the one to acknowledge.
@@ -502,13 +510,14 @@ void GameSession::handle_delta(const uint8_t* payload, size_t len)
     push_render(/*replacing=*/false);
 }
 
-bool GameSession::ingest_header(uint32_t server_tick, uint32_t run_time_ms, GameState game_state, bool baseline_ok)
+bool GameSession::ingest_header(uint32_t server_tick, uint32_t run_time_ms, GameState game_state, bool baseline_ok,
+                               bool is_full)
 {
     // The run state and the restart boundary both live in the ingest, and its
     // offer() is the one place a snapshot header can move either. A refused
     // delta (`baseline_ok` false) returns without touching them; see
     // snapshot_ingest.h for why the ordering matters.
-    return ingest_.offer(server_tick, run_time_ms, game_state, baseline_ok);
+    return ingest_.offer(server_tick, run_time_ms, game_state, baseline_ok, is_full);
 }
 
 void GameSession::send_ack(uint32_t tick)
