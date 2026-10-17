@@ -1,6 +1,6 @@
 #include "character_select.h"
 #include "game_session.h"
-#include "input_state.h"
+#include "input/InputManager.h"
 #include "net/ITransport.h"
 #include "net/SubprocessTransport.h"
 #include "net/TcpTransport.h"
@@ -188,7 +188,7 @@ int main(int argc, char** argv)
         return 1;
     }
 
-    haven::InputState input;
+    haven::InputManager input;
     renderer.attach_input(&input);
     if (!scripted_moves.empty())
     {
@@ -259,16 +259,23 @@ int main(int argc, char** argv)
 
     renderer.run([&](float dt) {
         hud.tick(dt);
+        input.update(dt);
         input.advance_key_script();
+
+        // A gamepad appearing or vanishing mid-session is worth one line each.
+        if (input.controller_just_added())
+            std::printf("haven: gamepad connected: %s\n", input.controller_name());
+        if (input.controller_just_removed())
+            std::printf("haven: gamepad disconnected\n");
 
         switch (state)
         {
         case AppState::MainMenu:
         case AppState::ConnectionFailed:
         {
-            const bool up = input.held(haven::InputState::kKeyUp);
-            const bool down = input.held(haven::InputState::kKeyDown);
-            const bool enter = input.held(haven::InputState::kKeyEnter);
+            const bool up = input.ui_up();
+            const bool down = input.ui_down();
+            const bool enter = input.ui_confirm();
             if (up && !prev_up)
             {
                 menu_selection = (menu_selection + 1) % 2;
@@ -307,12 +314,13 @@ int main(int argc, char** argv)
 
         case AppState::CharacterSelect:
         {
-            const bool up = input.held(haven::InputState::kKeyUp);
-            const bool down = input.held(haven::InputState::kKeyDown);
-            const bool left = input.held(haven::InputState::kKeyLeft);
-            const bool right = input.held(haven::InputState::kKeyRight);
-            const bool enter = input.held(haven::InputState::kKeyEnter);
-            const bool escape = input.held(haven::InputState::kKeyEscape);
+            const bool up = input.ui_up();
+            const bool down = input.ui_down();
+            const bool left = input.ui_left();
+            const bool right = input.ui_right();
+            const bool enter = input.ui_confirm();
+            const bool escape = input.ui_cancel();
+            // Typing is keyboard only; the D-pad cannot spell a name.
             const bool backspace = input.held(haven::InputState::kKeyBackspace);
 
             if (up && !prev_up) character_select.move_field(-1);
@@ -476,6 +484,7 @@ int main(int argc, char** argv)
 
     if (session) session->shutdown();
     hud.shutdown();
+    renderer.shutdown();
     renderer.closeApp();
 
     const double seconds = std::chrono::duration<double>(std::chrono::steady_clock::now() - started).count();

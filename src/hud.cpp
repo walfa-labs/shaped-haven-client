@@ -2,6 +2,7 @@
 
 #include "character_catalog.h"
 #include "hud_model.h"
+#include "levelup_format.h"
 #include "hud_text.h"
 #include "mesh_factory.h"
 
@@ -15,6 +16,7 @@
 #include <OgreTechnique.h>
 
 #include <array>
+#include <cstdint>
 #include <cstdio>
 #include <map>
 #include <string>
@@ -178,6 +180,8 @@ Hud::~Hud()
     destroy_layer(modal_title_);
     for (TextLayer*& layer : modal_cards_)
         destroy_layer(layer);
+    for (TextLayer*& layer : modal_stats_)
+        destroy_layer(layer);
     destroy_layer(modal_footer_);
     destroy_layer(score_title_);
     destroy_layer(score_lines_);
@@ -206,8 +210,21 @@ Ogre::MaterialPtr Hud::material_for(Rgba colour)
     const auto it = material_cache_.find(key);
     if (it != material_cache_.end()) return it->second;
 
-    char name[32];
-    std::snprintf(name, sizeof(name), "haven/hud_colour_%zu", material_cache_.size());
+    // The name is the colour, not a sequence number: two screens that reach
+    // the same colour in a different order would otherwise swap names, and
+    // the shader system keys what it generates on the material name.
+    uint64_t hash = 1469598103934665603ull;
+    for (const float channel : key)
+    {
+        const unsigned char* bytes = reinterpret_cast<const unsigned char*>(&channel);
+        for (size_t i = 0; i < sizeof(float); ++i)
+        {
+            hash ^= bytes[i];
+            hash *= 1099511628211ull;
+        }
+    }
+    char name[48];
+    std::snprintf(name, sizeof(name), "haven/hud_colour_%016llx", static_cast<unsigned long long>(hash));
     Ogre::MaterialPtr material = Ogre::MaterialManager::getSingleton().create(name, kResourceGroup);
     Ogre::Pass* pass = material->getTechnique(0)->getPass(0);
     pass->setAmbient(Ogre::ColourValue(colour.r, colour.g, colour.b, colour.a));
@@ -319,6 +336,8 @@ void Hud::hide_offer()
     clear_batch(modal_);
     destroy_layer(modal_title_);
     for (TextLayer*& layer : modal_cards_)
+        destroy_layer(layer);
+    for (TextLayer*& layer : modal_stats_)
         destroy_layer(layer);
     destroy_layer(modal_footer_);
     offer_visible_ = false;
@@ -912,6 +931,28 @@ void Hud::layout_offer(const LevelUpOffer& offer)
             line.colour = accent;
             card->lines.push_back(line);
             y -= 8.0f * line.pixel;
+        }
+
+        // What the pick actually changes, as a comparison against what the
+        // player has now: the card's reason to exist. Its own layer so the
+        // card's text object keeps the section count every offer shares.
+        const std::string stat = format_stat_delta(option.stat_type, option.current_stat_fp,
+                                                       option.upgraded_stat_fp);
+        float stat_pixel = 0.0f;
+        if (!stat.empty())
+        {
+            stat_pixel = fit_text_pixel(stat, kCardWidth - 3.0f, 0.0f, 0.24f);
+            TextLayer* stats = ensure_layer(modal_stats_[i]);
+            stats->lines.clear();
+            TextLine stat_line;
+            stat_line.text = stat;
+            stat_line.pixel = stat_pixel;
+            stat_line.x = kCardX[i] - static_cast<float>(text_pixel_width(stat)) * stat_line.pixel * 0.5f;
+            stat_line.y = y;
+            stat_line.colour = kWhite;
+            stats->lines.push_back(stat_line);
+            rebuild_layer(*stats);
+            y -= 8.0f * stat_pixel + 0.4f;
         }
 
         TextLine detail;

@@ -3,7 +3,7 @@
 #include "game_math.h"
 #include "hud.h"
 #include "hud_model.h"
-#include "input_state.h"
+#include "input/InputManager.h"
 #include "interpolation.h"
 #include "net/ITransport.h"
 #include "prediction.h"
@@ -90,7 +90,11 @@ struct SessionStats {
 /// interpolate the remote players and hand the result to the renderer.
 class GameSession {
 public:
-    GameSession(HavenRenderer& renderer, ITransport& net, InputState& input, Hud& hud);
+    /// `input` is the unified keyboard/gamepad manager; the movement the
+    /// predictor integrates and the restart the scoreboard offers both come
+    /// from it, while the choice scripts and the scripted keyboard stay on
+    /// the wrapped InputState (`input.keyboard()`).
+    GameSession(HavenRenderer& renderer, ITransport& net, InputManager& input, Hud& hud);
 
     /// Connects and sends C2S_HELLO, which carries the name and the two ids the
     /// character select produced: `race_id` picks the server's stat row and
@@ -175,7 +179,7 @@ private:
 
     HavenRenderer& renderer_;
     ITransport& net_;
-    InputState& input_;
+    InputManager& input_;
     Hud& hud_;
     ClientPredictor predictor_;
     InterpolationBuffer interpolation_;

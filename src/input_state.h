@@ -90,6 +90,11 @@ public:
     bool restart_requested() const { return restart_; }
     void consume_restart() { restart_ = false; }
 
+    /// Raises the restart request without a keyboard event: the gamepad's
+    /// Start button sets this from InputManager::update(), so the pad and the
+    /// keyboard feed the same one-shot path the restart gate guards.
+    void request_restart() { restart_ = true; }
+
     /// The choice script: one line per run event, in chronological order — a
     /// choice index 0..2 for each level-up offer, the literal `restart` for
     /// each game over. Each line names the event it answers, so it is consumed

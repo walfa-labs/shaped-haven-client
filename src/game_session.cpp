@@ -28,15 +28,14 @@ const PlayerNet* find_self_in(const std::vector<PlayerNet>& players, uint8_t pla
 
 }  // namespace
 
-GameSession::GameSession(HavenRenderer& renderer, ITransport& net, InputState& input, Hud& hud)
+GameSession::GameSession(HavenRenderer& renderer, ITransport& net, InputManager& input, Hud& hud)
     : renderer_(renderer), net_(net), input_(input), hud_(hud)
 {
     // Stable per-process token; phase 1 never reconnects with it.
     session_token_ = 0x53484156454E31ULL;
 }
 
-bool GameSession::connect(const std::string& host, uint16_t port, const std::string& name, uint8_t race_id,
-                          uint8_t starting_weapon_id, std::string* outError)
+bool GameSession::connect(const std::string& host, uint16_t port, const std::string& name, std::string* outError)
 {
     std::string error;
     if (!net_.connect(host, port, error))
@@ -46,7 +45,7 @@ bool GameSession::connect(const std::string& host, uint16_t port, const std::str
         return false;
     }
 
-    const std::vector<uint8_t> hello = encode_hello(race_id, starting_weapon_id, name);
+    const std::vector<uint8_t> hello = encode_hello(0, 0, name);
     if (!net_.sendPacket(hello.data(), hello.size()))
     {
         std::fprintf(stderr, "haven: could not send C2S_HELLO\n");
@@ -55,8 +54,6 @@ bool GameSession::connect(const std::string& host, uint16_t port, const std::str
         return false;
     }
     std::printf("haven: connected to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
-    std::printf("haven: C2S_HELLO name=%s race=%u weapon=%u\n", name.c_str(),
-                static_cast<unsigned>(race_id), static_cast<unsigned>(starting_weapon_id));
     return true;
 }
 
@@ -400,7 +397,10 @@ void GameSession::report_script_mismatch(const char* event, const char* marker)
 void GameSession::maybe_restart()
 {
     bool script_mismatch = false;
-    const bool queued = restart_gate_.take(input_, script_mismatch);
+    // The gate reads the keyboard side of the manager: the R key and the
+    // choice script are InputState's, and the gamepad's Start button reaches
+    // it as a request on the same wrapped state (InputManager::update).
+    const bool queued = restart_gate_.take(input_.keyboard(), script_mismatch);
     if (script_mismatch) report_script_mismatch("the game over", "choice");
     if (!queued) return;
 

@@ -21,15 +21,18 @@ set(HAVEN_SOURCES
   src/hud.cpp
   src/hud_model.cpp
   src/hud_text.cpp
+  src/input/InputManager.cpp
   src/input_state.cpp
   src/interpolation.cpp
   src/item_catalog.cpp
+  src/levelup_format.cpp
   src/mesh_factory.cpp
   src/net/TcpTransport.cpp
   src/net/SubprocessTransport.cpp
   src/net_client.cpp
   src/prediction.cpp
   src/protocol.cpp
+  src/render/TelegraphRenderer.cpp
   src/renderer.cpp
   src/run_events.cpp
   src/snapshot_ingest.cpp
@@ -68,9 +71,11 @@ add_executable(shaped-haven-client-tests tests/test_logic.cpp
   src/entity_frame.cpp
   src/hud_model.cpp
   src/hud_text.cpp
+  src/input/InputManager.cpp
   src/input_state.cpp
   src/interpolation.cpp
   src/item_catalog.cpp
+  src/levelup_format.cpp
   src/prediction.cpp
   src/protocol.cpp
   src/run_events.cpp

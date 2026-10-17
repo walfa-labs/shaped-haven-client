@@ -2,8 +2,9 @@
 
 #include "game_math.h"
 #include "entity_frame.h"
-#include "input_state.h"
+#include "input/InputManager.h"
 #include "mesh_factory.h"
+#include "render/TelegraphRenderer.h"
 
 #include <vector>
 
@@ -45,8 +46,10 @@ public:
     /// invoked once per rendered frame with the frame delta in seconds.
     void run(const std::function<void(float)>& tick);
 
-    /// Registers the keyboard state that produces movement input.
-    void attach_input(InputState* input);
+    /// Registers the input manager the window's keyboard events feed. The
+    /// renderer stays the OgreBites input listener and forwards each key event
+    /// into the manager, which merges it with the gamepad.
+    void attach_input(InputManager* input);
 
     bool keyPressed(const OgreBites::KeyboardEvent& evt) override;
     bool keyReleased(const OgreBites::KeyboardEvent& evt) override;
@@ -78,6 +81,10 @@ public:
     /// call each instead of one entity each. `run_time_ms` is the newest
     /// snapshot's run clock, which drives the boss dash warning box.
     void render_entities(const std::vector<EntityDrawItem>& items, uint32_t run_time_ms);
+
+    /// Destroys the telegraph shapes' scene objects while Ogre is still
+    /// alive. Must be called before closeApp().
+    void shutdown();
 
 private:
     /// One colour slot's worth of geometry inside its pool's Manual Object.
@@ -122,7 +129,8 @@ private:
     Ogre::SceneNode* local_player_node_ = nullptr;
     Ogre::ManualObject* grid_ = nullptr;
     std::unique_ptr<MeshFactory> meshes_;
-    InputState* input_ = nullptr;
+    std::unique_ptr<TelegraphRenderer> telegraphs_;
+    InputManager* input_ = nullptr;
 
     /// One Manual Object per draw layer, each holding one section per colour
     /// slot actually in use. See render_entities().

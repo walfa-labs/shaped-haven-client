@@ -284,6 +284,22 @@ struct UpgradeOptionNet {
     int16_t upgraded_stat_fp = 0;
 };
 
+/// `UpgradeOptionNet.stat_type` values, in the server's wire order. The two
+/// fixed-point fields are the stat's value times 100 (500 reads as 5.0); the
+/// HUD formats them as the level-up card's comparison string.
+enum class StatType : uint8_t {
+    Damage = 0,
+    Armor = 1,
+    MaxHP = 2,
+    MoveSpeed = 3,
+    Cooldown = 4,
+    Area = 5,
+    Projectiles = 6,
+    CritChance = 7,
+    MaxMana = 8,
+    MaxShield = 9,
+};
+
 struct LevelUpOffer {
     uint8_t player_id = 0;
     uint16_t event_id = 0;
