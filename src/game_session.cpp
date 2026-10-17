@@ -44,7 +44,7 @@ bool GameSession::connect(const std::string& host, uint16_t port, const std::str
         if (net_.connect(host, port))
         {
             net_.start();
-            if (!net_.send(encode_hello(0, 0, name)))
+            if (!net_.send(encode_hello(session_token_, 0, 0, name)))
                 std::fprintf(stderr, "haven: could not queue C2S_HELLO\n");
             std::printf("haven: connected to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
             return true;
