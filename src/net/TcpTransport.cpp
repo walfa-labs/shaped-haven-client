@@ -43,12 +43,7 @@ bool TcpTransport::connect(const std::string& host, uint16_t port, std::string& 
     // Non-blocking so the timeout below is ours to keep rather than the
     // operating system's, which is far longer.
     u_long non_blocking = 1;
-    if (::ioctlsocket(sock, FIONBIO, &non_blocking) != 0)
-    {
-        outError = "ioctlsocket() failed: " + std::to_string(::WSAGetLastError());
-        ::closesocket(sock);
-        return false;
-    }
+    ::ioctlsocket(sock, FIONBIO, &non_blocking);
 
     const int rc = ::connect(sock, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
     if (rc == SOCKET_ERROR && ::WSAGetLastError() != WSAEWOULDBLOCK)
@@ -106,10 +101,7 @@ bool TcpTransport::connect(const std::string& host, uint16_t port, std::string& 
 
     // Loopback traffic is tiny and latency sensitive; Nagle only adds delay.
     BOOL no_delay = TRUE;
-    if (::setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&no_delay), sizeof(no_delay)) != 0)
-    {
-        std::fprintf(stderr, "haven: TCP_NODELAY failed (non-fatal): %d\n", ::WSAGetLastError());
-    }
+    ::setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, reinterpret_cast<const char*>(&no_delay), sizeof(no_delay));
 
     net_.adopt(sock);
     return true;
