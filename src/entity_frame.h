@@ -67,6 +67,22 @@ struct EntityDrawItem {
     uint8_t hp_pct = 0;  // enemies only; 0..100, 100 being full health
     uint8_t shape = 0;   // projectiles only; ProjNet shape byte
     uint8_t elite_mask = 0;  // enemies only; one bit per elite modifier
+
+    // Player fields (protocol v2)
+    uint8_t race_id = 0;
+    uint8_t shield_pct = 0;
+    uint8_t mana_pct = 0;
+    uint16_t dash_cd_remaining = 0;
+    uint16_t dash_cd_total = 0;
+    uint8_t is_dashing = 0;
+    uint16_t max_hp = 0;
+    uint16_t max_shield = 0;
+
+    // Enemy telegraph fields (protocol v2)
+    uint8_t telegraph_progress = 0;
+    uint8_t telegraph_shape = 0;
+    uint16_t telegraph_angle = 0;
+    uint16_t telegraph_radius = 0;
 };
 
 /// Immediate-mode triangle sink. `vertex()` starts a new vertex and `index()`

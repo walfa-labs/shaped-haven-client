@@ -16,6 +16,14 @@ void upsert_player(std::unordered_map<EntityKey, EntityDrawItem>& held, const Pl
     item.pos = p.pos;
     item.angle = p.vel_angle;
     item.hp_pct = p.hp_pct;
+    item.race_id = p.race_id;
+    item.shield_pct = p.shield_pct;
+    item.mana_pct = p.mana_pct;
+    item.dash_cd_remaining = p.dash_cd_remaining;
+    item.dash_cd_total = p.dash_cd_total;
+    item.is_dashing = p.is_dashing;
+    item.max_hp = p.max_hp;
+    item.max_shield = p.max_shield;
     held[item.key] = item;
 }
 
@@ -29,6 +37,10 @@ void upsert_enemy(std::unordered_map<EntityKey, EntityDrawItem>& held, const Ene
     item.style = e.archetype;
     item.hp_pct = e.hp_pct;
     item.elite_mask = e.elite_mask;
+    item.telegraph_progress = e.telegraph_progress;
+    item.telegraph_shape = e.telegraph_shape;
+    item.telegraph_angle = e.telegraph_angle;
+    item.telegraph_radius = e.telegraph_radius;
     held[item.key] = item;
 }
 
@@ -128,6 +140,18 @@ RenderSnapshot SnapshotState::build_render(uint32_t run_time_ms) const
         style.shape = item.shape;
         style.angle = item.angle;
         style.elite_mask = item.elite_mask;
+        style.race_id = item.race_id;
+        style.shield_pct = item.shield_pct;
+        style.mana_pct = item.mana_pct;
+        style.dash_cd_remaining = item.dash_cd_remaining;
+        style.dash_cd_total = item.dash_cd_total;
+        style.is_dashing = item.is_dashing;
+        style.max_hp = item.max_hp;
+        style.max_shield = item.max_shield;
+        style.telegraph_progress = item.telegraph_progress;
+        style.telegraph_shape = item.telegraph_shape;
+        style.telegraph_angle = item.telegraph_angle;
+        style.telegraph_radius = item.telegraph_radius;
         render.styles.emplace(item.key, style);
     }
     return render;

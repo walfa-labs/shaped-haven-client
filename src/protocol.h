@@ -9,7 +9,7 @@
 #include <string>
 #include <vector>
 
-// Wire protocol v1, DESIGN.md section 5.
+// Wire protocol v2, per scratch/protocol-v2-spec.md.
 //
 // Every packet starts with a 7 byte header: msg_type u8, payload_len u16,
 // seq u32. Framing is little-endian, TCP_NODELAY is enabled by the client.
@@ -38,7 +38,7 @@ enum class MsgType : uint8_t {
     S2C_LOADOUT = 0x86,
 };
 
-constexpr uint8_t kProtocolVersion = 1;
+constexpr uint8_t kProtocolVersion = 2;
 constexpr size_t kHeaderSize = 7;
 constexpr size_t kMaxNameLength = 16;
 constexpr size_t kMaxPlayers = 4;
@@ -47,8 +47,8 @@ constexpr size_t kMaxPlayers = 4;
 /// trailing array. The decoder uses these to size-check the counts before it
 /// trusts them enough to allocate.
 constexpr size_t kSnapshotHeaderSize = 37;  // 3 x u32 + 4 x u32 + u8 + 4 x u16
-constexpr size_t kPlayerRecordSize = 8;
-constexpr size_t kEnemyRecordSize = 12;
+constexpr size_t kPlayerRecordSize = 20;
+constexpr size_t kEnemyRecordSize = 18;
 constexpr size_t kProjRecordSize = 12;
 constexpr size_t kGemRecordSize = 12;
 
@@ -108,8 +108,8 @@ private:
 
 std::vector<uint8_t> encode_packet(uint8_t msg_type, uint32_t seq, const std::vector<uint8_t>& payload);
 
-std::vector<uint8_t> encode_hello(uint64_t session_token, uint8_t requested_slot, const std::string& name);
-std::vector<uint8_t> encode_input(uint32_t input_seq, uint32_t client_tick, Vec2 move, uint16_t aim_angle, uint8_t buttons);
+std::vector<uint8_t> encode_hello(uint8_t race_id, uint8_t starting_weapon_id, const std::string& name);
+std::vector<uint8_t> encode_input(uint32_t input_seq, uint32_t client_tick, uint8_t buttons, int8_t axis_x, int8_t axis_y);
 
 /// C2S_LEVELUP_CHOICE (0x03): event_id u16, choice_idx u8 — 3 byte payload.
 std::vector<uint8_t> encode_levelup_choice(uint16_t event_id, uint8_t choice_idx);
@@ -151,9 +151,17 @@ bool decode_welcome(const uint8_t* payload, size_t len, Welcome& out);
 struct PlayerNet {
     uint8_t id = 0;
     uint8_t state_flags = 0;
+    uint8_t race_id = 0;
     Vec2 pos;
     float vel_angle = 0.0f;
     uint8_t hp_pct = 0;
+    uint8_t shield_pct = 0;
+    uint8_t mana_pct = 0;
+    uint16_t dash_cd_remaining = 0;
+    uint16_t dash_cd_total = 0;
+    uint8_t is_dashing = 0;
+    uint16_t max_hp = 0;
+    uint16_t max_shield = 0;
 };
 
 struct EnemyNet {
@@ -163,6 +171,10 @@ struct EnemyNet {
     Vec2 pos;
     float vel_angle = 0.0f;
     uint8_t hp_pct = 0;
+    uint8_t telegraph_progress = 0;
+    uint8_t telegraph_shape = 0;
+    int16_t telegraph_angle = 0;
+    uint16_t telegraph_radius = 0;
 };
 
 struct ProjNet {
@@ -259,14 +271,17 @@ bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out)
 /// disagrees with the `id` that heads it, is rejected.
 bool decode_snapshot_delta(const uint8_t* payload, size_t len, SnapshotDelta& out);
 
-/// S2C_LEVELUP_OFFER (0x84) — 14 byte payload: player_id u8, event_id u16,
-/// new_level u16, then three UpgradeOptionNet. The run pauses until the client
-/// answers with C2S_LEVELUP_CHOICE carrying the same event_id, or the server's
-/// 15 s timeout auto-selects option 0.
+/// S2C_LEVELUP_OFFER (0x84) — 29 byte payload: player_id u8, event_id u16,
+/// new_level u16, then three 8-byte UpgradeOptionNet. The run pauses until the
+/// client answers with C2S_LEVELUP_CHOICE carrying the same event_id, or the
+/// server's 15 s timeout auto-selects option 0.
 struct UpgradeOptionNet {
     uint8_t item_id = 0;
     uint8_t next_level = 0;
     uint8_t is_evo = 0;
+    uint8_t stat_type = 0;
+    int16_t current_stat_fp = 0;
+    int16_t upgraded_stat_fp = 0;
 };
 
 struct LevelUpOffer {
