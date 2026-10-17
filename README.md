@@ -5,8 +5,9 @@ game.
 
 The client is a thin **view + input** layer. It does not simulate the game: it
 sends input to the headless server and renders the state snapshots it receives.
-Everything is drawn from geometric primitives (square player, circle/triangle
-enemies) — there are no art assets.
+Visuals are procedural and cel-shaded — a toon outline and a stepped shading
+gradient per race — with anthropomorphic race meshes generated in code rather
+than loaded as art assets.
 
 Companion repository: `shaped-haven-server` (Zig simulation core).
 
@@ -37,6 +38,42 @@ Companion repository: `shaped-haven-server` (Zig simulation core).
 The full design — protocol message list, snapshot contents, interpolation rules,
 phase plan — is in [DESIGN.md](DESIGN.md).
 
+## Features
+
+- **Main menu.** Single Player spawns a local server process (`--server-path`)
+  and connects to it; Multiplayer connects to a host and port given at the
+  prompt. Up/Down select, Enter confirms, Escape cancels.
+- **Character select.** A name field (16 characters, seeded by `--name`), one of
+  ten anthropomorphic races and one of four starting weapons. Up/Down move
+  between the four fields, Left/Right cycle the race or the weapon, printable
+  keys edit the name, Enter confirms or starts, Escape returns to the menu. The
+  race and weapon are sent in `C2S_HELLO` as `race_id` and
+  `starting_weapon_id`.
+- **Races.** Ten races with distinct health, shield, mana, move-speed and
+  damage multipliers, dash behaviour and lore. The client's
+  `src/character_catalog.h` mirrors the server's `src/races.zig`.
+- **Controller support.** A unified input layer reads the keyboard and an SDL2
+  gamepad through the same state: the left stick moves, a shoulder/B button
+  dashes, the D-pad navigates menus, A confirms, B cancels and Start restarts.
+  With no controller attached the gamepad is inert and a keyboard-only run is
+  byte-identical.
+- **Dash.** Shift (or the gamepad dash button) spends mana for a burst of
+  movement with invulnerability frames, on a per-race cooldown. The mana bar
+  flashes when a dash is attempted without the mana to pay for it.
+- **Telegraphs.** An enemy's windup is drawn before the attack lands, from
+  `EnemyNet`'s telegraph fields, so a dash, a lunge or a boss charge is visible
+  and dodgeable.
+- **Descriptive level-ups.** Each upgrade card shows what it changes —
+  "12 ATK → 15 ATK (+25%)" — from the option's `stat_type` and fixed-point
+  pair, rather than only an item name and level.
+- **Persona-styled HUD.** Health, shield and mana drawn as sheared
+  parallelograms with a black outer border and a white inner one; the health
+  bar carries a white ghost bar, the shield bar a chevron divider and the mana
+  bar a gradient that flashes on a failed dash.
+- **Cel-shaded anime visuals.** Each race is drawn as an anthropomorphic mesh
+  with a toon outline and stepped shading, replacing the phase-1 geometric
+  primitives.
+
 ## Requirements
 
 - **Ogre3D 14.6.1** SDK. On this machine: `D:\src\ogre3d` (override with
@@ -54,10 +91,14 @@ cmake --build build --config Release
 PATH=D:\src\ogre3d\bin:%PATH% ./build/bin/Release/shaped-haven-client.exe
 ```
 
-The client connects to `127.0.0.1:7777` on startup and retries for about 2.5 s,
-so the server can still be starting up. Escape closes the window.
+The client opens on the **main menu**: Single Player or Multiplayer, chosen with
+Up/Down and confirmed with Enter. Single Player spawns a local server process
+(`--server-path`, defaulting to the sibling `shaped-haven-server`) and connects
+to it; Multiplayer connects to the host and port given at the prompt. A failed
+connection returns to the menu with the transport's own reason shown, rather
+than exiting. Escape closes the window.
 
-From the main menu, Enter opens the **character select**: a name field (seeded
+Enter from the main menu opens the **character select**: a name field (seeded
 by `--name`, 16 characters, the wire's `C2S_HELLO` field), the ten races with
 their base stats, the four starting weapons, and START. Up/Down move between
 the four fields, Left/Right cycle the race or the weapon, printable keys edit
@@ -289,3 +330,12 @@ Measured on this machine (Release build, 1280x720):
 An evolution was not reached in these runs: the scripted picks are the ones the
 offer happened to list first, and reaching a level-8 weapon needs both a longer
 run and the matching pick.
+
+Phase 7 — the art-style overhaul. On top of the phase-4 protocol the client
+already speaks, the game gained the main menu, character select, ten races,
+gamepad support, dash, enemy telegraphs, descriptive level-up cards, the
+Persona-styled HUD and the cel-shaded race meshes; see Features above for the
+list. It speaks protocol v2 end to end: `C2S_HELLO` carries `race_id` and
+`starting_weapon_id`, `PlayerNet` the mana, shield and dash state, `EnemyNet`
+the telegraph fields, and `S2C_LEVELUP_OFFER` the per-option stat deltas. The
+logic tests report **1304 checks, 0 failures**.
