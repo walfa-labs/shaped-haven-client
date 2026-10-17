@@ -57,16 +57,28 @@ PATH=D:\src\ogre3d\bin:%PATH% ./build/bin/Release/shaped-haven-client.exe
 The client connects to `127.0.0.1:7777` on startup and retries for about 2.5 s,
 so the server can still be starting up. Escape closes the window.
 
+From the main menu, Enter opens the **character select**: a name field (seeded
+by `--name`, 16 characters, the wire's `C2S_HELLO` field), the ten races with
+their base stats, the four starting weapons, and START. Up/Down move between
+the four fields, Left/Right cycle the race or the weapon, printable keys edit
+the name and backspace deletes, Enter confirms the name or starts the run, and
+Escape goes back to the menu. The two ids it produces are the `race_id` and
+`starting_weapon_id` the server's `C2S_HELLO` reads, and the table in
+`src/character_catalog.h` mirrors the server's `src/races.zig`.
+
 ### Command line
 
 | Flag | Meaning |
 | --- | --- |
 | `--host <ip>` / `--port <n>` | Server address (default `127.0.0.1:7777`). |
-| `--name <name>` | Player name sent in `C2S_HELLO`. |
-| `--frames <n>` | Quit after `n` rendered frames. |
+| `--name <name>` | Player name sent in `C2S_HELLO`; seeds the character select's name field. |
+| `--frames <n>` | Quit after `n` rendered frames of a run. |
 | `--screenshot <path>` | Write the framebuffer to `path` on exit (implies `--frames 120`). |
 | `--input-script <path>` | Feed move vectors from a file instead of the keyboard. |
 | `--choice-script <path>` | Answer level-ups and restarts from a file. |
+| `--key-script <path>` | Press keys for the menu and the character select from a file. |
+| `--auto-single-player` | Skip the menu and connect single player at once. |
+| `--server-path <path>` | The server executable Single Player spawns. |
 | `--verbose` | Print one status line per 60 frames. |
 
 `--input-script` exists so the input path can be exercised without a focused
@@ -85,6 +97,16 @@ other event stalls the run at that event — reported once on stderr — rather
 than being spent on the wrong one. The keyboard always works and wins over the
 script: `1`/`2`/`3` pick a card, `R` restarts. With no input at all the
 server's 15 s timeout auto-selects option 0.
+
+`--key-script` drives the screens a run has not reached yet, for the same
+reason: synthetic keystrokes do not reach the window in a headless session.
+Each non-comment line is one press, held for one frame and released on the
+next — a key name (`up`, `down`, `left`, `right`, `enter`, `escape`,
+`backspace`, `space`) or a single character, which is what the name field is
+typed with; see `tests/data/charselect_keys.txt`. When the script runs out on
+the main menu, the character select or a failed connection the client stops
+there, so `--screenshot` captures the screen the script left up; `--frames`
+ends a run as before.
 
 ## Tests
 
@@ -132,7 +154,23 @@ offer gate and the restart gate, `hud_model` holds what the HUD should show
 for a `S2C_LOADOUT`, and `snapshot_state` holds the baseline machine the delta
 protocol rests on.
 
+The character select is covered the same way: `character_catalog` pins the ten
+race rows and their stats and the four weapons, `character_select` holds the
+name, race, weapon and highlighted field with their key rules (the field order
+and its wraparound, the 16 byte name limit, Enter on START being the only Enter
+that connects), and the key script is shown to press each entry for one frame
+and release it, so a repeated key is two presses and not one long hold.
+
 ## Status
+
+Character select — a name, one of ten races and one of four starting weapons,
+chosen before the connection. `C2S_HELLO` carries the two ids, so the run starts
+with the race's stat row and the one weapon picked; the client's
+`src/character_catalog.h` mirrors the server's `src/races.zig` and is tested
+against the same ten rows. The screen is drawn from the same overlay system as
+the menu: a field box per field, the chosen race's row and weapon box
+highlighted, the chosen race's HP, shield, mana, speed and damage shown, and
+the name typed in place with a caret.
 
 Phase 4 — deltas, elites and the boss. The client speaks the phase-4 protocol
 from `PROTOCOL.md` (the authoritative byte layout for both repos) while still
@@ -182,7 +220,20 @@ either server:
 
 Measured on this machine (Release build, 1280x720):
 
-- The logic tests report **1057 checks, 0 failures** (Release and Debug).
+- The logic tests report **1215 checks, 0 failures** (Release and Debug). 158 of
+  those are the character select's: the ten race rows against the server's
+  table, the four weapons, the field and value rules, and the key script.
+- The character select, driven by `--key-script` and captured with
+  `--screenshot`, shows the ten races, the chosen race's stats and the four
+  weapons, with the highlighted row and weapon box where the model put them
+  (checked by reading the framebuffer's colours at the layout's coordinates);
+  START then connects with `C2S_HELLO name=havenz race=3 weapon=2` — the name
+  typed on the screen, Aerie Seraph and the Bow — and the server accepts it and
+  runs. Escape from the screen returns to the menu instead of closing the
+  window. The scripts are `tests/data/charselect_keys.txt` (stop on the screen
+  with a race and a weapon chosen), `charselect_default_keys.txt` (the same,
+  before either is changed) and `menu_roundtrip_keys.txt` (into the screen and
+  back out).
 - Against a mock delta server (21 byte welcome, full baseline, then deltas):
   `interest_radius=75`, **27 deltas applied, 0 rejected**, 28 `C2S_ACK_SNAPSHOT`
   sent, entities spawning and leaving the radius, `stale=0 malformed=0

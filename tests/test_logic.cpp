@@ -4,6 +4,8 @@
 // plain console test.
 
 #include "entity_frame.h"
+#include "character_catalog.h"
+#include "character_select.h"
 #include "game_math.h"
 #include "hud_model.h"
 #include "hud_text.h"
@@ -2559,6 +2561,260 @@ void test_choice_input()
     expect(!haven::load_choice_script("tests/data/choice_script_bad.txt", script), "malformed script is rejected");
 }
 
+void test_character_catalog()
+{
+    std::printf("character catalog\n");
+    expect(haven::kRaceCount == 10, "ten races");
+    expect(haven::kStartingWeaponCount == 4, "four starting weapons");
+
+    // The rows the server's RACE_SPECS holds, as DESIGN.md's race table lists
+    // them. The ids are what C2S_HELLO carries, so a row out of order here
+    // would spawn the player as a different race than the one on screen.
+    struct Row {
+        const char* name;
+        int hp;
+        int shield;
+        int mana;
+        float speed;
+        float atk;
+    };
+    const Row rows[10] = {
+        {"Terran Kin", 110, 25, 100, 1.00f, 1.00f},  {"Mantid Vex", 85, 15, 110, 1.15f, 1.18f},
+        {"Cephalon Tide", 95, 50, 140, 0.95f, 1.05f}, {"Aerie Seraph", 75, 20, 120, 1.22f, 1.08f},
+        {"Saurian Scute", 145, 40, 80, 0.90f, 1.12f}, {"Abyssal Pelag", 100, 35, 150, 1.08f, 1.00f},
+        {"Weave Widow", 80, 30, 130, 1.05f, 1.20f},   {"Felis Nyx", 85, 15, 100, 1.18f, 1.15f},
+        {"Canid Vanguard", 130, 30, 90, 1.06f, 1.10f}, {"Cervid Sylvan", 105, 25, 135, 1.16f, 0.98f},
+    };
+    for (int i = 0; i < haven::kRaceCount; ++i)
+    {
+        const haven::RaceInfo& race = haven::race_info(i);
+        expect(race.id == i, "race " + std::to_string(i) + " carries its own id");
+        expect(std::string(race.name) == rows[i].name, "race " + std::to_string(i) + " is " + rows[i].name);
+        expect(race.max_hp == rows[i].hp, std::string(rows[i].name) + " hp");
+        expect(race.max_shield == rows[i].shield, std::string(rows[i].name) + " shield");
+        expect(race.max_mana == rows[i].mana, std::string(rows[i].name) + " mana");
+        expect_near(race.move_speed_mult, rows[i].speed, 1e-6f, std::string(rows[i].name) + " speed");
+        expect_near(race.damage_mult, rows[i].atk, 1e-6f, std::string(rows[i].name) + " atk");
+    }
+    expect(haven::race_table()[3].max_hp == 75, "the table is indexed by race id");
+    // An id the wire could never carry reads as a race rather than past the end.
+    expect(std::string(haven::race_info(200).name) == "Terran Kin", "an out-of-range race reads as the first");
+    expect(haven::race_info(-1).id == 9, "and a negative one wraps to the last");
+
+    const char* const weapon_names[4] = {"Sword", "Axe", "Bow", "Gun"};
+    const char* const weapon_blurbs[4] = {"MELEE ARC", "HEAVY SWEEP", "PIERCING ARROW", "RAPID KINETIC"};
+    for (int i = 0; i < haven::kStartingWeaponCount; ++i)
+    {
+        const haven::StartingWeaponInfo& weapon = haven::starting_weapon_info(i);
+        expect(weapon.id == i, "weapon " + std::to_string(i) + " carries its own id");
+        expect(std::string(weapon.name) == weapon_names[i], "weapon " + std::to_string(i) + " is a name");
+        expect(std::string(weapon.description) == weapon_blurbs[i],
+               std::string(weapon_names[i]) + " has a description");
+    }
+    expect(std::string(haven::starting_weapon_info(9).name) == "Axe", "a weapon id wraps rather than overruns");
+
+    expect(haven::cycle_race(0, -1) == 9, "race cycles back past the first");
+    expect(haven::cycle_race(9, 1) == 0, "race cycles forward past the last");
+    expect(haven::cycle_race(4, 0) == 4, "a zero step holds the race");
+    expect(haven::cycle_weapon(0, -1) == 3, "weapon cycles back past the first");
+    expect(haven::cycle_weapon(3, 1) == 0, "weapon cycles forward past the last");
+
+    expect(haven::format_multiplier(1.0f) == "1.00X", "a whole multiplier prints two places");
+    expect(haven::format_multiplier(1.18f) == "1.18X", "a fraction prints its hundredths");
+    expect(haven::format_multiplier(0.9f) == "0.90X", "a short fraction is padded");
+}
+
+void test_character_select_model()
+{
+    std::printf("character select model\n");
+    haven::CharacterSelectModel select;
+    expect(select.name() == "haven", "the default name is haven");
+    expect(select.field() == haven::CharacterSelectModel::kFieldName, "the name field starts highlighted");
+    expect(select.race_id() == 0, "the first race starts chosen");
+    expect(select.weapon_id() == 0, "the first weapon starts chosen");
+
+    haven::CharacterSelectModel named("ada");
+    expect(named.name() == "ada", "--name seeds the name field");
+    haven::CharacterSelectModel long_name("0123456789abcdefghij");
+    expect(long_name.name().size() == haven::CharacterSelectModel::kMaxNameLength,
+           "a seed longer than the wire field is cut to 16");
+
+    // Up/Down walks the four fields and wraps.
+    select.move_field(-1);
+    expect(select.field() == haven::CharacterSelectModel::kFieldStart, "up from the name wraps to START");
+    select.move_field(1);
+    expect(select.field() == haven::CharacterSelectModel::kFieldName, "down from START wraps to the name");
+    select.move_field(1);
+    select.move_field(1);
+    expect(select.field() == haven::CharacterSelectModel::kFieldWeapon, "down twice reaches the weapon");
+
+    // Left/Right change the weapon only while the weapon field is highlighted.
+    const int race_before = select.race_id();
+    select.change_value(1);
+    expect(select.weapon_id() == 1, "right changes the weapon");
+    expect(select.race_id() == race_before, "and leaves the race alone");
+    select.change_value(-1);
+    expect(select.weapon_id() == 0, "left changes it back");
+    select.change_value(-1);
+    expect(select.weapon_id() == 3, "left past the first weapon wraps to the last");
+
+    select.move_field(-1);
+    expect(select.field() == haven::CharacterSelectModel::kFieldRace, "up from the weapon reaches the race");
+    select.change_value(1);
+    expect(select.race_id() == 1, "right changes the race");
+    select.change_value(-1);
+    select.change_value(-1);
+    expect(select.race_id() == 9, "left past the first race wraps to the last");
+
+    // The name is typed only while its own field is highlighted.
+    expect(select.field() == haven::CharacterSelectModel::kFieldRace, "the race field is still highlighted");
+    select.type_char('x');
+    expect(select.name() == "haven", "typing outside the name field is ignored");
+    select.backspace();
+    expect(select.name() == "haven", "so is backspace");
+
+    select.move_field(-1);  // back to the name
+    select.type_char('!');
+    expect(select.name() == "haven!", "a printable character is appended");
+    select.type_char('\n');
+    select.type_char('\t');
+    expect(select.name() == "haven!", "control characters are refused");
+    select.backspace();
+    expect(select.name() == "haven", "backspace deletes the last character");
+    for (int i = 0; i < 20; ++i) select.type_char('z');
+    expect(select.name().size() == haven::CharacterSelectModel::kMaxNameLength,
+           "the name stops at the wire field's 16 bytes");
+    for (int i = 0; i < 40; ++i) select.backspace();
+    expect(select.name().size() == 1, "backspace never empties the name");
+
+    // Enter confirms the name by moving on, and only START asks to connect.
+    haven::CharacterSelectModel flow("haven");
+    expect(!flow.confirm(), "enter on the name does not connect");
+    expect(flow.field() == haven::CharacterSelectModel::kFieldRace, "it moves the highlight to the race");
+    expect(!flow.confirm(), "enter on the race does not connect");
+    flow.move_field(1);
+    expect(!flow.confirm(), "enter on the weapon does not connect");
+    flow.move_field(1);
+    expect(flow.field() == haven::CharacterSelectModel::kFieldStart, "the highlight reached START");
+    expect(flow.confirm(), "enter on START connects");
+}
+
+void test_character_select_input()
+{
+    std::printf("character select input\n");
+    haven::InputState input;
+    auto key = [&input](int code, bool down) {
+        if (down)
+            input.key_down(code);
+        else
+            input.key_up(code);
+    };
+
+    // Escape quits by default, and the character select turns that off so the
+    // key can be its own back key instead.
+    key(haven::InputState::kKeyEscape, true);
+    expect(input.quit_requested(), "escape quits while nothing else claims it");
+    input.consume_quit();
+    key(haven::InputState::kKeyEscape, false);
+
+    input.set_escape_quits(false);
+    key(haven::InputState::kKeyEscape, true);
+    expect(!input.quit_requested(), "escape does not quit while the select screen holds it");
+    expect(input.held(haven::InputState::kKeyEscape), "but it is still held, so the screen can see it");
+    key(haven::InputState::kKeyEscape, false);
+    input.set_escape_quits(true);
+    key(haven::InputState::kKeyEscape, true);
+    expect(input.quit_requested(), "and it quits again once the screen is gone");
+    input.consume_quit();
+    key(haven::InputState::kKeyEscape, false);
+
+    // Typed text is collected only while the capture is on, and only for the
+    // printable keycodes: the arrows, enter, escape and backspace are keys the
+    // screen reads as commands.
+    expect(input.take_typed_text().empty(), "nothing is collected before the capture is on");
+    key('h', true);
+    key('h', false);
+    expect(input.take_typed_text().empty(), "a key pressed with the capture off is dropped");
+
+    input.set_text_capture(true);
+    key('h', true);
+    key('h', false);
+    key('a', true);
+    key('a', false);
+    key('7', true);
+    key('7', false);
+    key(haven::InputState::kKeyUp, true);
+    key(haven::InputState::kKeyUp, false);
+    key(haven::InputState::kKeyEnter, true);
+    key(haven::InputState::kKeyEnter, false);
+    key(haven::InputState::kKeyEscape, true);
+    key(haven::InputState::kKeyEscape, false);
+    key(haven::InputState::kKeyBackspace, true);
+    key(haven::InputState::kKeyBackspace, false);
+    expect(input.take_typed_text() == "ha7", "the printable keys arrive in order and nothing else does");
+    expect(input.take_typed_text().empty(), "taking the text clears it");
+    input.set_text_capture(false);
+    key('z', true);
+    key('z', false);
+    expect(input.take_typed_text().empty(), "and the capture stops collecting once it is off");
+}
+
+void test_key_script()
+{
+    std::printf("key script\n");
+    std::vector<int> keys;
+    expect(haven::load_key_script("tests/data/charselect_keys.txt", keys), "key script loads");
+    expect(keys.size() == 11, "every line is one press");
+    expect(keys[0] == haven::InputState::kKeyEnter, "a key name is that key");
+    expect(keys[1] == 'z' && keys[2] == 'q', "a single character is that key");
+    expect(keys[3] == haven::InputState::kKeyBackspace, "backspace is a key");
+    expect(keys[4] == haven::InputState::kKeyDown && keys[5] == haven::InputState::kKeyRight,
+           "and so are the arrows");
+    expect(keys[5] == keys[6] && keys[6] == keys[7], "a repeated key is repeated in the script");
+    expect(!haven::load_key_script("tests/data/does_not_exist.txt", keys), "a missing script is rejected");
+    std::vector<int> bad;
+    expect(!haven::load_key_script("tests/data/key_script_bad.txt", bad), "a line that names no key is rejected");
+
+    haven::InputState input;
+    input.set_key_script(keys);
+    expect(!input.key_script_finished(), "an armed script has not run out");
+
+    // Each entry is one press: held for a frame, then released, so a key that
+    // repeats is two presses and not one long hold — which is what the menu's
+    // and the character select's edge detection need to see.
+    input.advance_key_script();
+    expect(input.held(haven::InputState::kKeyEnter), "the first frame presses the first key");
+    input.advance_key_script();
+    expect(!input.held(haven::InputState::kKeyEnter), "the next frame releases it");
+
+    for (int i = 0; i < 6; ++i) input.advance_key_script();  // z, q and backspace
+    input.advance_key_script();
+    expect(input.held(haven::InputState::kKeyDown), "the script reaches the arrow keys");
+    input.advance_key_script();
+    expect(!input.held(haven::InputState::kKeyDown), "and releases them");
+
+    for (int i = 0; i < 3; ++i)
+    {
+        input.advance_key_script();
+        expect(input.held(haven::InputState::kKeyRight), "the repeated key is pressed each time");
+        input.advance_key_script();
+        expect(!input.held(haven::InputState::kKeyRight), "and released in between");
+    }
+
+    for (int i = 0; i < 6; ++i) input.advance_key_script();  // the last three entries
+    expect(input.key_script_finished(), "the script runs out after its last press");
+    input.advance_key_script();
+    expect(!input.held(haven::InputState::kKeyRight), "and an exhausted script presses nothing");
+
+    // The presses go through the same path a real key does, so the character
+    // select's name field sees them as typed text.
+    haven::InputState typed;
+    typed.set_text_capture(true);
+    typed.set_key_script(keys);
+    for (int i = 0; i < 8; ++i) typed.advance_key_script();
+    expect(typed.take_typed_text() == "zq", "the script's characters reach the name field");
+}
+
 }  // namespace
 
 int main()
@@ -2599,6 +2855,10 @@ int main()
     test_input_state();
     test_input_script();
     test_choice_input();
+    test_character_catalog();
+    test_character_select_model();
+    test_character_select_input();
+    test_key_script();
     test_restart_boundary();
     test_restart_boundary_proves_run_identity();
     test_restart_boundary_zero_clock();

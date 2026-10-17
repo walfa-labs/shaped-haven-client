@@ -1,3 +1,4 @@
+#include "character_select.h"
 #include "game_session.h"
 #include "input_state.h"
 #include "net/ITransport.h"
@@ -82,6 +83,7 @@ void print_usage(const char* argv0)
     std::printf("usage: %s [--host 127.0.0.1] [--port 7777] [--name <name>]\n"
                 "          [--frames <n>] [--screenshot <path>] [--verbose]\n"
                 "          [--input-script <path>] [--choice-script <path>]\n"
+                "          [--key-script <path>] [--auto-single-player]\n"
                 "          [--server-path <path>]\n"
                 "\n"
                 "  --input-script feeds move vectors from a file, one per 60 Hz tick,\n"
@@ -90,6 +92,14 @@ void print_usage(const char* argv0)
                 "  event in chronological order: a choice index 0..2 for each level-up\n"
                 "  offer, or \"restart\" at each game over. The keyboard (1/2/3 to\n"
                 "  pick a card, R to restart) always works and wins over the script.\n"
+                "  --key-script presses keys for the menu and the character select,\n"
+                "  one per line, each held for a frame and released on the next: a\n"
+                "  key name (up, down, left, right, enter, escape, backspace, space)\n"
+                "  or a single character. When it runs out on one of those screens\n"
+                "  the client stops there, which is what lets --screenshot capture\n"
+                "  the screen it left up.\n"
+                "  --auto-single-player skips the menu and connects single player at\n"
+                "  once, for automated runs.\n"
                 "  --server-path names the executable Single Player spawns. It defaults\n"
                 "  to shaped-haven-server.exe next to this client.\n",
                 argv0);
@@ -99,6 +109,9 @@ void print_usage(const char* argv0)
 /// does not need a server, so it is the only one that can be shown on startup.
 enum class AppState {
     MainMenu,
+    /// Picking a name, a race and a starting weapon. Needs no server either:
+    /// the two ids it produces are what C2S_HELLO carries.
+    CharacterSelect,
     Connecting,
     /// Waiting for the server's S2C_WELCOME after a successful TCP connect.
     AwaitingWelcome,
@@ -122,6 +135,7 @@ int main(int argc, char** argv)
     std::string screenshot;
     std::string input_script;
     std::string choice_script;
+    std::string key_script;
     std::string server_path = default_server_path();
     int frame_limit = 0;
     bool verbose = false;
@@ -138,6 +152,7 @@ int main(int argc, char** argv)
         else if (arg == "--screenshot") screenshot = next();
         else if (arg == "--input-script") input_script = next();
         else if (arg == "--choice-script") choice_script = next();
+        else if (arg == "--key-script") key_script = next();
         else if (arg == "--server-path") server_path = next();
         else if (arg == "--verbose") verbose = true;
         else if (arg == "--auto-single-player") auto_single_player = true;
@@ -162,6 +177,10 @@ int main(int argc, char** argv)
     if (!choice_script.empty() && !haven::load_choice_script(choice_script, scripted_choices))
         return 1;
 
+    std::vector<int> scripted_keys;
+    if (!key_script.empty() && !haven::load_key_script(key_script, scripted_keys))
+        return 1;
+
     haven::HavenRenderer renderer;
     if (!renderer.initialise())
     {
@@ -182,12 +201,21 @@ int main(int argc, char** argv)
         std::printf("haven: scripted choices from %s (%zu events)\n", choice_script.c_str(),
                     scripted_choices.size());
     }
+    if (!scripted_keys.empty())
+    {
+        input.set_key_script(scripted_keys);
+        std::printf("haven: scripted keys from %s (%zu presses)\n", key_script.c_str(), scripted_keys.size());
+    }
 
     haven::Hud hud(renderer.scene_manager(), renderer.mesh_factory(), renderer.camera_node());
 
     AppState state = AppState::MainMenu;
     int menu_selection = 0;  // 0 = Single Player, 1 = Multiplayer
     std::string menu_error;
+    /// The name, race and starting weapon. `--name` seeds the name field, and
+    /// the two ids are 0 until the player changes them, which is what the
+    /// client sent before the character select existed.
+    haven::CharacterSelectModel character_select(name);
     std::unique_ptr<haven::ITransport> transport;
     std::unique_ptr<haven::GameSession> session;
     bool connect_attempted = false;
@@ -208,13 +236,30 @@ int main(int argc, char** argv)
     // was not held on the previous frame, so holding a key does not repeat.
     bool prev_up = false;
     bool prev_down = false;
+    bool prev_left = false;
+    bool prev_right = false;
     bool prev_enter = false;
+    bool prev_escape = false;
+    bool prev_backspace = false;
 
     const auto started = std::chrono::steady_clock::now();
     int frames = 0;
 
+    /// Ends the run the way --frames does: the framebuffer first, so a
+    /// --screenshot captures the frame that was on screen when it was called.
+    const auto finish = [&]() {
+        if (!screenshot.empty())
+        {
+            std::printf("haven: writing screenshot to %s\n", screenshot.c_str());
+            renderer.capture_framebuffer(screenshot);
+            std::printf("haven: screenshot written\n");
+        }
+        renderer.getRoot()->queueEndRendering();
+    };
+
     renderer.run([&](float dt) {
         hud.tick(dt);
+        input.advance_key_script();
 
         switch (state)
         {
@@ -236,12 +281,81 @@ int main(int argc, char** argv)
             }
             if (enter && !prev_enter)
             {
-                state = AppState::Connecting;
-                connect_attempted = false;
+                // The choice of Single Player or Multiplayer is what the
+                // Connecting state reads; the character select sits between
+                // them, so `menu_selection` is left alone here.
+                menu_error.clear();
+                hud.clear_menu_error();
+                hud.hide_main_menu();
+                hud.set_character_select_name(character_select.name());
+                hud.set_character_select_race(character_select.race_id());
+                hud.set_character_select_weapon(character_select.weapon_id());
+                hud.set_character_select_selection(character_select.field());
+                hud.show_character_select();
+                // Escape is the select screen's back key, not the quit key, and
+                // printable keys are the name field's until the screen goes.
+                input.set_escape_quits(false);
+                input.set_text_capture(true);
+                input.take_typed_text();
+                state = AppState::CharacterSelect;
             }
             prev_up = up;
             prev_down = down;
             prev_enter = enter;
+            break;
+        }
+
+        case AppState::CharacterSelect:
+        {
+            const bool up = input.held(haven::InputState::kKeyUp);
+            const bool down = input.held(haven::InputState::kKeyDown);
+            const bool left = input.held(haven::InputState::kKeyLeft);
+            const bool right = input.held(haven::InputState::kKeyRight);
+            const bool enter = input.held(haven::InputState::kKeyEnter);
+            const bool escape = input.held(haven::InputState::kKeyEscape);
+            const bool backspace = input.held(haven::InputState::kKeyBackspace);
+
+            if (up && !prev_up) character_select.move_field(-1);
+            if (down && !prev_down) character_select.move_field(1);
+            if (left && !prev_left) character_select.change_value(-1);
+            if (right && !prev_right) character_select.change_value(1);
+            if (backspace && !prev_backspace) character_select.backspace();
+            for (const char typed : input.take_typed_text())
+                character_select.type_char(typed);
+
+            bool start = false;
+            if (enter && !prev_enter) start = character_select.confirm();
+            const bool go_back = escape && !prev_escape;
+
+            prev_up = up;
+            prev_down = down;
+            prev_left = left;
+            prev_right = right;
+            prev_enter = enter;
+            prev_escape = escape;
+            prev_backspace = backspace;
+
+            hud.set_character_select_selection(character_select.field());
+            hud.set_character_select_name(character_select.name());
+            hud.set_character_select_race(character_select.race_id());
+            hud.set_character_select_weapon(character_select.weapon_id());
+
+            if (start)
+            {
+                hud.hide_character_select();
+                input.set_escape_quits(true);
+                input.set_text_capture(false);
+                state = AppState::Connecting;
+                connect_attempted = false;
+            }
+            else if (go_back)
+            {
+                hud.hide_character_select();
+                hud.show_main_menu();
+                input.set_escape_quits(true);
+                input.set_text_capture(false);
+                state = AppState::MainMenu;
+            }
             break;
         }
 
@@ -265,7 +379,9 @@ int main(int argc, char** argv)
 
                 session = std::make_unique<haven::GameSession>(renderer, *transport, input, hud);
                 std::string connect_error;
-                if (session->connect(host, port, name, &connect_error))
+                if (session->connect(host, port, character_select.name(),
+                                     static_cast<uint8_t>(character_select.race_id()),
+                                     static_cast<uint8_t>(character_select.weapon_id()), &connect_error))
                 {
                     hud.hide_main_menu();
                     state = AppState::AwaitingWelcome;
@@ -344,18 +460,18 @@ int main(int argc, char** argv)
                             static_cast<unsigned>(s.restarts_sent), s.update_ms_ema);
             }
 
-            if (frame_limit > 0 && frames >= frame_limit)
-            {
-                if (!screenshot.empty())
-                {
-                    std::printf("haven: writing screenshot to %s\n", screenshot.c_str());
-                    renderer.capture_framebuffer(screenshot);
-                    std::printf("haven: screenshot written\n");
-                }
-                renderer.getRoot()->queueEndRendering();
-            }
+            if (frame_limit > 0 && frames >= frame_limit) finish();
             break;
         }
+
+        // A key script drives the pre-game screens. Once it runs out on one of
+        // them there is nothing left to do, so the client stops there and a
+        // --screenshot captures the screen the script left up. The states a run
+        // has reached are left alone: --frames ends those.
+        if (input.key_script_finished() &&
+            (state == AppState::MainMenu || state == AppState::CharacterSelect ||
+             state == AppState::ConnectionFailed))
+            finish();
     });
 
     if (session) session->shutdown();

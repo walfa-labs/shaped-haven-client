@@ -81,6 +81,18 @@ public:
     void set_menu_error(const std::string& error);
     void clear_menu_error();
 
+    // Character select, shown between the main menu and the connection. It
+    // mirrors the name, race, starting weapon and field the player has chosen
+    // so far; the values themselves live in CharacterSelectModel.
+    void show_character_select();
+    void hide_character_select();
+
+    /// Which field is highlighted: 0 name, 1 race, 2 weapon, 3 START.
+    void set_character_select_selection(int selection);
+    void set_character_select_name(const std::string& name);
+    void set_character_select_race(int race_id);
+    void set_character_select_weapon(int weapon_id);
+
     /// Destroys every HUD scene object while Ogre is still alive. Must be
     /// called before renderer.closeApp(); the destructor has nothing left to
     /// do afterwards.
@@ -111,10 +123,14 @@ private:
     /// One Manual Object for every coloured quad that is not a persistent
     /// full-screen element: the item tray boxes and the modal cards. Rebuilt
     /// wholesale whenever it changes, sectioned per colour like the batches.
+    /// `z` places the batch among the other HUD layers: quads of two batches at
+    /// the same z have no defined order between them, so a batch that must sit
+    /// over another is given a higher one.
     struct QuadBatch {
         Ogre::ManualObject* object = nullptr;
         Ogre::SceneNode* node = nullptr;
         std::string name;
+        float z = 0.49f;
         struct Section {
             Rgba colour;
             uint32_t verts = 0;
@@ -148,6 +164,7 @@ private:
     void layout_game_over(const GameOverStats& stats);
     void layout_banner(const std::string& name);
     void layout_main_menu();
+    void layout_character_select();
 
     Ogre::SceneManager* scene_ = nullptr;
     MeshFactory* meshes_ = nullptr;
@@ -166,6 +183,11 @@ private:
     QuadBatch tray_;
     QuadBatch modal_;
     QuadBatch menu_;
+    /// The character select's field boxes, and the highlights drawn over them.
+    /// They are two batches because a highlight that shared a z with the box it
+    /// marks could render behind it.
+    QuadBatch select_fields_;
+    QuadBatch select_;
     TextLayer* hud_lines_ = nullptr;    // level label, xp numbers, run clock
     TextLayer* tray_text_ = nullptr;    // weapon/passive names
     TextLayer* modal_title_ = nullptr;  // "LEVEL UP!" header
@@ -180,6 +202,13 @@ private:
     TextLayer* menu_options_ = nullptr; // the two entries
     TextLayer* menu_footer_ = nullptr;  // the key hints
     TextLayer* menu_error_ = nullptr;   // the connection-failure banner
+    TextLayer* select_title_ = nullptr;   // "CHOOSE YOUR CHARACTER"
+    TextLayer* select_name_ = nullptr;    // the name field's label and value
+    TextLayer* select_races_ = nullptr;   // the ten race names
+    TextLayer* select_detail_ = nullptr;  // the chosen race's stats
+    TextLayer* select_weapons_ = nullptr; // the four weapon names
+    TextLayer* select_start_ = nullptr;   // the START button
+    TextLayer* select_hints_ = nullptr;   // the key hints
 
     uint32_t last_run_second_ = 0xFFFFFFFFu;
     bool banner_visible_ = false;
@@ -189,6 +218,11 @@ private:
     bool menu_visible_ = false;
     int menu_selection_ = 0;
     std::string menu_error_text_;
+    bool select_visible_ = false;
+    int select_selection_ = 0;
+    std::string select_name_text_;
+    int select_race_ = 0;
+    int select_weapon_ = 0;
     bool initialised_ = false;
 
     struct ColourLess {

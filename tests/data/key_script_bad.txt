@@ -1,0 +1,4 @@
+# A malformed key script: the second line names no key and is more than one
+# character, so there is nothing to press.
+enter
+notakey
