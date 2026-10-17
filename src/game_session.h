@@ -165,6 +165,11 @@ private:
     /// told us about.
     void apply_run_state();
 
+    /// True when the local player's mana covers a dash. The dash cost is not on
+    /// the wire — `PlayerNet` carries only the current mana percentage — so it
+    /// is read from the character catalog against the player's own race.
+    bool dash_affordable() const;
+
     /// Answers the open level-up offer, from the keyboard or the choice
     /// script.
     void resolve_levelup_choice();
@@ -236,6 +241,11 @@ private:
     /// baseline_tick matches; a full snapshot replaces it outright. See
     /// PROTOCOL.md "Baseline rules" and snapshot_state.h.
     SnapshotState snapshot_state_;
+
+    /// The local player's newest vitals, mirrored from the snapshot for the
+    /// dash-affordability check. Empty until the first snapshot that carries
+    /// this player.
+    Vitals self_vitals_;
 
     float accumulator_ = 0.0f;
     uint64_t session_token_ = 0;
