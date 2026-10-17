@@ -207,7 +207,8 @@ int main(int argc, char** argv)
         std::printf("haven: scripted keys from %s (%zu presses)\n", key_script.c_str(), scripted_keys.size());
     }
 
-    haven::Hud hud(renderer.scene_manager(), renderer.mesh_factory(), renderer.camera_node());
+    haven::Hud hud(renderer.scene_manager(), renderer.mesh_factory(), renderer.camera_node(),
+                  renderer.cel_generator(), renderer.race_meshes());
 
     AppState state = AppState::MainMenu;
     int menu_selection = 0;  // 0 = Single Player, 1 = Multiplayer

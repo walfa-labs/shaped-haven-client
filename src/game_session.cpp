@@ -50,6 +50,7 @@ bool GameSession::connect(const std::string& host, uint16_t port, const std::str
     // The two ids the character select produced are what the server keys the
     // run's stat row and its starting weapon on, so they travel in the
     // handshake rather than being left at the defaults.
+    race_id_ = race_id;
     const std::vector<uint8_t> hello = encode_hello(race_id, starting_weapon_id, name);
     if (!net_.sendPacket(hello.data(), hello.size()))
     {
@@ -114,7 +115,7 @@ void GameSession::update(float dt_seconds)
     // continuous between snapshot arrivals.
     interpolation_.advance(dt_seconds);
 
-    renderer_.set_local_player(predictor_.position());
+    renderer_.set_local_player(predictor_.position(), local_facing_, race_id_);
     update_entities();
     renderer_.follow_camera(predictor_.position());
 
@@ -167,6 +168,10 @@ void GameSession::step_fixed()
     const Vec2 move = input_.move_vector();
     stats_.last_move = move;
 
+    // The character mesh faces the way it is moving; a stationary player
+    // keeps the last facing rather than snapping back to a default.
+    if (length(move) > 1e-3f) local_facing_ = std::atan2(move.y, move.x);
+
     // Reserve the sequence number the predictor is about to use, so the packet
     // describes exactly the step that is about to be taken.
     const uint32_t seq = predictor_.next_seq();
@@ -189,7 +194,7 @@ void GameSession::step_fixed()
     }
 
     predictor_.step(move);
-    renderer_.set_local_player(predictor_.position());
+    renderer_.set_local_player(predictor_.position(), local_facing_, race_id_);
     ++stats_.inputs_sent;
     ++client_tick_;
 }
@@ -656,7 +661,7 @@ void GameSession::update_entities()
             continue;
         }
         present_remotes_.insert(id);
-        renderer_.set_remote_player(static_cast<uint8_t>(id), item.pos);
+        renderer_.set_remote_player(static_cast<uint8_t>(id), item.pos, item.angle, item.race_id);
     }
 
     if (self != nullptr)

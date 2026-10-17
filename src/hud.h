@@ -21,6 +21,8 @@
 namespace haven {
 
 class MeshFactory;
+class CelShaderGenerator;
+class AnthropomorphicMeshBuilder;
 
 /// The 2D overlay: the status cluster (health, shield, mana), the XP bar, the
 /// item tray, the level-up modal, the evolution banner, the main menu, the
@@ -34,7 +36,8 @@ class MeshFactory;
 /// so screen space and world space coincide.
 class Hud {
 public:
-    Hud(Ogre::SceneManager* scene_manager, MeshFactory* meshes, Ogre::SceneNode* camera_node);
+    Hud(Ogre::SceneManager* scene_manager, MeshFactory* meshes, Ogre::SceneNode* camera_node,
+        CelShaderGenerator* cel, AnthropomorphicMeshBuilder* race_meshes);
     ~Hud();
 
     Hud(const Hud&) = delete;
@@ -237,6 +240,23 @@ private:
     Ogre::SceneManager* scene_ = nullptr;
     MeshFactory* meshes_ = nullptr;
     Ogre::SceneNode* camera_node_ = nullptr;
+    CelShaderGenerator* cel_ = nullptr;
+    AnthropomorphicMeshBuilder* race_meshes_ = nullptr;
+
+    /// The character select's cel-shaded preview: the chosen race's
+    /// anthropomorphic mesh on a camera-local node in front of the panel,
+    /// turning slowly so the silhouette reads from every angle. Null until
+    /// first shown, and when the cel-shading shaders failed to compile.
+    Ogre::Entity* preview_ = nullptr;
+    Ogre::SceneNode* preview_node_ = nullptr;
+    Ogre::MaterialPtr preview_material_;
+    int preview_race_ = 0;
+    float preview_angle_ = 0.0f;
+
+    /// Builds the preview entity on first use and points it at the selected
+    /// race's mesh; a no-op without cel-shading or before the first race.
+    void ensure_preview();
+    void destroy_preview();
 
     /// Child of the camera node that cancels its z (kCameraZ), so every HUD
     /// element parented under it lands at the z the combat layers use while

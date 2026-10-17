@@ -4,6 +4,8 @@
 #include "entity_frame.h"
 #include "input/InputManager.h"
 #include "mesh_factory.h"
+#include "render/AnthropomorphicMeshBuilder.h"
+#include "render/CelShaderGenerator.h"
 #include "render/TelegraphRenderer.h"
 
 #include <vector>
@@ -62,16 +64,27 @@ public:
     Ogre::SceneNode* camera_node() const { return camera_node_; }
     MeshFactory* mesh_factory() const { return meshes_.get(); }
 
-    /// Local player square, driven by the prediction state.
-    void set_local_player(const Vec2& pos);
+    /// True when the cel-shading shaders compiled. When false the renderer
+    /// draws the flat coloured-primitive fallback, so the game stays playable
+    /// on a GPU that rejects the custom shaders.
+    bool cel_shading_ready() const { return cel_ready_; }
+    CelShaderGenerator* cel_generator() const { return cel_generator_.get(); }
+    AnthropomorphicMeshBuilder* race_meshes() const { return race_meshes_.get(); }
+
+    /// Local player, driven by the prediction state. `angle` is the facing in
+    /// radians and `race_id` picks the anthropomorphic mesh; a changed race
+    /// rebuilds the view. Called every predicted tick and every frame.
+    void set_local_player(const Vec2& pos, float angle, uint8_t race_id);
 
     /// Keeps the 80x45 viewport centred on the local player, so the action
     /// stays in view inside the 2000x2000 arena. Called by the game loop after
     /// it advances the player, so tracking does not lag a frame behind.
     void follow_camera(const Vec2& pos);
 
-    /// Remote players, driven by the interpolation buffer.
-    void set_remote_player(uint8_t player_id, const Vec2& pos);
+    /// Remote players, driven by the interpolation buffer. `angle` is the
+    /// decoded facing and `race_id` the race the player picked, so a remote
+    /// shows the same cel-shaded silhouette the local player would.
+    void set_remote_player(uint8_t player_id, const Vec2& pos, float angle, uint8_t race_id);
     void remove_player(uint8_t player_id);
     void clear_remote_players();
 
@@ -87,6 +100,21 @@ public:
     void shutdown();
 
 private:
+    /// One cel-shaded character: the body mesh on a node that faces the
+    /// movement direction, and the cape/scarf mesh on a child node that trails
+    /// behind the velocity vector.
+    struct PlayerView {
+        Ogre::Entity* body = nullptr;
+        Ogre::Entity* cape = nullptr;
+        Ogre::SceneNode* node = nullptr;
+        Ogre::SceneNode* cape_node = nullptr;
+        float facing = 0.0f;
+        uint8_t race_id = 0;
+        Vec2 last_pos{0.0f, 0.0f};
+        float cape_angle = 0.0f;
+        bool pos_valid = false;
+    };
+
     /// One colour slot's worth of geometry inside its pool's Manual Object.
     struct ColourBatch {
         Ogre::ManualObject* object = nullptr;
@@ -106,6 +134,21 @@ private:
     void build_camera();
     void build_combat_batches();
 
+    /// Builds (or rebuilds) a player's body and cape entities from the cached
+    /// race meshes, and returns the view. `initialised` is false until the
+    /// first call, so a fresh view is created rather than looked up.
+    PlayerView& ensure_player(PlayerView& view, const std::string& name, uint8_t race_id);
+    void position_player(PlayerView& view, const Vec2& pos, float angle);
+    /// Swings the cape node to trail behind the latest velocity; a no-op when
+    /// the view has no cape (the flat fallback).
+    void update_cape(PlayerView& view, const Vec2& pos);
+
+    /// The shared cel material for every player's body (the race meshes bake
+    /// the palette, so the base colour is white), and the per-race cape
+    /// material tinted to the race's accent colour.
+    Ogre::MaterialPtr body_material();
+    Ogre::MaterialPtr cape_material(uint8_t race_id);
+
     size_t slot_index(const ColourSlot& slot);
     ColourBatch& batch_for(const ColourSlot& slot);
     void slot_capacity(ColourPool pool, uint32_t& verts, uint32_t& indices);
@@ -113,7 +156,10 @@ private:
     /// The Manual Object that holds one draw layer's sections.
     Ogre::ManualObject* pool_object(ColourPool pool);
 
-    /// Adds a section (and its material) for a colour slot on first use.
+    /// Adds a section (and its material) for a colour slot on first use. The
+    /// EnemyBody, Projectile and Gem pools get the cel-shaded toon material;
+    /// the bar, elite-outline and telegraph pools stay flat, since they are
+    /// arena-floor and HUD-style elements rather than characters.
     void create_slot(const ColourSlot& slot);
 
     /// The orthographic viewport is a fixed 80 x 45 units, so the window is
@@ -126,11 +172,13 @@ private:
     Ogre::SceneManager* scene_manager_ = nullptr;
     Ogre::Camera* camera_ = nullptr;
     Ogre::SceneNode* camera_node_ = nullptr;
-    Ogre::SceneNode* local_player_node_ = nullptr;
     Ogre::ManualObject* grid_ = nullptr;
     std::unique_ptr<MeshFactory> meshes_;
+    std::unique_ptr<CelShaderGenerator> cel_generator_;
+    std::unique_ptr<AnthropomorphicMeshBuilder> race_meshes_;
     std::unique_ptr<TelegraphRenderer> telegraphs_;
     InputManager* input_ = nullptr;
+    bool cel_ready_ = false;
 
     /// One Manual Object per draw layer, each holding one section per colour
     /// slot actually in use. See render_entities().
@@ -147,10 +195,15 @@ private:
     std::vector<const EntityDrawItem*> slot_items_[kSlotItemCount];
     ColourBatch batches_[kSlotItemCount];
 
+    /// The local player's cel-shaded view.
+    PlayerView local_player_;
+    Ogre::MaterialPtr body_material_;
+    std::unordered_map<uint8_t, Ogre::MaterialPtr> cape_materials_;
+
     std::function<void(float)> tick_;
     bool quit_ = false;
 
-    std::unordered_map<uint8_t, Ogre::SceneNode*> remote_players_;
+    std::unordered_map<uint8_t, PlayerView> remote_players_;
 };
 
 }  // namespace haven

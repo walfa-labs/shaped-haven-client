@@ -71,6 +71,12 @@ Ogre::ColourValue colour(const Rgba& rgba)
     return Ogre::ColourValue(rgba.r, rgba.g, rgba.b, rgba.a);
 }
 
+/// The ink outline colour for player characters: a near-black blue (#0A0A0F).
+/// Elites and bosses would use a crimson ink (#FF0033); they are drawn as
+/// flat batches rather than cel-shaded meshes, and their elite outline rings
+/// already carry the crimson accent.
+const Ogre::ColourValue kInkNormal(0.04f, 0.04f, 0.06f);
+
 }  // namespace
 
 HavenRenderer::HavenRenderer() : OgreBites::ApplicationContext("Shaped Haven") {}
@@ -149,8 +155,6 @@ void HavenRenderer::build_scene()
     meshes_->build(Shape::Square, 0.5f, "haven/player_square");
     meshes_->build(Shape::Circle, 0.5f, "haven/enemy_circle");
     meshes_->build(Shape::Triangle, 0.5f, "haven/enemy_triangle");
-    meshes_->flat_material("haven/player", colour(0.30f, 0.85f, 0.45f));
-    meshes_->flat_material("haven/remote_player", colour(0.35f, 0.55f, 0.95f));
     meshes_->flat_material("haven/grid", colour(0.18f, 0.20f, 0.26f));
     meshes_->flat_material("haven/arena_wall", colour(0.55f, 0.35f, 0.85f));
     // White, unlit, and tracking the per-vertex colour: the combat batches put
@@ -161,6 +165,10 @@ void HavenRenderer::build_scene()
     // through to the shader. Self-illumination stays black because the FFP
     // shader adds it on top of the vertex-coloured diffuse; a white
     // self-illumination would wash every entity out to white.
+    //
+    // This shared material is the fallback for the combat batches when the
+    // cel-shading shaders failed to compile; when they did, the per-slot
+    // toon materials (created in create_slot) replace it pool by pool.
     Ogre::MaterialPtr batch = Ogre::MaterialManager::getSingleton().create("haven/batch", kResourceGroup);
     Ogre::Pass* batch_pass = batch->getTechnique(0)->getPass(0);
     const Ogre::ColourValue white(1.0f, 1.0f, 1.0f);
@@ -170,16 +178,23 @@ void HavenRenderer::build_scene()
     batch_pass->setVertexColourTracking(Ogre::TVC_DIFFUSE);
     batch->load();
 
+    // Cel-shading: the shader programs and the procedural race meshes. If the
+    // shaders fail to compile, cel_ready_ stays false and every draw path
+    // falls back to the flat materials above, so the game stays playable.
+    cel_generator_ = std::make_unique<CelShaderGenerator>(scene_manager_);
+    cel_ready_ = cel_generator_->initialise();
+    race_meshes_ = std::make_unique<AnthropomorphicMeshBuilder>(scene_manager_);
+
     build_camera();
     build_grid();
     build_combat_batches();
     telegraphs_ = std::make_unique<TelegraphRenderer>(scene_manager_);
 
-    Ogre::Entity* player = scene_manager_->createEntity("haven/player_square");
-    player->setMaterialName("haven/player", kResourceGroup);
-    local_player_node_ = scene_manager_->getRootSceneNode()->createChildSceneNode("haven/local_player");
-    local_player_node_->attachObject(player);
-    local_player_node_->setPosition(0.0f, 0.0f, 0.0f);
+    // The local player's cel-shaded view is built on the first
+    // set_local_player call, once the race is known; the node exists now so
+    // the position can be set before the body exists.
+    local_player_.node = scene_manager_->getRootSceneNode()->createChildSceneNode("haven/local_player");
+    local_player_.node->setPosition(0.0f, 0.0f, 0.0f);
 }
 
 void HavenRenderer::build_camera()
@@ -239,6 +254,12 @@ void HavenRenderer::build_grid()
 /// Uploads into a Manual Object through the same immediate-mode sink the
 /// geometry builders write to, so the batch path and the tested builders are
 /// one code path. Vertices carry no colour: the material owns it.
+///
+/// For the pools whose material is the cel-shaded toon shader (enemy bodies,
+/// projectiles and gems) the sink bakes a fake radial normal per vertex,
+/// domed from the item's position, which is what the toon shader quantises
+/// into bands. The flat pools keep the plain (0,0,1) normal their materials
+/// have always used, so their rendering is unchanged.
 class ManualPrimitiveSink : public PrimitiveSink {
 public:
     explicit ManualPrimitiveSink(Ogre::ManualObject& object) : object_(object) {}
@@ -248,7 +269,18 @@ public:
     void vertex(float x, float y, float z) override
     {
         object_.position(x, y, z);
-        object_.normal(0.0f, 0.0f, 1.0f);
+        if (toon_)
+        {
+            const float dx = x - origin_.x;
+            const float dy = y - origin_.y;
+            const float nz = radius_ * 0.9f;
+            const float inv = 1.0f / std::sqrt(dx * dx + dy * dy + nz * nz);
+            object_.normal(dx * inv, dy * inv, nz * inv);
+        }
+        else
+        {
+            object_.normal(0.0f, 0.0f, 1.0f);
+        }
         ++vertex_count_;
     }
 
@@ -256,9 +288,23 @@ public:
 
     void reset() { vertex_count_ = 0; }
 
+    /// True for the cel-shaded pools, false for the flat ones.
+    void set_toon(bool toon) { toon_ = toon; }
+
+    /// The shape's centre and radius, set per item, so each archetype, gem
+    /// and projectile domes the right way.
+    void set_shape(Vec2 origin, float radius)
+    {
+        origin_ = origin;
+        radius_ = radius;
+    }
+
 private:
     Ogre::ManualObject& object_;
     uint32_t vertex_count_ = 0;
+    bool toon_ = false;
+    Vec2 origin_{0.0f, 0.0f};
+    float radius_ = 1.0f;
 };
 
 /// Emits the geometry for one entity into one pool.
@@ -374,7 +420,18 @@ void HavenRenderer::create_slot(const ColourSlot& slot)
 
     const std::string name = "haven/slot_" + std::to_string(static_cast<int>(slot.pool)) + "_" +
                              std::to_string(static_cast<int>(slot.slot));
-    Ogre::MaterialPtr material = meshes_->flat_material(name, colour(slot_colour(slot)));
+
+    // The enemy bodies, projectiles and gems get the cel-shaded toon
+    // material; the bar, elite-outline and telegraph pools are arena-floor
+    // and HUD-style elements and stay flat. When the shaders failed to
+    // compile, every pool falls back to a flat material.
+    const bool toon = cel_ready_ && (slot.pool == ColourPool::EnemyBody || slot.pool == ColourPool::Projectile ||
+                                     slot.pool == ColourPool::Gem);
+    Ogre::MaterialPtr material;
+    if (toon)
+        material = cel_generator_->batch_material(name, colour(slot_colour(slot)));
+    else
+        material = meshes_->flat_material(name, colour(slot_colour(slot)));
 
     uint32_t verts = 0;
     uint32_t indices = 0;
@@ -521,25 +578,44 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items, ui
 
             object->beginUpdate(batch.section);
             ManualPrimitiveSink sink(*object);
+            const bool toon = cel_ready_ && (colour_pool == ColourPool::EnemyBody ||
+                                             colour_pool == ColourPool::Projectile || colour_pool == ColourPool::Gem);
+            sink.set_toon(toon);
             if (colour_pool == ColourPool::EliteOutline)
             {
                 for (const EntityDrawItem* item : slot_items_[slot_index(key)])
+                {
+                    sink.set_shape(item->pos, enemy_radius(item->style));
                     append_elite_ring(sink, *item, slot);
+                }
             }
             else if (colour_pool == ColourPool::BossTelegraph)
             {
                 for (const EntityDrawItem* item : slot_items_[slot_index(key)])
+                {
+                    sink.set_shape(item->pos, enemy_radius(item->style));
                     append_boss_telegraph(sink, *item);
+                }
             }
             else if (colour_pool == ColourPool::EnemyBar && slot == 0)
             {
                 for (const EntityDrawItem* item : slot_items_[slot_index(key)])
+                {
+                    sink.set_shape(item->pos, 1.0f);
                     append_bar_background(sink, *item);
+                }
             }
             else
             {
                 for (const EntityDrawItem* item : slot_items_[slot_index(key)])
+                {
+                    float radius = 1.0f;
+                    if (colour_pool == ColourPool::EnemyBody) radius = enemy_radius(item->style);
+                    else if (colour_pool == ColourPool::Gem) radius = gem_radius(item->style);
+                    else if (colour_pool == ColourPool::Projectile) radius = weapon_visual(item->style).radius;
+                    sink.set_shape(item->pos, radius);
                     append_to_pool(colour_pool, sink, *item);
+                }
             }
             object->end();
             any = true;
@@ -614,39 +690,173 @@ void HavenRenderer::follow_camera(const Vec2& pos)
     if (camera_node_ != nullptr) camera_node_->setPosition(pos.x, pos.y, kCameraZ);
 }
 
-void HavenRenderer::set_local_player(const Vec2& pos)
+void HavenRenderer::set_local_player(const Vec2& pos, float angle, uint8_t race_id)
 {
-    if (local_player_node_ != nullptr) local_player_node_->setPosition(pos.x, pos.y, 0.0f);
+    if (local_player_.node == nullptr) return;
+    ensure_player(local_player_, "haven/local_player", race_id);
+    position_player(local_player_, pos, angle);
+    update_cape(local_player_, pos);
 }
 
-void HavenRenderer::set_remote_player(uint8_t player_id, const Vec2& pos)
+void HavenRenderer::set_remote_player(uint8_t player_id, const Vec2& pos, float angle, uint8_t race_id)
 {
     auto it = remote_players_.find(player_id);
     if (it == remote_players_.end())
     {
-        Ogre::Entity* entity = scene_manager_->createEntity("haven/remote_player_" + std::to_string(player_id),
-                                                            "haven/player_square", kResourceGroup);
-        entity->setMaterialName("haven/remote_player", kResourceGroup);
-        Ogre::SceneNode* node = scene_manager_->getRootSceneNode()->createChildSceneNode();
-        node->attachObject(entity);
-        it = remote_players_.emplace(player_id, node).first;
+        PlayerView view;
+        view.node =
+            scene_manager_->getRootSceneNode()->createChildSceneNode("haven/remote_player_node_" + std::to_string(player_id));
+        it = remote_players_.emplace(player_id, view).first;
     }
-    it->second->setPosition(pos.x, pos.y, -0.01f);
+    ensure_player(it->second, "haven/remote_player_" + std::to_string(player_id), race_id);
+    position_player(it->second, pos, angle);
+    update_cape(it->second, pos);
 }
 
 void HavenRenderer::remove_player(uint8_t player_id)
 {
     auto it = remote_players_.find(player_id);
     if (it == remote_players_.end()) return;
-    scene_manager_->destroySceneNode(it->second);
+    PlayerView& view = it->second;
+    if (view.body != nullptr)
+    {
+        view.node->detachObject(view.body);
+        scene_manager_->destroyEntity(view.body);
+    }
+    if (view.cape != nullptr)
+    {
+        view.cape_node->detachObject(view.cape);
+        scene_manager_->destroyEntity(view.cape);
+    }
+    if (view.cape_node != nullptr)
+    {
+        view.node->removeChild(view.cape_node);
+        scene_manager_->destroySceneNode(view.cape_node);
+    }
+    scene_manager_->destroySceneNode(view.node);
     remote_players_.erase(it);
 }
 
 void HavenRenderer::clear_remote_players()
 {
     for (auto& entry : remote_players_)
-        scene_manager_->destroySceneNode(entry.second);
+    {
+        PlayerView& view = entry.second;
+        if (view.body != nullptr)
+        {
+            view.node->detachObject(view.body);
+            scene_manager_->destroyEntity(view.body);
+        }
+        if (view.cape != nullptr)
+        {
+            view.cape_node->detachObject(view.cape);
+            scene_manager_->destroyEntity(view.cape);
+        }
+        if (view.cape_node != nullptr)
+        {
+            view.node->removeChild(view.cape_node);
+            scene_manager_->destroySceneNode(view.cape_node);
+        }
+        scene_manager_->destroySceneNode(view.node);
+    }
     remote_players_.clear();
+}
+
+Ogre::MaterialPtr HavenRenderer::body_material()
+{
+    if (body_material_.isNull())
+    {
+        if (cel_ready_)
+            body_material_ = cel_generator_->cel_material("haven/player_body_mat", Ogre::ColourValue::White, kInkNormal);
+        else
+            body_material_ = meshes_->flat_material("haven/player_body_flat", colour(0.30f, 0.85f, 0.45f));
+    }
+    return body_material_;
+}
+
+Ogre::MaterialPtr HavenRenderer::cape_material(uint8_t race_id)
+{
+    auto it = cape_materials_.find(race_id);
+    if (it != cape_materials_.end()) return it->second;
+    const Ogre::ColourValue accent = AnthropomorphicMeshBuilder::race_accent_colour(race_id);
+    Ogre::MaterialPtr material;
+    if (cel_ready_)
+        material = cel_generator_->cel_material("haven/player_cape_mat_" + std::to_string(race_id), accent, kInkNormal);
+    else
+        material = meshes_->flat_material("haven/player_cape_flat_" + std::to_string(race_id), accent);
+    cape_materials_.emplace(race_id, material);
+    return material;
+}
+
+HavenRenderer::PlayerView& HavenRenderer::ensure_player(PlayerView& view, const std::string& name, uint8_t race_id)
+{
+    if (view.body != nullptr && view.race_id == race_id) return view;
+
+    // Tear down a view that was built for a different race.
+    if (view.body != nullptr)
+    {
+        view.node->detachObject(view.body);
+        scene_manager_->destroyEntity(view.body);
+        view.body = nullptr;
+    }
+    if (view.cape != nullptr)
+    {
+        view.cape_node->detachObject(view.cape);
+        scene_manager_->destroyEntity(view.cape);
+        view.cape = nullptr;
+    }
+    if (view.cape_node != nullptr)
+    {
+        view.node->removeChild(view.cape_node);
+        scene_manager_->destroySceneNode(view.cape_node);
+        view.cape_node = nullptr;
+    }
+
+    Ogre::MeshPtr body_mesh = cel_ready_ ? race_meshes_->body_mesh_for_race(race_id)
+                                          : Ogre::MeshManager::getSingleton().getByName("haven/player_square", kResourceGroup);
+    view.body = scene_manager_->createEntity(name + "_body", body_mesh->getName(), kResourceGroup);
+    view.body->setMaterialName(body_material()->getName(), kResourceGroup);
+    view.node->attachObject(view.body);
+
+    if (cel_ready_)
+    {
+        Ogre::MeshPtr cape_mesh = race_meshes_->cape_mesh_for_race(race_id);
+        view.cape_node = view.node->createChildSceneNode(name + "_cape_node");
+        view.cape = scene_manager_->createEntity(name + "_cape", cape_mesh->getName(), kResourceGroup);
+        view.cape->setMaterialName(cape_material(race_id)->getName(), kResourceGroup);
+        view.cape_node->attachObject(view.cape);
+    }
+
+    view.race_id = race_id;
+    return view;
+}
+
+void HavenRenderer::position_player(PlayerView& view, const Vec2& pos, float angle)
+{
+    view.facing = angle;
+    view.node->setPosition(pos.x, pos.y, 0.0f);
+    view.node->setOrientation(Ogre::Quaternion(Ogre::Radian(angle), Ogre::Vector3::UNIT_Z));
+}
+
+void HavenRenderer::update_cape(PlayerView& view, const Vec2& pos)
+{
+    if (view.cape_node == nullptr) return;
+    // The cape trails behind the velocity vector: its world direction is the
+    // velocity direction plus pi, so its local rotation relative to the
+    // facing node is (velocity angle - facing). When the player is stationary
+    // the last angle is kept, so the cape does not snap to a default.
+    if (view.pos_valid)
+    {
+        const Vec2 delta = pos - view.last_pos;
+        if (length(delta) > 0.03f)
+        {
+            const float velocity_angle = std::atan2(delta.y, delta.x);
+            view.cape_angle = velocity_angle - view.facing;
+        }
+    }
+    view.last_pos = pos;
+    view.pos_valid = true;
+    view.cape_node->setOrientation(Ogre::Quaternion(Ogre::Radian(view.cape_angle), Ogre::Vector3::UNIT_Z));
 }
 
 void HavenRenderer::capture_framebuffer(const std::string& path) const
