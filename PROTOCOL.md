@@ -216,19 +216,34 @@ changes position every tick, so a mask would cost a byte to save nothing.
 
 ### Baseline rules
 
-The client holds exactly one complete state: the one it last acknowledged with
-`C2S_ACK_SNAPSHOT`. A delta is applied on top of that state and must carry
-`baseline_tick` equal to it.
+A client holds exactly one complete state: the one it last acknowledged with
+`C2S_ACK_SNAPSHOT`. Every delta must be applied on top of that state, and must
+carry `baseline_tick` equal to it.
 
-- The server sends `S2C_SNAPSHOT_FULL` when the client has no acknowledged
-  baseline, or when the requested baseline has fallen out of the server's
-  32-snapshot history ring (1.6 s).
-- Otherwise it sends a delta against the acknowledged tick.
-- A client that receives a delta whose `baseline_tick` is not the tick it
-  holds **must not apply it**; it should keep sending `C2S_ACK_SNAPSHOT` for
-  the state it does hold, and the server will answer with a full snapshot.
-- `S2C_SNAPSHOT_FULL` also carries `baseline_tick = 0`, which is never a valid
-  delta baseline, so the two are never ambiguous.
+- The server sends `S2C_SNAPSHOT_FULL` when it has no usable model of what the
+  client holds, or when that tick has fallen out of its 32-snapshot history
+  ring (1.6 s).
+- Otherwise it sends a delta against **its model of the client's held tick**,
+  not against the raw last acknowledgement. The model advances to a snapshot's
+  own tick when that snapshot is sent, because a client that applies a delta
+  moves its held state onto it; an acknowledgement corrects the model when it
+  disagrees. This exists because an acknowledgement is causally triggered by
+  the very broadcast it would have to beat — a client's socket thread flushes
+  on its own `select` timeout, which coincides with the snapshot period — so a
+  strictly acknowledgement-driven baseline is always one broadcast stale and
+  the client refuses roughly half the deltas.
+- A client that receives a delta whose `baseline_tick` is not the tick it holds
+  **must not apply it, and must not let it advance any run state** — not the
+  HUD clock, not the game-state gating, not prediction. It re-acknowledges the
+  tick it does hold. A repeated acknowledgement that disagrees with the
+  server's model corrects the model, which is what stops a drifted model from
+  refusing forever.
+- `S2C_SNAPSHOT_FULL` carries `baseline_tick = 0`, which is never a valid delta
+  baseline, so the two are never ambiguous. A full snapshot replaces the held
+  state outright.
+- `C2S_RESTART` forgets the model on both sides: the new run's tick returns to
+  zero, and a coinciding tick would otherwise diff the new run against the old
+  one.
 
 ### Interest management
 
