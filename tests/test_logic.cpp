@@ -106,7 +106,7 @@ void test_angle_quantisation()
 void test_hello_packet()
 {
     std::printf("C2S_HELLO\n");
-    std::vector<uint8_t> packet = haven::encode_hello(3, 2, "haven");
+    std::vector<uint8_t> packet = haven::encode_hello(0x1122334455667788ULL, 3, 2, "haven");
     // proto_ver(1) + race_id(1) + starting_weapon_id(1) + reserved(1) + name(16) = 20.
     expect(packet.size() == haven::kHeaderSize + 20, "hello is 7 byte header + 20 byte payload");
 
