@@ -1,5 +1,7 @@
 #include "renderer.h"
 
+#include "render/TelegraphRenderer.h"
+
 #include <OgreEntity.h>
 #include <OgreGpuProgramManager.h>
 #include <OgreHardwareBuffer.h>
@@ -171,6 +173,7 @@ void HavenRenderer::build_scene()
     build_camera();
     build_grid();
     build_combat_batches();
+    telegraphs_ = std::make_unique<TelegraphRenderer>(scene_manager_);
 
     Ogre::Entity* player = scene_manager_->createEntity("haven/player_square");
     player->setMaterialName("haven/player", kResourceGroup);
@@ -548,23 +551,30 @@ void HavenRenderer::render_entities(const std::vector<EntityDrawItem>& items, ui
         // slot in it produced anything this frame.
         object->setVisible(any);
     }
+
+    // The windup warnings under the enemies: one pooled shape per enemy whose
+    // telegraph progress is above zero.
+    if (telegraphs_ != nullptr) telegraphs_->render(items);
 }
 
-void HavenRenderer::attach_input(InputState* input)
+void HavenRenderer::attach_input(InputManager* input)
 {
     input_ = input;
+    // The renderer is the listener: OgreBites delivers the window's keyboard
+    // events here and each is forwarded into the manager, which merges it with
+    // the gamepad and keeps the wrapped InputState.
     addInputListener(this);
 }
 
 bool HavenRenderer::keyPressed(const OgreBites::KeyboardEvent& evt)
 {
-    if (input_ != nullptr) input_->key_down(evt.keysym.sym);
+    if (input_ != nullptr) input_->keyPressed(evt.keysym.sym);
     return false;
 }
 
 bool HavenRenderer::keyReleased(const OgreBites::KeyboardEvent& evt)
 {
-    if (input_ != nullptr) input_->key_up(evt.keysym.sym);
+    if (input_ != nullptr) input_->keyReleased(evt.keysym.sym);
     return false;
 }
 
@@ -586,6 +596,17 @@ bool HavenRenderer::frameRenderingQueued(const Ogre::FrameEvent& evt)
 
     if (tick_) tick_(evt.timeSinceLastFrame);
     return true;
+}
+
+void HavenRenderer::shutdown()
+{
+    // The telegraph shapes are scene objects; they must go before closeApp()
+    // tears the scene manager down, the same way hud.shutdown() goes first.
+    if (telegraphs_ != nullptr)
+    {
+        telegraphs_->shutdown();
+        telegraphs_.reset();
+    }
 }
 
 void HavenRenderer::follow_camera(const Vec2& pos)

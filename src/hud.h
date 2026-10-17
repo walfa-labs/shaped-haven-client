@@ -3,6 +3,7 @@
 #include "entity_frame.h"
 #include "game_math.h"
 #include "item_catalog.h"
+#include "levelup_format.h"
 #include "protocol.h"
 
 #include <OgreManualObject.h>
@@ -101,6 +102,14 @@ public:
     /// Advances the banner countdown; call once per rendered frame.
     void tick(float dt_seconds);
 
+    /// The level-up card's stat comparison: delegates to the Ogre-free
+    /// haven::format_stat_delta (levelup_format.h), which is unit-tested
+    /// without a renderer.
+    static std::string format_stat_delta(uint8_t stat_type, int16_t current_stat_fp, int16_t upgraded_stat_fp)
+    {
+        return haven::format_stat_delta(stat_type, current_stat_fp, upgraded_stat_fp);
+    }
+
 private:
     struct TextLine {
         std::string text;
@@ -192,6 +201,11 @@ private:
     TextLayer* tray_text_ = nullptr;    // weapon/passive names
     TextLayer* modal_title_ = nullptr;  // "LEVEL UP!" header
     std::array<TextLayer*, 3> modal_cards_{};
+    /// The stat comparison line each card carries ("12 ATK -> 15 ATK"). Own
+    /// layer per card rather than a line inside the card's layer: the card
+    /// layer keeps the section count it was laid out with, and the stat is
+    /// the one line whose presence varies per offer.
+    std::array<TextLayer*, 3> modal_stats_{};
     TextLayer* modal_footer_ = nullptr;
     TextLayer* score_title_ = nullptr;
     TextLayer* score_lines_ = nullptr;

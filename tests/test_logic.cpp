@@ -9,9 +9,11 @@
 #include "game_math.h"
 #include "hud_model.h"
 #include "hud_text.h"
+#include "input/InputManager.h"
 #include "input_state.h"
 #include "interpolation.h"
 #include "item_catalog.h"
+#include "levelup_format.h"
 #include "prediction.h"
 #include "protocol.h"
 #include "run_events.h"
@@ -1852,6 +1854,161 @@ void test_input_state()
     expect(!input.quit_requested(), "consume_quit clears the flag");
 }
 
+void test_levelup_format()
+{
+    std::printf("levelup format\n");
+    using haven::StatType;
+    auto fmt = haven::format_stat_delta;
+
+    // Damage from a weapon level: absolute ATK with the relative gain. The
+    // damage table's values are integers, so 1200 fp reads as 12 ATK.
+    expect(fmt(static_cast<uint8_t>(StatType::Damage), 1200, 1500) == "12 ATK -> 15 ATK (+25%)",
+           "a weapon level shows the ATK gain");
+    expect(fmt(static_cast<uint8_t>(StatType::Damage), 0, 1200) == "0 ATK -> 12 ATK",
+           "a new weapon shows no percentage");
+    expect(fmt(static_cast<uint8_t>(StatType::Damage), 9000, 6500) == "90 ATK -> 65 ATK (-28%)",
+           "an evolution's damage drop reads as ATK");
+
+    // Damage from the damage passive and the Overclock fallback reports the
+    // same stat type as a multiplier: 10 fp reads as +10%.
+    expect(fmt(static_cast<uint8_t>(StatType::Damage), 0, 10) == "1.00x -> 1.10x (+10%) damage",
+           "new spinach core shows the damage multiplier");
+    expect(fmt(static_cast<uint8_t>(StatType::Damage), 10, 20) == "1.10x -> 1.20x (+9%) damage",
+           "a levelled spinach core accumulates");
+    expect(fmt(static_cast<uint8_t>(StatType::Damage), 100, 102) == "1.00x -> 1.02x (+2%) damage",
+           "the overclock damage bonus reads the multiplier outright");
+
+    // Armor: flat points with the flat delta (Titanium Plating: 300 fp a level).
+    expect(fmt(static_cast<uint8_t>(StatType::Armor), 300, 600) == "3 Armor -> 6 Armor (+3)",
+           "armor shows the flat gain");
+    expect(fmt(static_cast<uint8_t>(StatType::Armor), 0, 300) == "0 Armor -> 3 Armor (+3)",
+           "new armor shows the flat gain from zero");
+
+    // Max HP: flat points with the flat delta (Overclock: 2500 fp a level).
+    expect(fmt(static_cast<uint8_t>(StatType::MaxHP), 10000, 12500) == "100 HP -> 125 HP (+25)",
+           "max HP shows the flat gain");
+    expect(fmt(static_cast<uint8_t>(StatType::MaxHP), 0, 2500) == "0 HP -> 25 HP (+25)",
+           "the overclock HP bonus shows the flat gain from zero");
+
+    // Move speed: a multiplier; the fixed-point pair is the accumulated bonus,
+    // so Thruster Boots' 8 fp per level reads as 1.08x.
+    expect(fmt(static_cast<uint8_t>(StatType::MoveSpeed), 0, 8) == "1.00x -> 1.08x (+8%)",
+           "thruster boots show the speed gain");
+    expect(fmt(static_cast<uint8_t>(StatType::MoveSpeed), 24, 32) == "1.24x -> 1.32x (+6%)",
+           "a levelled passive shows the new multiplier");
+
+    // Area: the same multiplier form (Amplifier Lens: 12 fp per level).
+    expect(fmt(static_cast<uint8_t>(StatType::Area), 0, 12) == "1.00x -> 1.12x (+12%)",
+           "amplifier lens shows the area gain");
+
+    // Cooldown: the one passive reports the accumulated delta from a 1.0x
+    // base, so -8 reads as 0.92x.
+    expect(fmt(static_cast<uint8_t>(StatType::Cooldown), 0, -8) == "1.00x CD -> 0.92x CD (-8%)",
+           "new clockwork gear shows the cooldown cut");
+    expect(fmt(static_cast<uint8_t>(StatType::Cooldown), -16, -24) == "0.84x CD -> 0.76x CD (-10%)",
+           "a levelled clockwork gear shows the accumulated multipliers");
+    // The overclock fallback reports the multiplier itself: 100 fp is 1.00x.
+    expect(fmt(static_cast<uint8_t>(StatType::Cooldown), 100, 98) == "1.00x CD -> 0.98x CD (-2%)",
+           "the overclock cooldown reads the multiplier outright");
+
+    // Projectiles: a flat count (Prism Splitter: 100 fp a level).
+    expect(fmt(static_cast<uint8_t>(StatType::Projectiles), 0, 100) == "0 -> 1 projectiles",
+           "prism splitter's first level adds one projectile");
+    expect(fmt(static_cast<uint8_t>(StatType::Projectiles), 100, 200) == "1 -> 2 projectiles",
+           "the second level adds another");
+
+    // Crit chance: a percentage.
+    expect(fmt(static_cast<uint8_t>(StatType::CritChance), 500, 1000) == "5% -> 10% crit",
+           "crit chance shows the percentage");
+
+    // Max mana and max shield: flat points.
+    expect(fmt(static_cast<uint8_t>(StatType::MaxMana), 10000, 15000) == "100 -> 150 mana",
+           "max mana shows the flat gain");
+    expect(fmt(static_cast<uint8_t>(StatType::MaxShield), 0, 2500) == "0 -> 25 shield",
+           "max shield shows the flat gain");
+
+    // An option with no wire stat slot shows nothing.
+    expect(fmt(static_cast<uint8_t>(StatType::Damage), 0, 0).empty(), "a zeroed pair formats to nothing");
+    expect(fmt(4, 0, 0).empty(), "an unmapped passive formats to nothing");
+
+    // A stat type this client does not know degrades to the raw numbers.
+    expect(fmt(99, 1200, 1500) == "12 -> 15", "an unknown stat type still shows the numbers");
+
+    // Fractional values keep at most two decimals.
+    expect(fmt(static_cast<uint8_t>(StatType::Damage), 1250, 1500) == "12.5 ATK -> 15 ATK (+20%)",
+           "a fractional damage value prints trimmed");
+}
+
+void test_input_manager()
+{
+    std::printf("input manager\n");
+    haven::InputManager input;
+
+    auto press = [&input](int code) { input.keyPressed(code); };
+    auto release = [&input](int code) { input.keyReleased(code); };
+
+    // The manager is an OgreBites listener whose keyboard events land in the
+    // wrapped InputState, so the menu surface reads them there.
+    press(haven::InputState::kKeyD);
+    expect(input.held(haven::InputState::kKeyD), "keyPressed forwards to the wrapped state");
+    expect_vec(input.move_vector(), {1.0f, 0.0f}, 0.0f, "D moves right through the manager");
+    release(haven::InputState::kKeyD);
+    expect(!input.held(haven::InputState::kKeyD), "keyReleased forwards to the wrapped state");
+    expect_vec(input.move_vector(), {0.0f, 0.0f}, 0.0f, "an idle frame is still idle");
+
+    // The unified accessors answer the keyboard when no gamepad is attached.
+    press(haven::InputState::kKeyUp);
+    expect(input.ui_up(), "ui_up answers the up arrow");
+    expect(!input.ui_down(), "ui_down ignores the up arrow");
+    release(haven::InputState::kKeyUp);
+    press(haven::InputState::kKeyW);
+    expect_vec(input.move_vector(), {0.0f, 1.0f}, 0.0f, "W still moves up with the stick absent");
+    release(haven::InputState::kKeyW);
+
+    press(haven::InputState::kKeyEnter);
+    expect(input.ui_confirm(), "ui_confirm answers Enter");
+    release(haven::InputState::kKeyEnter);
+    press(haven::InputState::kKeyEscape);
+    expect(input.ui_cancel(), "ui_cancel answers Escape");
+    release(haven::InputState::kKeyEscape);
+
+    // Dash is Shift (or a shoulder/B button on the pad), edge-detected once
+    // per rendered frame by update(): a press is one dash, a hold repeats
+    // nothing, and a release-then-press is another.
+    expect(!input.dash_pressed(), "no dash before Shift is held");
+    press(haven::InputManager::kKeyShiftLeft);
+    input.update(1.0f / 60.0f);
+    expect(input.dash_pressed(), "Shift's first frame is the dash");
+    expect(!input.dash_pressed(), "holding Shift does not repeat the dash");
+    release(haven::InputManager::kKeyShiftLeft);
+    input.update(1.0f / 60.0f);
+    expect(!input.dash_pressed(), "the release is observed");
+    press(haven::InputManager::kKeyShiftLeft);
+    input.update(1.0f / 60.0f);
+    expect(input.dash_pressed(), "a second Shift press dashes again");
+    release(haven::InputManager::kKeyShiftLeft);
+
+    // Restart is R, consumed on read.
+    expect(!input.restart_pressed(), "no restart before R is pressed");
+    press(haven::InputState::kKeyR);
+    expect(input.restart_pressed(), "R is a restart");
+    expect(!input.restart_pressed(), "a restart is one-shot");
+
+    // The scripted keyboard surface is untouched by the wrapper.
+    press('1');
+    expect(input.pending_choice() == 0, "the level-up choice keys still arrive");
+    input.consume_choice();
+    press('2');
+    expect(input.pending_choice() == 1, "a second choice key is pending");
+    input.consume_choice();
+
+    // The gamepad is absent on a machine with none attached; every accessor
+    // has to stay on the keyboard then, which is what the checks above ran.
+    expect(!input.controller_attached(), "no controller is attached");
+    input.update(1.0f / 60.0f);
+    expect_vec(input.move_vector(), {0.0f, 0.0f}, 0.0f, "update() with no gamepad changes nothing");
+}
+
 void test_input_script()
 {
     std::printf("input script\n");
@@ -2853,6 +3010,8 @@ int main()
     test_reconcile_repeats_identical_acks();
     test_reconcile_tolerates_a_stale_ack();
     test_input_state();
+    test_input_manager();
+    test_levelup_format();
     test_input_script();
     test_choice_input();
     test_character_catalog();

@@ -28,7 +28,7 @@ const PlayerNet* find_self_in(const std::vector<PlayerNet>& players, uint8_t pla
 
 }  // namespace
 
-GameSession::GameSession(HavenRenderer& renderer, ITransport& net, InputState& input, Hud& hud)
+GameSession::GameSession(HavenRenderer& renderer, ITransport& net, InputManager& input, Hud& hud)
     : renderer_(renderer), net_(net), input_(input), hud_(hud)
 {
     // Stable per-process token; phase 1 never reconnects with it.
@@ -397,7 +397,10 @@ void GameSession::report_script_mismatch(const char* event, const char* marker)
 void GameSession::maybe_restart()
 {
     bool script_mismatch = false;
-    const bool queued = restart_gate_.take(input_, script_mismatch);
+    // The gate reads the keyboard side of the manager: the R key and the
+    // choice script are InputState's, and the gamepad's Start button reaches
+    // it as a request on the same wrapped state (InputManager::update).
+    const bool queued = restart_gate_.take(input_.keyboard(), script_mismatch);
     if (script_mismatch) report_script_mismatch("the game over", "choice");
     if (!queued) return;
 
