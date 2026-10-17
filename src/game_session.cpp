@@ -47,7 +47,12 @@ bool GameSession::connect(const std::string& host, uint16_t port, const std::str
 
     const std::vector<uint8_t> hello = encode_hello(0, 0, name);
     if (!net_.sendPacket(hello.data(), hello.size()))
-        std::fprintf(stderr, "haven: could not queue C2S_HELLO\n");
+    {
+        std::fprintf(stderr, "haven: could not send C2S_HELLO\n");
+        if (outError != nullptr) *outError = "failed to send initial handshake";
+        net_.disconnect();
+        return false;
+    }
     std::printf("haven: connected to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
     return true;
 }
