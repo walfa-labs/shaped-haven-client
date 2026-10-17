@@ -247,6 +247,13 @@ private:
     /// this player.
     Vitals self_vitals_;
 
+    /// The race the run was started with, from C2S_HELLO. Picks the
+    /// cel-shaded silhouette the renderer draws for the local player.
+    uint8_t race_id_ = 0;
+    /// The local player's facing in radians, following the last non-zero move
+    /// vector, so the character mesh turns the way it is moving.
+    float local_facing_ = 0.0f;
+
     float accumulator_ = 0.0f;
     uint64_t session_token_ = 0;
     uint32_t client_tick_ = 0;

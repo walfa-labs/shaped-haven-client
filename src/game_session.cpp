@@ -1,5 +1,6 @@
 #include "game_session.h"
 
+#include "character_catalog.h"
 #include "protocol.h"
 #include "run_events.h"
 
@@ -35,7 +36,8 @@ GameSession::GameSession(HavenRenderer& renderer, ITransport& net, InputManager&
     session_token_ = 0x53484156454E31ULL;
 }
 
-bool GameSession::connect(const std::string& host, uint16_t port, const std::string& name, std::string* outError)
+bool GameSession::connect(const std::string& host, uint16_t port, const std::string& name, uint8_t race_id,
+                          uint8_t starting_weapon_id, std::string* outError)
 {
     std::string error;
     if (!net_.connect(host, port, error))
@@ -45,7 +47,11 @@ bool GameSession::connect(const std::string& host, uint16_t port, const std::str
         return false;
     }
 
-    const std::vector<uint8_t> hello = encode_hello(0, 0, name);
+    // The two ids the character select produced are what the server keys the
+    // run's stat row and its starting weapon on, so they travel in the
+    // handshake rather than being left at the defaults.
+    race_id_ = race_id;
+    const std::vector<uint8_t> hello = encode_hello(race_id, starting_weapon_id, name);
     if (!net_.sendPacket(hello.data(), hello.size()))
     {
         std::fprintf(stderr, "haven: could not send C2S_HELLO\n");
@@ -53,7 +59,9 @@ bool GameSession::connect(const std::string& host, uint16_t port, const std::str
         net_.disconnect();
         return false;
     }
-    std::printf("haven: connected to %s:%u\n", host.c_str(), static_cast<unsigned>(port));
+    std::printf("haven: connected to %s:%u as %s (race %u, weapon %u)\n", host.c_str(),
+                static_cast<unsigned>(port), name.c_str(), static_cast<unsigned>(race_id),
+                static_cast<unsigned>(starting_weapon_id));
     return true;
 }
 
@@ -107,11 +115,22 @@ void GameSession::update(float dt_seconds)
     // continuous between snapshot arrivals.
     interpolation_.advance(dt_seconds);
 
-    renderer_.set_local_player(predictor_.position());
+    renderer_.set_local_player(predictor_.position(), local_facing_, race_id_);
     update_entities();
     renderer_.follow_camera(predictor_.position());
+
+    // A dash the player asked for but cannot pay for is answered on the HUD.
+    // The server owns whether the dash actually happens; the client only
+    // reports the attempt it could not afford. The edge is consumed either way,
+    // so a press made during a pause cannot fire later.
+    const bool dash_attempted = input_.dash_pressed();
+    if (run_state_ == RunState::Running && dash_attempted && !dash_affordable())
+        hud_.signal_dash_denied();
+
+    // The HUD's per-frame clock is advanced by the render loop in main.cpp, not
+    // here. Ticking it from both would run the health ghost bar's 450 ms hold and
+    // the banner countdown at twice the rate they are specified at.
     hud_.set_run_time(ingest_.run_time_ms());
-    hud_.tick(dt_seconds);
 
     const float elapsed_ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() -
                                                                        update_started)
@@ -149,6 +168,10 @@ void GameSession::step_fixed()
     const Vec2 move = input_.move_vector();
     stats_.last_move = move;
 
+    // The character mesh faces the way it is moving; a stationary player
+    // keeps the last facing rather than snapping back to a default.
+    if (length(move) > 1e-3f) local_facing_ = std::atan2(move.y, move.x);
+
     // Reserve the sequence number the predictor is about to use, so the packet
     // describes exactly the step that is about to be taken.
     const uint32_t seq = predictor_.next_seq();
@@ -171,7 +194,7 @@ void GameSession::step_fixed()
     }
 
     predictor_.step(move);
-    renderer_.set_local_player(predictor_.position());
+    renderer_.set_local_player(predictor_.position(), local_facing_, race_id_);
     ++stats_.inputs_sent;
     ++client_tick_;
 }
@@ -423,6 +446,7 @@ void GameSession::maybe_restart()
     // tick counter, so the old run's baseline tick names nothing in the new
     // run, and the new run's first snapshot is a full one.
     snapshot_state_.reset();
+    self_vitals_ = Vitals{};
     renderer_.clear_remote_players();
     hud_.reset();
     evolution_watch_.reset();
@@ -620,6 +644,7 @@ void GameSession::update_entities()
     present_remotes_.clear();
     combat_items_.clear();
     combat_items_.reserve(draw_items_.size());
+    const EntityDrawItem* self = nullptr;
     for (const EntityDrawItem& item : draw_items_)
     {
         if (item.kind != EntityKind::Player)
@@ -628,9 +653,21 @@ void GameSession::update_entities()
             continue;
         }
         const uint32_t id = key_raw_id(item.key);
-        if (id == stats_.player_id) continue;
+        if (id == stats_.player_id)
+        {
+            // The local player is not drawn, but its record is what the HUD's
+            // health, shield and mana bars are built from.
+            self = &item;
+            continue;
+        }
         present_remotes_.insert(id);
-        renderer_.set_remote_player(static_cast<uint8_t>(id), item.pos);
+        renderer_.set_remote_player(static_cast<uint8_t>(id), item.pos, item.angle, item.race_id);
+    }
+
+    if (self != nullptr)
+    {
+        self_vitals_ = vitals_from_player(*self);
+        hud_.set_vitals(self_vitals_);
     }
 
     for (uint32_t id : known_remotes_)
@@ -652,6 +689,13 @@ void GameSession::update_entities()
     stats_.projectile_count = projectiles;
     stats_.gem_count = gems;
     stats_.remote_player_count = known_remotes_.size();
+}
+
+bool GameSession::dash_affordable() const
+{
+    if (!self_vitals_.reported) return true;
+    const RaceInfo& race = race_info(self_vitals_.race_id);
+    return haven::dash_affordable(self_vitals_, race.max_mana, race.dash_mana_cost);
 }
 
 void GameSession::shutdown()

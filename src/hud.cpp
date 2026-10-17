@@ -5,6 +5,8 @@
 #include "levelup_format.h"
 #include "hud_text.h"
 #include "mesh_factory.h"
+#include "render/AnthropomorphicMeshBuilder.h"
+#include "render/CelShaderGenerator.h"
 
 #include <OgreAxisAlignedBox.h>
 #include <OgreEntity.h>
@@ -196,6 +198,16 @@ static_assert(kSelectRaceBottom > kSelectWeaponY + kSelectWeaponHalfH,
 static_assert(kSelectWeaponY - kSelectWeaponHalfH > kSelectStartY + 1.5f, "the weapon row runs into START");
 static_assert(kSelectStartY - 1.5f > -23.0f, "START falls off the bottom of the screen");
 
+/// The character select's cel-shaded preview: its position in the HUD's
+/// camera-local space (between the race list and the stats column, in front
+/// of the panel), its size, and the ink outline colour the preview shares
+/// with the in-world characters.
+constexpr float kPreviewX = -5.0f;
+constexpr float kPreviewY = 2.0f;
+constexpr float kPreviewZ = 0.50f;
+constexpr float kPreviewScale = 4.5f;
+const Rgba kPreviewInk{0.04f, 0.04f, 0.06f, 1.0f};  // #0A0A0F
+
 /// Uploads into a ManualObject through the same immediate-mode sink the
 /// geometry builders write to, so HUD text and the tested builders are one
 /// code path. Vertices carry no colour: the material owns it.
@@ -260,8 +272,9 @@ std::vector<std::string> split_name(const std::string& name, size_t max_chars)
 // Construction and the persistent full-screen quads.
 // ---------------------------------------------------------------------------
 
-Hud::Hud(Ogre::SceneManager* scene_manager, MeshFactory* meshes, Ogre::SceneNode* camera_node)
-    : scene_(scene_manager), meshes_(meshes), camera_node_(camera_node)
+Hud::Hud(Ogre::SceneManager* scene_manager, MeshFactory* meshes, Ogre::SceneNode* camera_node,
+         CelShaderGenerator* cel, AnthropomorphicMeshBuilder* race_meshes)
+    : scene_(scene_manager), meshes_(meshes), camera_node_(camera_node), cel_(cel), race_meshes_(race_meshes)
 {
     tray_.name = "haven/hud_tray";
     modal_.name = "haven/hud_modal";
@@ -579,6 +592,42 @@ void Hud::clear_menu_error()
 // Character select.
 // ---------------------------------------------------------------------------
 
+void Hud::ensure_preview()
+{
+    if (preview_ != nullptr || cel_ == nullptr || race_meshes_ == nullptr) return;
+    if (preview_race_ < 0) return;
+    if (preview_material_.isNull())
+        preview_material_ = cel_->cel_material("haven/hud_preview_mat", Ogre::ColourValue::White,
+                                               Ogre::ColourValue(kPreviewInk.r, kPreviewInk.g, kPreviewInk.b,
+                                                                 kPreviewInk.a));
+    if (preview_material_.isNull()) return;
+
+    Ogre::MeshPtr mesh = race_meshes_->body_mesh_for_race(static_cast<uint8_t>(preview_race_));
+    preview_node_ = attach_node_->createChildSceneNode("haven/hud_preview_node");
+    preview_node_->setPosition(kPreviewX, kPreviewY, kPreviewZ);
+    preview_node_->setScale(kPreviewScale, kPreviewScale, kPreviewScale);
+    preview_ = scene_->createEntity("haven/hud_preview", mesh->getName(), kResourceGroup);
+    preview_->setMaterialName(preview_material_->getName(), kResourceGroup);
+    preview_node_->attachObject(preview_);
+    preview_->setVisible(select_visible_);
+}
+
+void Hud::destroy_preview()
+{
+    if (preview_ != nullptr && preview_node_ != nullptr)
+    {
+        preview_node_->detachObject(preview_);
+        scene_->destroyEntity(preview_);
+        preview_ = nullptr;
+    }
+    if (preview_node_ != nullptr)
+    {
+        attach_node_->removeChild(preview_node_);
+        scene_->destroySceneNode(preview_node_);
+        preview_node_ = nullptr;
+    }
+}
+
 void Hud::show_character_select()
 {
     if (!initialised_) return;
@@ -589,6 +638,9 @@ void Hud::show_character_select()
     refresh_vitals();
     dim_->setVisible(true);
     set_panel(41.0f, 23.0f, 0.0f);
+    // The cel-shaded preview of the chosen race, turning slowly in front of
+    // the panel so the silhouette reads from every angle.
+    ensure_preview();
 }
 
 void Hud::hide_character_select()
@@ -606,6 +658,7 @@ void Hud::hide_character_select()
     select_visible_ = false;
     dim_->setVisible(false);
     hide_panel();
+    if (preview_ != nullptr) preview_->setVisible(false);
 }
 
 void Hud::set_character_select_selection(int selection)
@@ -626,7 +679,14 @@ void Hud::set_character_select_race(int race_id)
 {
     if (!initialised_ || race_id == select_race_) return;
     select_race_ = race_id;
+    preview_race_ = race_id;
     if (select_visible_) layout_character_select();
+    // Rebuild the preview so it shows the newly chosen race's silhouette.
+    if (preview_ != nullptr)
+    {
+        destroy_preview();
+        ensure_preview();
+    }
 }
 
 void Hud::set_character_select_weapon(int weapon_id)
@@ -644,6 +704,7 @@ void Hud::shutdown()
     hide_game_over();
     hide_main_menu();
     hide_character_select();
+    destroy_preview();
     clear_batch(tray_);
     clear_batch(xp_bar_);
     clear_batch(status_);
@@ -665,6 +726,14 @@ void Hud::tick(float dt_seconds)
     // as well, or the ghost bar's 450 ms hold would really be 225 ms.
     bars_.tick(dt_seconds);
     refresh_vitals();
+
+    // The character select's preview turns slowly so the chosen race's
+    /// silhouette reads from every angle while the screen is up.
+    if (preview_node_ != nullptr && preview_ != nullptr && preview_->isVisible())
+    {
+        preview_angle_ += dt_seconds * 0.6f;
+        preview_node_->setOrientation(Ogre::Quaternion(Ogre::Radian(preview_angle_), Ogre::Vector3::UNIT_Z));
+    }
 
     if (!banner_visible_) return;
     banner_timer_ -= dt_seconds;

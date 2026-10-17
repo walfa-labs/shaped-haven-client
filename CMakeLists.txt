@@ -32,6 +32,8 @@ set(HAVEN_SOURCES
   src/net_client.cpp
   src/prediction.cpp
   src/protocol.cpp
+  src/render/AnthropomorphicMeshBuilder.cpp
+  src/render/CelShaderGenerator.cpp
   src/render/TelegraphRenderer.cpp
   src/renderer.cpp
   src/run_events.cpp
