@@ -105,10 +105,19 @@ layout, and the arc fan's interval coverage). They link no Ogre libraries.
 Phase 4 added coverage for the delta protocol: the 21 byte `S2C_WELCOME` (and
 the 17 byte phase-3 layout it must still decode), `C2S_ACK_SNAPSHOT`, the
 `S2C_SNAPSHOT_DELTA` decoder and its validation (unknown `kind` bytes, inflated
-counts, trailing bytes), the `SnapshotState` baseline machine (a full snapshot
-replaces the held state, a delta applies only against the tick it holds and is
-refused otherwise, and `build_render` carries the elite mask), the elite
-outline and boss telegraph slots and colours, and the wireframe-rect builder.
+counts, trailing bytes, a non-zero reserved count, and an updated record whose
+own id disagrees with the `id` that heads it), the `SnapshotState` baseline
+machine (a full snapshot replaces the held state, a delta applies only against
+the tick it holds and is refused otherwise, and `build_render` carries the elite
+mask), the elite outline and boss telegraph slots and colours, and the
+wireframe-rect builder.
+
+The review fixes are covered too: `SnapshotIngest` proves a refused delta
+advances none of the run state and does not disarm the restart boundary,
+`AckRetry` proves a refused acknowledgement send stays owed until one succeeds,
+the 64 bit entity key is shown to survive the whole 32 bit id space, and
+`InterpolationBuffer::push_replacing` is shown to drop the history only when a
+full snapshot's run clock went backwards.
 
 The pure parts of the run logic live in their own translation units so they can
 be tested without Ogre: `run_events` holds the restart boundary, the level-up
@@ -128,10 +137,19 @@ either server:
   Ogre-free `snapshot_state` module. A `S2C_SNAPSHOT_FULL` replaces it outright
   and its tick becomes the baseline; a `S2C_SNAPSHOT_DELTA` (0x83) is applied on
   top of it only when its `baseline_tick` is the tick the client holds. A delta
-  that names any other tick is **not** applied: the client keeps acknowledging
-  the state it does hold and the server answers with a full snapshot. The 21
+  that names any other tick is **refused, and changes nothing at all** — not the
+  HUD clock, not the game-state gating, not prediction: the baseline verdict is
+  reached before the header is ingested or any record reconciled, and the client
+  re-acknowledges the tick it does hold so the server answers with a full
+  snapshot. The run state and that ordering rule live in an Ogre-free
+  `snapshot_ingest` module, which is what makes the ordering testable. The 21
   byte `S2C_WELCOME` carries the server's `interest_radius`; the 17 byte
   phase-3 layout still decodes, with the field defaulting to 0.
+- **Acknowledgment retry.** The socket's outgoing queue is bounded, so a
+  `C2S_ACK_SNAPSHOT` can be refused. `AckRetry` keeps the newest tick owed until
+  a send for it actually succeeds, instead of forgetting it — a forgotten
+  acknowledgement would leave the server's model of this client stuck on a tick
+  it has moved past.
 - **Interest management.** The held state is the complete world within the
   interest radius, so it is what goes into the interpolation buffer each
   snapshot. An entity the server destroys is simply absent from the newest
@@ -157,19 +175,28 @@ either server:
 
 Measured on this machine (Release build, 1280x720):
 
-- The logic tests report **999 checks, 0 failures** (Release and Debug).
+- The logic tests report **1042 checks, 0 failures** (Release and Debug).
 - Against a mock delta server (21 byte welcome, full baseline, then deltas):
   `interest_radius=75`, **27 deltas applied, 0 rejected**, 28 `C2S_ACK_SNAPSHOT`
   sent, entities spawning and leaving the radius, `stale=0 malformed=0
   disconnected=0`, ~119 fps.
-- Against the real `shaped-haven-server` `phase-4-delta` branch under
-  `--stress-enemies 40`: the 21 byte welcome decodes (`interest_radius=50`),
-  deltas are applied and acknowledged, level-ups and game over + restart all
-  work, `stale=0 malformed=0`. The server sends some deltas against a baseline
-  one broadcast stale (its reader thread processes the ACK a 50 ms broadcast
-  late), so the client rejects roughly half and re-acknowledges — the behaviour
-  the spec requires, and the server answers with a full snapshot once the
-  baseline leaves its 32-snapshot ring. The run is playable start to finish.
+- Against the real `shaped-haven-server` `phase-4-delta` branch (commit
+  `f5edbcb`) under `--stress-enemies 40`: the 21 byte welcome decodes
+  (`interest_radius=40`), and deltas flow. In a 2400 frame run the client applied
+  **333 deltas and refused none**; in another it applied **735 of 737** (99.7%),
+  the two refusals being the baseline-one-broadcast-stale case the protocol
+  expects — the client re-acknowledged the tick it held and carried on. Every
+  run reported `stale=0 malformed=0 ackretry=0 sendfail=0 qdropped=0`, and the
+  frame rate was **~142 fps** (1800 frames in 12.7 s). Level-ups, the level-up
+  pause (`game_state=1`) and game over (`game_state=2`) are all observed; a game
+  over answered with a scripted restart put the client back into a fresh run
+  (`restart requested`, new run at `srv_tick=6`, `restarts=1`, `stale=0`
+  throughout), so the restart boundary still disarms on the new run's first
+  snapshot. The run is playable start to finish.
+- The retry path and the recovery-full-snapshot path did not come up in these
+  runs — on loopback the outgoing queue never fills (`qdropped=0 ackretry=0`)
+  and the server's baseline model held, so no recovery full snapshot was needed.
+  Both are covered by unit tests instead (see above).
 - Against the phase-3 server (`main`, 17 byte welcome, full snapshots only):
   `interest_radius=0`, full snapshots flow, level-ups and restart work,
   `stale=0 malformed=0`, ~134 fps.
