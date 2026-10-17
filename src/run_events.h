@@ -4,6 +4,7 @@
 #include "protocol.h"
 
 #include <cstdint>
+#include <optional>
 
 namespace haven {
 
@@ -134,6 +135,42 @@ public:
 
 private:
     bool pending_ = false;
+};
+
+/// Remembers the tick the client still owes the server an acknowledgement for.
+///
+/// PROTOCOL.md "Baseline rules" makes the acknowledgement load-bearing: it is
+/// what lets the server pick a baseline, and a client that refuses a delta
+/// re-acknowledges the tick it does hold, which is what corrects a drifted
+/// server model. The socket's outgoing queue is bounded, so `NetClient::send`
+/// can refuse an acknowledgement; a refusal that was simply forgotten would
+/// leave the server's model of this client stuck on a tick the client has moved
+/// past, and convergence would not be guaranteed. This keeps the newest
+/// requested tick pending until a send for it actually succeeds.
+class AckRetry {
+public:
+    /// Requests an acknowledgement of `tick`. The newest request wins: the tick
+    /// to acknowledge is the newest state the client holds, so it supersedes any
+    /// older one still pending.
+    void request(uint32_t tick) { pending_ = tick; }
+
+    /// The tick to try to send now, or nothing when nothing is owed.
+    std::optional<uint32_t> pending() const { return pending_; }
+
+    bool owes() const { return pending_.has_value(); }
+
+    /// The send succeeded, so nothing is owed any more.
+    void sent() { pending_.reset(); }
+
+    /// A new run begins, so the old run's tick names nothing any more. The server
+    /// forgets its whole baseline model on a restart, so an acknowledgement still
+    /// owed for a tick of the dead run could only drag the new run's model onto a
+    /// tick of a run that no longer exists; the new run's first snapshot
+    /// acknowledges itself instead. `GameSession::maybe_restart` runs this.
+    void clear() { pending_.reset(); }
+
+private:
+    std::optional<uint32_t> pending_;
 };
 
 }  // namespace haven

@@ -153,6 +153,15 @@ std::vector<uint8_t> encode_restart()
     return encode_packet(static_cast<uint8_t>(MsgType::C2S_RESTART), 0, {});
 }
 
+std::vector<uint8_t> encode_ack_snapshot(uint32_t last_recv_server_tick)
+{
+    ByteWriter w;
+    w.u32(last_recv_server_tick);
+
+    std::vector<uint8_t> payload(w.data(), w.data() + w.size());
+    return encode_packet(static_cast<uint8_t>(MsgType::C2S_ACK_SNAPSHOT), 0, payload);
+}
+
 bool decode_header(const uint8_t* data, size_t len, PacketHeader& out)
 {
     ByteReader r(data, len);
@@ -169,35 +178,69 @@ bool decode_welcome(const uint8_t* payload, size_t len, Welcome& out)
     uint8_t tick_hz = 0;
     uint8_t snap_hz = 0;
     uint16_t arena_half_size = 0;
+    // The first 13 bytes are identical in both layouts: player_id u8,
+    // session_token u64, tick_hz u8, snap_hz u8, arena_half_size u16.
     if (!r.u8(player_id) || !r.u64(out.session_token) || !r.u8(tick_hz) || !r.u8(snap_hz) ||
-        !r.u16(arena_half_size) || !r.u32(out.server_tick))
+        !r.u16(arena_half_size))
         return false;
 
     out.player_id = player_id;
     out.tick_hz = tick_hz;
     out.snap_hz = snap_hz;
     out.arena_half_size = arena_half_size;
+    out.has_interest_radius = false;
+    out.interest_radius = 0;
+
+    // What follows is one of two forms, told apart by the payload length the
+    // frame header declared: the 17 byte phase-3 layout carries only a u32
+    // server_tick here, while the 21 byte phase-4 layout inserts a u16
+    // interest_radius and a u16 reserved before it.
+    if (r.remaining() == 4)
+    {
+        return r.u32(out.server_tick);
+    }
+    if (r.remaining() == 8)
+    {
+        uint16_t reserved = 0;
+        if (!r.u16(out.interest_radius) || !r.u16(reserved) || !r.u32(out.server_tick))
+            return false;
+        out.has_interest_radius = true;
+        return true;
+    }
+    return false;
+}
+
+bool decode_snapshot_header(const uint8_t* payload, size_t len, uint32_t& server_tick, uint32_t& baseline_tick,
+                            uint32_t& run_time_ms, std::array<uint32_t, kMaxPlayers>& acked_seq, GameState& game_state,
+                            std::array<uint16_t, 4>& counts)
+{
+    ByteReader r(payload, len);
+    uint8_t state = 0;
+    if (!r.u32(server_tick) || !r.u32(baseline_tick) || !r.u32(run_time_ms))
+        return false;
+    for (uint32_t& acked : acked_seq)
+        if (!r.u32(acked)) return false;
+    if (!r.u8(state)) return false;
+    for (uint16_t& count : counts)
+        if (!r.u16(count)) return false;
+    game_state = static_cast<GameState>(state);
     return true;
 }
 
 bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out)
 {
-    ByteReader r(payload, len);
-    uint8_t game_state = 0;
+    std::array<uint32_t, kMaxPlayers> acked{};
     std::array<uint16_t, 4> counts{};
-    if (!r.u32(out.server_tick) || !r.u32(out.baseline_tick) || !r.u32(out.run_time_ms))
+    if (!decode_snapshot_header(payload, len, out.server_tick, out.baseline_tick, out.run_time_ms, acked,
+                                out.game_state, counts))
         return false;
-    for (uint32_t& acked : out.acked_seq)
-        if (!r.u32(acked)) return false;
-    if (!r.u8(game_state)) return false;
-    for (uint16_t& count : counts)
-        if (!r.u16(count)) return false;
-
-    out.game_state = static_cast<GameState>(game_state);
+    out.acked_seq = acked;
     out.player_count = counts[0];
     out.enemy_count = counts[1];
     out.proj_count = counts[2];
     out.gem_count = counts[3];
+
+    ByteReader r(payload + kSnapshotHeaderSize, len - kSnapshotHeaderSize);
 
     // The counts come off the wire, so they are attacker-controlled: a header
     // claiming 65,535 of each record would otherwise make the decoder allocate
@@ -250,6 +293,134 @@ bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out)
     // A payload longer than the records it declares is a framing error, not
     // something to silently ignore: accepting it would hide a header/record
     // mismatch and leave the reader out of step on the next packet.
+    return r.remaining() == 0;
+}
+
+namespace {
+
+// Reads one record of the kind `kind_byte` names from `r`. Every field goes
+// through the ByteReader, which checks the remaining length first, so a count
+// larger than the payload is caught the moment a record runs off the end
+// rather than by trusting the count up front. Returns false on a short read or
+// a kind byte outside 0..3.
+//
+// For an updated record the caller has already read the separate `id` u32 that
+// heads it, and passes it as `external_id`; the record's own id field must
+// agree with it. PROTOCOL.md sends the id twice for an updated entity, and the
+// two disagreeing means the record and its key describe different entities —
+// applying it would write one entity's state under another's key.
+bool read_delta_record(ByteReader& r, uint8_t kind_byte, SnapshotDelta& out, bool spawned, uint32_t external_id)
+{
+    const DeltaKind kind = static_cast<DeltaKind>(kind_byte);
+    switch (kind)
+    {
+        case DeltaKind::Player:
+        {
+            PlayerNet p;
+            uint8_t vel_angle = 0;
+            if (!r.u8(p.id) || !r.u8(p.state_flags) || !r.vec2(p.pos) || !r.u8(vel_angle) || !r.u8(p.hp_pct))
+                return false;
+            if (!spawned && static_cast<uint32_t>(p.id) != external_id) return false;
+            p.vel_angle = decode_angle(vel_angle);
+            (spawned ? out.spawned_players : out.updated_players).push_back(p);
+            return true;
+        }
+        case DeltaKind::Enemy:
+        {
+            EnemyNet e;
+            uint8_t vel_angle = 0;
+            if (!r.u32(e.id) || !r.u8(e.archetype) || !r.u8(e.elite_mask) || !r.vec2(e.pos) || !r.u8(vel_angle) ||
+                !r.u8(e.hp_pct))
+                return false;
+            if (!spawned && e.id != external_id) return false;
+            e.vel_angle = decode_angle(vel_angle);
+            (spawned ? out.spawned_enemies : out.updated_enemies).push_back(e);
+            return true;
+        }
+        case DeltaKind::Projectile:
+        {
+            ProjNet p;
+            uint8_t vel_angle = 0;
+            if (!r.u32(p.id) || !r.u8(p.owner_id) || !r.u8(p.weapon_id) || !r.u8(p.shape) || !r.vec2(p.pos) ||
+                !r.u8(vel_angle))
+                return false;
+            if (!spawned && p.id != external_id) return false;
+            p.vel_angle = decode_angle(vel_angle);
+            (spawned ? out.spawned_projs : out.updated_projs).push_back(p);
+            return true;
+        }
+        case DeltaKind::Gem:
+        {
+            GemNet g;
+            if (!r.u32(g.id) || !r.vec2(g.pos) || !r.u16(g.xp_value) || !r.u8(g.magnet_target_id) || !r.skip(1))
+                return false;
+            if (!spawned && g.id != external_id) return false;
+            (spawned ? out.spawned_gems : out.updated_gems).push_back(g);
+            return true;
+        }
+    }
+    return false;
+}
+
+// Reads `count` (kind, id) pairs into the matching per-kind id vector.
+bool read_destroyed(ByteReader& r, uint16_t count, SnapshotDelta& out)
+{
+    for (uint16_t i = 0; i < count; ++i)
+    {
+        uint8_t kind_byte = 0;
+        uint32_t id = 0;
+        if (!r.u8(kind_byte) || !r.u32(id)) return false;
+        switch (static_cast<DeltaKind>(kind_byte))
+        {
+            case DeltaKind::Player: out.destroyed_players.push_back(id); break;
+            case DeltaKind::Enemy: out.destroyed_enemies.push_back(id); break;
+            case DeltaKind::Projectile: out.destroyed_projs.push_back(id); break;
+            case DeltaKind::Gem: out.destroyed_gems.push_back(id); break;
+            default: return false;
+        }
+    }
+    return true;
+}
+
+}  // namespace
+
+bool decode_snapshot_delta(const uint8_t* payload, size_t len, SnapshotDelta& out)
+{
+    std::array<uint32_t, kMaxPlayers> acked{};
+    std::array<uint16_t, 4> counts{};
+    if (!decode_snapshot_header(payload, len, out.server_tick, out.baseline_tick, out.run_time_ms, acked,
+                                out.game_state, counts))
+        return false;
+    out.acked_seq = acked;
+    out.spawned_count = counts[0];
+    out.updated_count = counts[1];
+    out.destroyed_count = counts[2];
+    // counts[3] is reserved, and PROTOCOL.md fixes it at zero. A non-zero value
+    // is not a field a future revision may reuse silently: the frozen layout
+    // says the header is 37 bytes with a zero there, so anything else is a
+    // header that disagrees with the format this client implements.
+    if (counts[3] != 0) return false;
+
+    ByteReader r(payload + kSnapshotHeaderSize, len - kSnapshotHeaderSize);
+
+    for (uint16_t i = 0; i < out.spawned_count; ++i)
+    {
+        uint8_t kind_byte = 0;
+        if (!r.u8(kind_byte)) return false;
+        if (!read_delta_record(r, kind_byte, out, /*spawned=*/true, 0)) return false;
+    }
+    for (uint16_t i = 0; i < out.updated_count; ++i)
+    {
+        uint8_t kind_byte = 0;
+        uint32_t id = 0;
+        if (!r.u8(kind_byte) || !r.u32(id)) return false;
+        if (!read_delta_record(r, kind_byte, out, /*spawned=*/false, id)) return false;
+    }
+    if (!read_destroyed(r, out.destroyed_count, out)) return false;
+
+    // The payload must be exactly the three arrays and nothing more: trailing
+    // bytes would mean the header and the records disagree, which is a framing
+    // error rather than something to silently ignore.
     return r.remaining() == 0;
 }
 

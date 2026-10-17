@@ -26,6 +26,18 @@ void InterpolationBuffer::push(const RenderSnapshot& snapshot)
     while (snapshots_.size() > kCapacity) snapshots_.pop_front();
 }
 
+void InterpolationBuffer::push_replacing(const RenderSnapshot& snapshot)
+{
+    // sample() scans for the first snapshot at or after the render time, which
+    // only works while the buffered timestamps rise. A full snapshot whose run
+    // clock is below the newest buffered one means the server restarted its
+    // clock — a recovery full snapshot the client did not ask for through
+    // C2S_RESTART — so the history is dropped rather than left non-monotonic.
+    if (!snapshots_.empty() && snapshot.run_time_ms < snapshots_.back().data.run_time_ms)
+        snapshots_.clear();
+    push(snapshot);
+}
+
 uint32_t InterpolationBuffer::latest_time_ms() const
 {
     return snapshots_.empty() ? 0 : snapshots_.back().data.run_time_ms;
@@ -36,15 +48,15 @@ void InterpolationBuffer::clear()
     snapshots_.clear();
 }
 
-const std::unordered_map<uint32_t, Vec2>& InterpolationBuffer::latest_positions() const
+const std::unordered_map<EntityKey, Vec2>& InterpolationBuffer::latest_positions() const
 {
-    static const std::unordered_map<uint32_t, Vec2> empty;
+    static const std::unordered_map<EntityKey, Vec2> empty;
     return snapshots_.empty() ? empty : snapshots_.back().data.positions;
 }
 
-const std::unordered_map<uint32_t, EntityStyle>& InterpolationBuffer::latest_styles() const
+const std::unordered_map<EntityKey, EntityStyle>& InterpolationBuffer::latest_styles() const
 {
-    static const std::unordered_map<uint32_t, EntityStyle> empty;
+    static const std::unordered_map<EntityKey, EntityStyle> empty;
     return snapshots_.empty() ? empty : snapshots_.back().data.styles;
 }
 
@@ -58,7 +70,7 @@ int64_t InterpolationBuffer::render_time_ms() const
     return now_server - static_cast<int64_t>(kDelayMs);
 }
 
-bool InterpolationBuffer::sample(uint32_t entity_id, Vec2& out) const
+bool InterpolationBuffer::sample(EntityKey entity_id, Vec2& out) const
 {
     if (snapshots_.size() < 2) return false;
 
@@ -82,7 +94,7 @@ bool InterpolationBuffer::sample(uint32_t entity_id, Vec2& out) const
 }
 
 bool InterpolationBuffer::interpolate_between(const RenderSnapshot& a, const RenderSnapshot& b, int64_t t_render,
-                                              uint32_t entity_id, Vec2& out)
+                                              EntityKey entity_id, Vec2& out)
 {
     const auto it_a = a.positions.find(entity_id);
     const auto it_b = b.positions.find(entity_id);
@@ -93,7 +105,7 @@ bool InterpolationBuffer::interpolate_between(const RenderSnapshot& a, const Ren
     return true;
 }
 
-bool InterpolationBuffer::first_seen_position(uint32_t entity_id, Vec2& out) const
+bool InterpolationBuffer::first_seen_position(EntityKey entity_id, Vec2& out) const
 {
     // Oldest first: the first snapshot that carries the entity is where it was
     // when it appeared, which is the position the interpolation window will

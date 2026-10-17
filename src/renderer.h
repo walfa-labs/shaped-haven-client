@@ -75,8 +75,9 @@ public:
     /// Enemies and projectiles, rebuilt from scratch every frame out of the
     /// interpolated draw items the session hands over. One Manual Object per
     /// draw layer holds the whole batch, so a thousand enemies cost one draw
-    /// call each instead of one entity each.
-    void render_entities(const std::vector<EntityDrawItem>& items);
+    /// call each instead of one entity each. `run_time_ms` is the newest
+    /// snapshot's run clock, which drives the boss dash warning box.
+    void render_entities(const std::vector<EntityDrawItem>& items, uint32_t run_time_ms);
 
 private:
     /// One colour slot's worth of geometry inside its pool's Manual Object.
@@ -129,10 +130,12 @@ private:
     Ogre::ManualObject* enemy_bars_ = nullptr;
     Ogre::ManualObject* projectiles_ = nullptr;
     Ogre::ManualObject* gem_bodies_ = nullptr;
+    Ogre::ManualObject* elite_outlines_ = nullptr;
+    Ogre::ManualObject* boss_telegraph_ = nullptr;
 
     /// Scratch storage grouping the frame's entities by colour slot, and the
     /// slots that exist. Both are indexed pool * kMaxSlotsPerPool + slot.
-    static constexpr size_t kSlotItemCount = 4 * kMaxSlotsPerPool;
+    static constexpr size_t kSlotItemCount = kPoolCount * kMaxSlotsPerPool;
     std::vector<const EntityDrawItem*> slot_items_[kSlotItemCount];
     ColourBatch batches_[kSlotItemCount];
 

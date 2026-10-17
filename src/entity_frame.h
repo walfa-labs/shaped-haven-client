@@ -28,36 +28,45 @@ enum class EntityKind : uint8_t {
 };
 
 /// Key an entity is stored under in the interpolation buffer: the entity kind
-/// in the top two bits, the server's own id below it. Every server pool is
-/// orders of magnitude below 2^30 entries, so no id is ever truncated.
-constexpr uint32_t kKindShift = 30;
-constexpr uint32_t kKindMask = 0x3u << kKindShift;
-constexpr uint32_t kRawIdMask = (1u << kKindShift) - 1u;
+/// above the server's own id, so an id is never truncated and two entities of
+/// different kinds can never collide.
+///
+/// The key is 64 bits because the server's ids are 32. A 32 bit key would have
+/// to take its kind bits out of the id, and an id above that ceiling would wrap
+/// silently onto another entity's key — safe for the 20 minute benchmark, whose
+/// pools never approach it, but exactly the kind of collision an endless run
+/// would eventually reach. The key is wide enough that it cannot happen.
+using EntityKey = uint64_t;
 
-inline uint32_t interpolation_key(uint32_t entity_id, EntityKind kind)
+constexpr uint32_t kKindShift = 32;
+constexpr EntityKey kKindMask = static_cast<EntityKey>(0x3u) << kKindShift;
+constexpr EntityKey kRawIdMask = 0xFFFFFFFFull;
+
+inline EntityKey interpolation_key(uint32_t entity_id, EntityKind kind)
 {
-    return (static_cast<uint32_t>(kind) << kKindShift) | (entity_id & kRawIdMask);
+    return (static_cast<EntityKey>(kind) << kKindShift) | static_cast<EntityKey>(entity_id);
 }
 
-inline EntityKind key_kind(uint32_t key)
+inline EntityKind key_kind(EntityKey key)
 {
     return static_cast<EntityKind>((key & kKindMask) >> kKindShift);
 }
 
-inline uint32_t key_raw_id(uint32_t key)
+inline uint32_t key_raw_id(EntityKey key)
 {
-    return key & kRawIdMask;
+    return static_cast<uint32_t>(key & kRawIdMask);
 }
 
 /// Everything the renderer needs to draw one interpolated entity for one frame.
 struct EntityDrawItem {
-    uint32_t key = 0;
+    EntityKey key = 0;
     EntityKind kind = EntityKind::Player;
     Vec2 pos;
     float angle = 0.0f;  // facing, in radians (vel_angle decoded)
     uint8_t style = 0;   // enemy archetype, projectile weapon_id, or gem size bucket
     uint8_t hp_pct = 0;  // enemies only; 0..100, 100 being full health
     uint8_t shape = 0;   // projectiles only; ProjNet shape byte
+    uint8_t elite_mask = 0;  // enemies only; one bit per elite modifier
 };
 
 /// Immediate-mode triangle sink. `vertex()` starts a new vertex and `index()`
@@ -131,14 +140,25 @@ void append_arc(PrimitiveSink& sink, Vec2 centre, float radius, float direction,
 /// A rectangle rotated by `angle`, for the RAY projectile fallback.
 void append_quad(PrimitiveSink& sink, Vec2 centre, Vec2 half_extents, float angle, float z);
 
-/// The four draw layers the renderer keeps. Each is a separate Manual Object,
-/// so an entity's z never has to change to be drawn in the right order.
+/// The outline of a rectangle rotated by `angle`, drawn as four thin quads so
+/// it reads as a wireframe box rather than a filled one. Used for the boss
+/// dash warning, which DESIGN.md section 4 specifies as a red wireframe box.
+void append_wireframe_rect(PrimitiveSink& sink, Vec2 centre, Vec2 half_extents, float angle, float z,
+                           float thickness);
+
+/// The draw layers the renderer keeps. Each is a separate Manual Object, so an
+/// entity's z never has to change to be drawn in the right order.
 enum class ColourPool : uint8_t {
     EnemyBody = 0,
     EnemyBar = 1,
     Projectile = 2,
     Gem = 3,
+    EliteOutline = 4,   // one ring per elite modifier bit, around the body
+    BossTelegraph = 5,  // the red wireframe dash warning box
 };
+
+/// How many draw layers there are, i.e. how many ColourPool values.
+constexpr uint8_t kPoolCount = 6;
 
 /// One material colour inside one pool. The renderer builds one Manual Object
 /// section per slot, which is how a thousand differently coloured entities still
@@ -150,12 +170,16 @@ struct ColourSlot {
 };
 
 /// Slots per pool. The bar pool holds a background colour plus one fill colour
-/// per HP bucket. The gem pool holds one colour per XP value bucket.
+/// per HP bucket. The gem pool holds one colour per XP value bucket. The elite
+/// outline pool holds one ring colour per modifier bit. The boss telegraph pool
+/// holds the single warning-box red.
 constexpr uint8_t kEnemyBodySlots = 7;                  // one per archetype
 constexpr uint8_t kHpFillBuckets = 8;
 constexpr uint8_t kEnemyBarSlots = 1 + kHpFillBuckets;  // background + fills
 constexpr uint8_t kProjectileSlots = 4;                 // one per weapon
 constexpr uint8_t kGemSlots = 4;                       // Small/Medium/Large/Boss Cache
+constexpr uint8_t kEliteOutlineSlots = 4;               // Vampiric/Splitter/Shielded/Haste
+constexpr uint8_t kBossTelegraphSlots = 1;              // the warning-box red
 
 /// The widest pool, in colour slots.
 constexpr uint8_t kMaxSlotsPerPool = kEnemyBarSlots;
@@ -164,6 +188,13 @@ ColourSlot slot_for_body(const EntityDrawItem& item);
 ColourSlot slot_for_bar(const EntityDrawItem& item);
 ColourSlot slot_for_projectile(const EntityDrawItem& item);
 ColourSlot slot_for_gem(const EntityDrawItem& item);
+
+/// The outline ring for one elite modifier bit: the EliteOutline pool, one slot
+/// per bit. `bit` must be a set bit in `item.elite_mask`.
+ColourSlot slot_for_elite_outline(uint8_t bit);
+
+/// The boss dash warning box: the BossTelegraph pool, its single red slot.
+ColourSlot slot_for_boss_telegraph();
 
 /// The colour a slot is created for.
 Rgba slot_colour(const ColourSlot& slot);
@@ -241,6 +272,45 @@ enum class Archetype : uint8_t {
 float enemy_radius(uint8_t archetype);
 bool archetype_is_circle(uint8_t archetype);
 Rgba archetype_colour(uint8_t archetype);
+
+// ---------------------------------------------------------------------------
+// Elite modifiers (DESIGN.md section 4). The wire carries them as a bitmask in
+// `EnemyNet.elite_mask`; the bits are assigned in the section's list order.
+// ---------------------------------------------------------------------------
+
+constexpr uint8_t kEliteVampiric = 1 << 0;   // +20% speed, heals on hit
+constexpr uint8_t kEliteSplitter = 1 << 1;   // splits into 3 on death
+constexpr uint8_t kEliteShielded = 1 << 2;   // regenerating barrier
+constexpr uint8_t kEliteHasteAura = 1 << 3;  // speeds up nearby enemies
+constexpr uint8_t kEliteMaskAny = kEliteVampiric | kEliteSplitter | kEliteShielded | kEliteHasteAura;
+
+/// The outline ring colour for one elite modifier bit.
+Rgba elite_colour(uint8_t bit);
+
+/// A human-readable name for one elite modifier bit, for the verbose log.
+const char* elite_name(uint8_t bit);
+
+// ---------------------------------------------------------------------------
+// Boss telegraph (DESIGN.md section 4). The boss runs a 6.0 s attack loop; the
+// client derives the phase from the snapshot's run clock because the wire
+// carries no explicit boss state. Boss spawns land on 180 s multiples, which
+/// are themselves multiples of the 6 s loop, so the phase is the same whether
+/// the loop is anchored to the run start or to the boss's own spawn.
+// ---------------------------------------------------------------------------
+
+constexpr uint32_t kBossCycleMs = 6000;
+/// The dash warning is the 1.0 s window before the dash. Its position inside
+/// the loop is the one thing the frozen protocol leaves open; this is the
+/// client's reading of it.
+constexpr uint32_t kBossTelegraphStartMs = 2000;
+constexpr uint32_t kBossTelegraphEndMs = 3000;
+/// The dash covers 22.0 u at 22.0 u/s, which is what the warning box spans.
+constexpr float kBossDashUnits = 22.0f;
+
+/// True during the 1.0 s dash-warning window of the boss's 6.0 s attack loop.
+/// Derived from the snapshot's run clock, since the wire carries no explicit
+/// boss state; see the note on the cycle above.
+bool boss_telegraph_active(uint32_t run_time_ms);
 
 /// HP bar geometry, shared by the builder and the tests.
 float enemy_hp_bar_width(uint8_t archetype);
