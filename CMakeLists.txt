@@ -23,6 +23,8 @@ set(HAVEN_SOURCES
   src/interpolation.cpp
   src/item_catalog.cpp
   src/mesh_factory.cpp
+  src/net/TcpTransport.cpp
+  src/net/SubprocessTransport.cpp
   src/net_client.cpp
   src/prediction.cpp
   src/protocol.cpp

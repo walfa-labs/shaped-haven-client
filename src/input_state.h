@@ -32,6 +32,9 @@ public:
     static constexpr int kKey3 = '3';
     static constexpr int kKeyR = 'r';
 
+    /// The menu's confirm key. SDL2 delivers the return key as SDLK_RETURN.
+    static constexpr int kKeyEnter = 13;
+
     // OgreBites hands us SDL2 keycodes, but the SDK ships SDL2.dll without the
     // SDL headers, so the arrow keys are restated here. SDL2 defines
     // SDLK_*ARROW as SDL_SCANCODE_TO_KEYCODE(SDL_SCANCODE_*ARROW) with
@@ -45,6 +48,10 @@ public:
 
     void key_down(int key_code);
     void key_up(int key_code);
+
+    /// True while `key_code` is down. The main menu edge-detects on this: a
+    /// press is a key that is held now and was not held last frame.
+    bool held(int key_code) const;
 
     Vec2 move_vector() const;
     bool quit_requested() const { return quit_; }

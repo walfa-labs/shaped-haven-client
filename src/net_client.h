@@ -41,8 +41,14 @@ public:
     NetClient(const NetClient&) = delete;
     NetClient& operator=(const NetClient&) = delete;
 
-    /// Synchronous connect; call before start(). Returns false on failure.
-    bool connect(const std::string& host, uint16_t port);
+    /// Takes ownership of an already-connected socket and starts the socket
+    /// thread on it. The handle must be non-blocking with TCP_NODELAY set —
+    /// the transport that performed the connect (TcpTransport's timed
+    /// non-blocking connect) owns that configuration.
+    ///
+    /// This is the only way the handle enters the class: the connect itself
+    /// lives in the transport, which is where the timeout policy belongs.
+    void adopt(int sock);
 
     /// Spawns the socket thread and transfers ownership of the handle to it.
     void start();

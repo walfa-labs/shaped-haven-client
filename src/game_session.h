@@ -5,7 +5,7 @@
 #include "hud_model.h"
 #include "input_state.h"
 #include "interpolation.h"
-#include "net_client.h"
+#include "net/ITransport.h"
 #include "prediction.h"
 #include "renderer.h"
 #include "run_events.h"
@@ -90,11 +90,15 @@ struct SessionStats {
 /// interpolate the remote players and hand the result to the renderer.
 class GameSession {
 public:
-    GameSession(HavenRenderer& renderer, NetClient& net, InputState& input, Hud& hud);
+    GameSession(HavenRenderer& renderer, ITransport& net, InputState& input, Hud& hud);
 
-    /// Connects, sends C2S_HELLO and starts the socket thread. Retries a few
-    /// times so a server that is still starting up does not kill the client.
-    bool connect(const std::string& host, uint16_t port, const std::string& name);
+    /// Connects and sends C2S_HELLO. The transport owns the connect policy —
+    /// its timeout, and for single-player the server spawn and readiness wait —
+    /// so there is no retry loop here: a transport that has reported failure
+    /// has already waited as long as it is going to. On failure `outError`
+    /// carries the transport's own reason, for the menu to show.
+    bool connect(const std::string& host, uint16_t port, const std::string& name,
+                  std::string* outError = nullptr);
 
     void update(float dt_seconds);
     void shutdown();
@@ -167,7 +171,7 @@ private:
     void report_script_mismatch(const char* event, const char* marker);
 
     HavenRenderer& renderer_;
-    NetClient& net_;
+    ITransport& net_;
     InputState& input_;
     Hud& hud_;
     ClientPredictor predictor_;
