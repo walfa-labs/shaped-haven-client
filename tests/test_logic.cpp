@@ -2652,6 +2652,147 @@ void test_evolution_watch()
     expect(watch.observe(loadout) == 1, "a slot past weapon_count is ignored");
 }
 
+void test_bar_animator()
+{
+    std::printf("bar animator\n");
+    haven::BarAnimator bars;
+
+    // Nothing reported yet: the bars are off the screen rather than showing an
+    // empty 0% bar for the frames before the first snapshot.
+    expect(!bars.visible(), "no vitals means no bars");
+    expect(!bars.shield_visible(), "and no shield bar");
+
+    haven::Vitals full;
+    full.reported = true;
+    full.race_id = 0;
+    full.hp_pct = 100;
+    full.shield_pct = 100;
+    full.mana_pct = 100;
+    full.max_hp = 110;
+    full.max_shield = 25;
+    bars.observe(full);
+    expect(bars.visible(), "the first report shows the bars");
+    expect(bars.shield_visible(), "a race with a shield shows the shield bar");
+    expect_near(bars.hp_fraction(), 1.0f, 1e-6f, "the first report fills the health bar");
+    expect_near(bars.ghost_fraction(), 1.0f, 1e-6f, "and the ghost along with it");
+    expect_near(bars.shield_fraction(), 1.0f, 1e-6f, "and the shield bar");
+    expect_near(bars.mana_fraction(), 1.0f, 1e-6f, "and the mana bar");
+
+    // Damage: the fill drops at once, the ghost holds where it was.
+    full.hp_pct = 60;
+    bars.observe(full);
+    expect_near(bars.hp_fraction(), 0.6f, 1e-6f, "the health bar drops immediately");
+    expect_near(bars.ghost_fraction(), 1.0f, 1e-6f, "the ghost holds at the old value");
+    bars.tick(0.44f);
+    expect_near(bars.ghost_fraction(), 1.0f, 1e-6f, "it is still there just before the hold ends");
+    bars.tick(0.02f);
+    expect_near(bars.ghost_fraction(), 0.6f, 1e-6f, "and snaps down once the hold is up");
+
+    // A hit during the hold must not push the snap back, or continuous damage
+    // would pin the ghost at its old value for as long as the hits kept coming.
+    full.hp_pct = 40;
+    bars.observe(full);
+    bars.tick(0.20f);
+    full.hp_pct = 20;
+    bars.observe(full);
+    expect_near(bars.ghost_fraction(), 0.6f, 1e-6f, "a second hit leaves the ghost where it was");
+    bars.tick(0.25f);
+    expect_near(bars.ghost_fraction(), 0.2f, 1e-6f, "the hold ends on schedule, at the newest value");
+
+    // Healing snaps the ghost up immediately: there is nothing to lag behind.
+    full.hp_pct = 80;
+    bars.observe(full);
+    expect_near(bars.hp_fraction(), 0.8f, 1e-6f, "healing raises the health bar");
+    expect_near(bars.ghost_fraction(), 0.8f, 1e-6f, "and the ghost snaps up with it");
+
+    // The mana bar's denial flash.
+    expect(!bars.mana_flashing(), "the mana bar is not flashing at rest");
+    bars.signal_dash_denied();
+    expect(bars.mana_flashing(), "a denied dash flashes the mana bar");
+    bars.tick(0.19f);
+    expect(bars.mana_flashing(), "it is still flashing just before the window ends");
+    bars.tick(0.02f);
+    expect(!bars.mana_flashing(), "and stops once it does");
+
+    // A race with no shield has no shield bar, even though shield_pct is 0 for
+    // it either way.
+    haven::Vitals bare;
+    bare.reported = true;
+    bare.hp_pct = 100;
+    bare.max_shield = 0;
+    bars.observe(bare);
+    expect(bars.visible(), "a shieldless race still shows the health bar");
+    expect(!bars.shield_visible(), "but no shield bar");
+    expect_near(bars.shield_fraction(), 0.0f, 1e-6f, "and no shield fill");
+
+    // Clearing the vitals — what a restart does — hides the bars again.
+    bars.observe(haven::Vitals{});
+    expect(!bars.visible(), "clearing the vitals hides the bars");
+    expect_near(bars.hp_fraction(), 0.0f, 1e-6f, "and empties the health bar");
+}
+
+void test_dash_affordable()
+{
+    std::printf("dash affordability\n");
+    haven::Vitals vitals;
+    // A player whose snapshot has not arrived yet is never flashed.
+    expect(haven::dash_affordable(vitals, 100, 25), "unreported vitals are never flashed");
+
+    vitals.reported = true;
+    vitals.mana_pct = 100;
+    expect(haven::dash_affordable(vitals, 100, 25), "full mana pays for a dash");
+    vitals.mana_pct = 25;
+    expect(haven::dash_affordable(vitals, 100, 25), "mana exactly at the cost pays");
+    vitals.mana_pct = 24;
+    expect(!haven::dash_affordable(vitals, 100, 25), "one point short does not");
+    vitals.mana_pct = 0;
+    expect(!haven::dash_affordable(vitals, 100, 25), "empty mana does not");
+
+    // A race with no mana cannot be asked for any.
+    expect(haven::dash_affordable(vitals, 0, 0), "a race with no mana is never flashed");
+
+    // The percentage is taken against the race's own maximum, so the same 25%
+    // is 25 points for one race and 50 for another.
+    vitals.mana_pct = 25;
+    expect(haven::dash_affordable(vitals, 100, 25), "25 of 100 pays a 25-point dash");
+    expect(!haven::dash_affordable(vitals, 200, 60), "but 25 of 200 does not pay a 60-point one");
+}
+
+void test_vitals_from()
+{
+    std::printf("vitals from player\n");
+    haven::PlayerNet player;
+    player.race_id = 3;
+    player.hp_pct = 75;
+    player.shield_pct = 50;
+    player.mana_pct = 10;
+    player.max_hp = 75;
+    player.max_shield = 20;
+
+    const haven::Vitals from_net = haven::vitals_from(player);
+    expect(from_net.reported, "a player record always reports");
+    expect(from_net.race_id == 3, "the race id carries over");
+    expect(from_net.hp_pct == 75 && from_net.shield_pct == 50 && from_net.mana_pct == 10,
+           "the three percentages carry over");
+    expect(from_net.max_hp == 75 && from_net.max_shield == 20, "and the two maxima");
+
+    // The draw item is the same record after the interpolation buffer has held
+    // it, and it is what the game session reads for the local player.
+    haven::EntityDrawItem item;
+    item.race_id = player.race_id;
+    item.hp_pct = player.hp_pct;
+    item.shield_pct = player.shield_pct;
+    item.mana_pct = player.mana_pct;
+    item.max_hp = player.max_hp;
+    item.max_shield = player.max_shield;
+    const haven::Vitals from_item = haven::vitals_from_player(item);
+    expect(from_item.reported, "a draw item always reports");
+    expect(from_item.race_id == from_net.race_id && from_item.hp_pct == from_net.hp_pct &&
+               from_item.shield_pct == from_net.shield_pct && from_item.mana_pct == from_net.mana_pct &&
+               from_item.max_hp == from_net.max_hp && from_item.max_shield == from_net.max_shield,
+           "the draw item and the wire record agree");
+}
+
 void test_choice_input()
 {
     std::printf("choice input\n");
@@ -3042,6 +3183,9 @@ int main()
     test_hud_text();
     test_xp_bar_fill();
     test_evolution_watch();
+    test_bar_animator();
+    test_dash_affordable();
+    test_vitals_from();
     test_projectile_shapes();
     test_collect_draw_items();
     test_empty_buffer_collects_nothing();

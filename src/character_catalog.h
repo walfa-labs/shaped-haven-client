@@ -25,6 +25,10 @@ struct RaceInfo {
     uint16_t max_mana;
     float move_speed_mult;
     float damage_mult;
+    /// Mana a dash costs. Not on the wire — `PlayerNet` carries only the
+    /// current mana percentage — so the HUD reads it from here to decide
+    /// whether a dash attempt can be paid for.
+    uint16_t dash_mana_cost;
 };
 
 struct StartingWeaponInfo {

@@ -10,12 +10,16 @@
 #include <OgreEntity.h>
 #include <OgreMaterialManager.h>
 #include <OgrePass.h>
+#include <OgreQuaternion.h>
 #include <OgreResourceGroupManager.h>
 #include <OgreRoot.h>
 #include <OgreSceneManager.h>
 #include <OgreTechnique.h>
+#include <OgreVector3.h>
 
+#include <algorithm>
 #include <array>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <map>
@@ -29,6 +33,8 @@ namespace {
 constexpr const char* kResourceGroup = "ShapedHaven";
 constexpr const char* kQuadMesh = "haven/player_square";
 
+constexpr float kPi = 3.14159265358979323846f;
+
 /// DESIGN.md section 1: the orthographic viewport covers 80 x 45 units.
 constexpr float kViewportHalfWidth = 40.0f;
 constexpr float kViewportHalfHeight = 22.5f;
@@ -38,6 +44,102 @@ constexpr float kXpBarX = -36.0f;
 constexpr float kXpBarWidth = 72.0f;
 constexpr float kXpBarY = 19.1f;  // centre line
 constexpr float kXpBarHeight = 1.4f;
+constexpr float kXpBarCentreX = kXpBarX + kXpBarWidth * 0.5f;
+
+/// The Persona-styled status cluster. The three bars are stacked at the top
+/// left, under the XP bar: shield above health, mana beneath it. The cluster
+/// is rotated about `kStatusCentreX/Y`, which is what keeps the ends of the
+/// rotated bars inside the viewport — the XP bar cannot be rotated at all,
+/// see kXpBarShear.
+///
+/// The vertical steps are wide enough that one bar's border cannot reach the
+/// next bar: each bar's border extends `kBarBorder` past its own half height,
+/// so the shield's step has to exceed the health bar's half height plus two
+/// borders, and the mana bar's has to be far enough below it.
+constexpr float kStatusCentreX = -20.0f;
+constexpr float kStatusCentreY = 11.8f;
+constexpr float kStatusHalfWidth = 16.0f;
+constexpr float kStatusShieldY = 2.3f;
+constexpr float kStatusManaY = -2.4f;
+constexpr float kHpBarHalfHeight = 0.85f;
+constexpr float kShieldBarHalfHeight = 0.55f;
+constexpr float kManaBarHalfHeight = 0.65f;
+
+/// Every bar is rotated this far about its own centre, and sheared this many
+/// units of x per unit of y. The shear is what makes the bars read as Persona's
+/// skewed geometry rather than plain boxes.
+constexpr float kBarAngle = -8.0f * kPi / 180.0f;
+constexpr float kBarShear = 0.35f;
+/// The XP bar's shear, larger than the cluster's because it has no rotation to
+/// give it its slant.
+constexpr float kXpBarShear = 1.2f;
+
+/// Border and fill insets, in viewport units. The frame is a black quad, a
+/// white quad at half the thickness inside it, then the dark track; the fill
+/// sits `kBarFillInset` inside the track so the white border stays visible.
+constexpr float kBarBorder = 0.30f;
+constexpr float kBarFillInset = 0.10f;
+
+// The status cluster's steps clear each other's borders: each bar's border
+// reaches `kBarBorder` past its own half height, so the shield has to sit more
+// than two borders above the health bar's top edge, and the mana bar the same
+// distance below its bottom edge.
+static_assert(kStatusShieldY - kShieldBarHalfHeight - kBarBorder > kHpBarHalfHeight + kBarBorder,
+              "the shield bar's border runs into the health bar");
+static_assert(kStatusManaY + kManaBarHalfHeight + kBarBorder < -kHpBarHalfHeight - kBarBorder,
+              "the mana bar's border runs into the health bar");
+// The whole rotated cluster has to fit between the XP bar above it and the
+// bottom of the viewport. The shield's top corner and the mana bar's bottom
+// corner are the extremes once the -8 degree turn is applied.
+static_assert(kStatusCentreY + (kStatusHalfWidth + kBarBorder) * 0.14f +
+                      (kStatusShieldY + kShieldBarHalfHeight + kBarBorder) * 0.99f <
+                  kXpBarY - kXpBarHeight * 0.5f - kBarBorder,
+              "the rotated shield bar runs into the XP bar");
+static_assert(kStatusCentreY - (kStatusHalfWidth + kBarBorder) * 0.14f -
+                      (kStatusManaY - kManaBarHalfHeight - kBarBorder) * -0.99f > -kViewportHalfHeight,
+              "the rotated mana bar falls off the bottom of the screen");
+
+/// Layer offsets within a bar batch, added to the batch's own z. Two coplanar
+/// quads have no defined order between them — the crimson accent on the XP bar
+/// was seen disappearing behind its own track on one run and not the next — so
+/// a layer that has to sit over another is given a slightly greater depth.
+constexpr float kBarGhostZ = 0.001f;
+constexpr float kBarFillZ = 0.002f;
+constexpr float kBarDecalZ = 0.003f;
+
+/// The same offsets for a layered box (a tray slot or a level-up card): black
+/// outer border, white inner border, the box's own colour, dark interior.
+constexpr float kBoxBorderZ = 0.001f;
+constexpr float kBoxAccentZ = 0.002f;
+constexpr float kBoxInnerZ = 0.003f;
+
+/// The panel's two borders, as depths either side of the panel itself. The gaps
+/// are wide enough that the three cannot z-fight.
+constexpr float kPanelBorderOuterZ = 0.482f;
+constexpr float kPanelBorderInnerZ = 0.484f;
+constexpr float kPanelZ = 0.486f;
+
+/// The mana bar's gradient is drawn as this many flat slices, which is the
+/// only gradient the flat-colour HUD materials can express.
+constexpr int kManaSlices = 24;
+
+/// The shield bar's chevron dividers: one hexagon every kShieldSegmentPoints
+/// points of the bar's 100-point scale.
+constexpr float kChevronRadius = 0.34f;
+constexpr float kChevronThickness = 0.10f;
+
+/// Persona palette. High contrast, one crimson accent.
+constexpr Rgba kPersonaBlack{0.02f, 0.02f, 0.03f, 1.0f};
+constexpr Rgba kPersonaWhite{0.98f, 0.98f, 1.00f, 1.0f};
+constexpr Rgba kCrimson{0.902f, 0.000f, 0.071f, 1.0f};       // #E60012
+constexpr Rgba kShieldCyan{0.000f, 0.941f, 1.000f, 1.0f};    // #00F0FF
+constexpr Rgba kManaCobalt{0.106f, 0.400f, 1.000f, 1.0f};    // #1B66FF
+constexpr Rgba kManaViolet{0.541f, 0.169f, 0.886f, 1.0f};    // #8A2BE2
+constexpr Rgba kHpGreen{0.35f, 0.85f, 0.55f, 0.95f};
+/// The track a fill sits on. Opaque: a transparent track would let the white
+/// border behind it show through and read as a mid grey rather than a dark
+/// trough for the fill.
+constexpr Rgba kBarTrack{0.07f, 0.08f, 0.12f, 1.0f};
 
 /// Item tray geometry.
 constexpr float kTrayWeaponWidth = 6.4f;
@@ -164,6 +266,18 @@ Hud::Hud(Ogre::SceneManager* scene_manager, MeshFactory* meshes, Ogre::SceneNode
     tray_.name = "haven/hud_tray";
     modal_.name = "haven/hud_modal";
     menu_.name = "haven/hud_menu";
+    xp_bar_.name = "haven/hud_xp_bar";
+    xp_bar_.z = 0.06f;
+    status_.name = "haven/hud_status";
+    status_.z = 0.06f;
+    status_.x = kStatusCentreX;
+    status_.y = kStatusCentreY;
+    status_.angle = kBarAngle;
+    status_decals_.name = "haven/hud_status_decals";
+    status_decals_.z = 0.06f;
+    status_decals_.x = kStatusCentreX;
+    status_decals_.y = kStatusCentreY;
+    status_decals_.angle = kBarAngle;
     select_fields_.name = "haven/hud_select_fields";
     select_fields_.z = 0.488f;
     select_.name = "haven/hud_select";
@@ -251,19 +365,42 @@ void Hud::build_persistent_elements()
         return entity;
     };
 
-    xp_bg_ = make_quad("haven/xp_bar_bg", Rgba{0.07f, 0.08f, 0.12f, 0.92f}, 0.06f);
-    xp_fill_ = make_quad("haven/xp_bar_fill", Rgba{0.35f, 0.85f, 0.55f, 0.95f}, 0.07f);
     dim_ = make_quad("haven/hud_dim", Rgba{0.01f, 0.01f, 0.02f, 0.72f}, 0.48f);
-    panel_ = make_quad("haven/hud_panel", Rgba{0.06f, 0.07f, 0.11f, 0.90f}, 0.485f);
+    panel_ = make_quad("haven/hud_panel", Rgba{0.06f, 0.07f, 0.11f, 0.90f}, kPanelZ);
+    panel_border_outer_ = make_quad("haven/hud_panel_border_outer", kPersonaBlack, kPanelBorderOuterZ);
+    panel_border_inner_ = make_quad("haven/hud_panel_border_inner", kPersonaWhite, kPanelBorderInnerZ);
 
-    // The quad mesh is 1x1 unit; the persistent elements are sized once here.
-    xp_bg_->getParentNode()->setScale(kXpBarWidth, kXpBarHeight, 1.0f);
-    xp_bg_->getParentNode()->setPosition(kXpBarX + kXpBarWidth * 0.5f, kXpBarY, 0.06f);
     dim_->getParentNode()->setScale(82.0f, 47.0f, 1.0f);
     panel_->getParentNode()->setScale(48.0f, 24.0f, 1.0f);
+    panel_border_outer_->getParentNode()->setScale(48.6f, 24.6f, 1.0f);
+    panel_border_inner_->getParentNode()->setScale(48.3f, 24.3f, 1.0f);
 
-    xp_bg_->setVisible(true);
+    dim_->setVisible(false);
     initialised_ = true;
+}
+
+void Hud::set_panel(float half_width, float half_height, float centre_y)
+{
+    const auto place = [this, half_width, half_height, centre_y](Ogre::Entity* entity, float grow) {
+        Ogre::Node* node = entity->getParentNode();
+        node->setScale(half_width * 2.0f + grow, half_height * 2.0f + grow, 1.0f);
+        node->setPosition(0.0f, centre_y, node->getPosition().z);
+    };
+    // The panel sits between its two borders in z, so the black one reads as
+    // the outer edge and the white one as the inner.
+    place(panel_border_outer_, 0.6f);
+    place(panel_border_inner_, 0.3f);
+    place(panel_, 0.0f);
+    panel_border_outer_->setVisible(true);
+    panel_border_inner_->setVisible(true);
+    panel_->setVisible(true);
+}
+
+void Hud::hide_panel()
+{
+    panel_border_outer_->setVisible(false);
+    panel_border_inner_->setVisible(false);
+    panel_->setVisible(false);
 }
 
 // ---------------------------------------------------------------------------
@@ -278,25 +415,9 @@ void Hud::set_run_time(uint32_t run_time_ms)
     // a restart clears the HUD; GameSession::update() calls this every frame,
     // so the empty case has to be answered without reading through it.
     const XpBarFill fill = xp_bar_fill(loadout_);
-    if (fill.visible)
-    {
-        const float width = kXpBarWidth * fill.fraction;
-        if (width > 0.01f)
-        {
-            xp_fill_->setVisible(true);
-            Ogre::Node* node = xp_fill_->getParentNode();
-            node->setScale(width, kXpBarHeight, 1.0f);
-            node->setPosition(kXpBarX + width * 0.5f, kXpBarY, 0.07f);
-        }
-        else
-        {
-            xp_fill_->setVisible(false);
-        }
-    }
-    else
-    {
-        xp_fill_->setVisible(false);
-    }
+    xp_fill_visible_ = fill.visible;
+    xp_fraction_ = fill.fraction;
+    refresh_vitals();
 
     const uint32_t second = run_time_ms / 1000u;
     if (second == last_run_second_) return;
@@ -324,10 +445,7 @@ void Hud::show_offer(const LevelUpOffer& offer)
     layout_offer(offer);
     offer_visible_ = true;
     dim_->setVisible(true);
-    panel_->setVisible(true);
-    Ogre::Node* panel_node = panel_->getParentNode();
-    panel_node->setScale(66.0f, 18.5f, 1.0f);
-    panel_node->setPosition(0.0f, kCardY - 0.5f, 0.485f);
+    set_panel(33.0f, 9.25f, kCardY - 0.5f);
 }
 
 void Hud::hide_offer()
@@ -342,7 +460,7 @@ void Hud::hide_offer()
     destroy_layer(modal_footer_);
     offer_visible_ = false;
     dim_->setVisible(false);
-    panel_->setVisible(false);
+    hide_panel();
 }
 
 void Hud::show_evolution(uint8_t evo_item_id)
@@ -359,10 +477,7 @@ void Hud::show_game_over(const GameOverStats& stats)
     layout_game_over(stats);
     game_over_visible_ = true;
     dim_->setVisible(true);
-    panel_->setVisible(true);
-    Ogre::Node* panel_node = panel_->getParentNode();
-    panel_node->setScale(48.0f, 24.0f, 1.0f);
-    panel_node->setPosition(0.0f, 0.0f, 0.485f);
+    set_panel(24.0f, 12.0f, 0.0f);
 }
 
 void Hud::hide_game_over()
@@ -373,7 +488,7 @@ void Hud::hide_game_over()
     destroy_layer(score_footer_);
     game_over_visible_ = false;
     dim_->setVisible(false);
-    panel_->setVisible(false);
+    hide_panel();
 }
 
 void Hud::reset()
@@ -382,13 +497,30 @@ void Hud::reset()
     loadout_.reset();
     hide_offer();
     hide_game_over();
-    xp_fill_->setVisible(false);
+    xp_fill_visible_ = false;
+    xp_fraction_ = 0.0f;
+    bars_ = BarAnimator{};
+    refresh_vitals();
     clear_batch(tray_);
     destroy_layer(tray_text_);
     destroy_layer(hud_lines_);
     last_run_second_ = 0xFFFFFFFFu;
     banner_visible_ = false;
     banner_timer_ = 0.0f;
+}
+
+void Hud::set_vitals(const Vitals& vitals)
+{
+    if (!initialised_) return;
+    bars_.observe(vitals);
+    refresh_vitals();
+}
+
+void Hud::signal_dash_denied()
+{
+    if (!initialised_) return;
+    bars_.signal_dash_denied();
+    refresh_vitals();
 }
 
 // ---------------------------------------------------------------------------
@@ -401,13 +533,10 @@ void Hud::show_main_menu()
     layout_main_menu();
     menu_visible_ = true;
     // The XP bar is run-bound; it comes back when the menu goes away.
-    xp_bg_->setVisible(false);
-    xp_fill_->setVisible(false);
+    xp_bar_visible_ = false;
+    refresh_vitals();
     dim_->setVisible(true);
-    panel_->setVisible(true);
-    Ogre::Node* panel_node = panel_->getParentNode();
-    panel_node->setScale(46.0f, 33.0f, 1.0f);
-    panel_node->setPosition(0.0f, 0.0f, 0.485f);
+    set_panel(23.0f, 16.5f, 0.0f);
 }
 
 void Hud::hide_main_menu()
@@ -419,9 +548,10 @@ void Hud::hide_main_menu()
     destroy_layer(menu_footer_);
     destroy_layer(menu_error_);
     menu_visible_ = false;
-    xp_bg_->setVisible(true);
+    xp_bar_visible_ = true;
+    refresh_vitals();
     dim_->setVisible(false);
-    panel_->setVisible(false);
+    hide_panel();
 }
 
 void Hud::set_menu_selection(int selection)
@@ -455,13 +585,10 @@ void Hud::show_character_select()
     layout_character_select();
     select_visible_ = true;
     // The XP bar is run-bound; it comes back when the screen goes away.
-    xp_bg_->setVisible(false);
-    xp_fill_->setVisible(false);
+    xp_bar_visible_ = false;
+    refresh_vitals();
     dim_->setVisible(true);
-    panel_->setVisible(true);
-    Ogre::Node* panel_node = panel_->getParentNode();
-    panel_node->setScale(82.0f, 46.0f, 1.0f);
-    panel_node->setPosition(0.0f, 0.0f, 0.485f);
+    set_panel(41.0f, 23.0f, 0.0f);
 }
 
 void Hud::hide_character_select()
@@ -478,7 +605,7 @@ void Hud::hide_character_select()
     destroy_layer(select_hints_);
     select_visible_ = false;
     dim_->setVisible(false);
-    panel_->setVisible(false);
+    hide_panel();
 }
 
 void Hud::set_character_select_selection(int selection)
@@ -518,6 +645,9 @@ void Hud::shutdown()
     hide_main_menu();
     hide_character_select();
     clear_batch(tray_);
+    clear_batch(xp_bar_);
+    clear_batch(status_);
+    clear_batch(status_decals_);
     destroy_layer(tray_text_);
     destroy_layer(hud_lines_);
     destroy_layer(banner_tag_);
@@ -529,6 +659,13 @@ void Hud::shutdown()
 
 void Hud::tick(float dt_seconds)
 {
+    if (!initialised_) return;
+    // The bars' timers run on the same per-frame clock as the banner. They are
+    // ticked here, once per rendered frame: GameSession must not tick the HUD
+    // as well, or the ghost bar's 450 ms hold would really be 225 ms.
+    bars_.tick(dt_seconds);
+    refresh_vitals();
+
     if (!banner_visible_) return;
     banner_timer_ -= dt_seconds;
     if (banner_timer_ <= 0.0f)
@@ -622,13 +759,13 @@ void Hud::destroy_layer(TextLayer*& ptr)
 // Quad batch (tray boxes, modal cards).
 // ---------------------------------------------------------------------------
 
-void Hud::quad_into(QuadBatch& batch, Rgba colour, float cx, float cy, float hx, float hy)
+void Hud::quad_into(QuadBatch& batch, Rgba colour, float cx, float cy, float hx, float hy, float z)
 {
     QuadBatch::Section* section = nullptr;
     for (QuadBatch::Section& existing : batch.sections)
     {
         if (existing.colour.r == colour.r && existing.colour.g == colour.g &&
-            existing.colour.b == colour.b && existing.colour.a == colour.a)
+            existing.colour.b == colour.b && existing.colour.a == colour.a && existing.z == z)
         {
             section = &existing;
             break;
@@ -639,6 +776,7 @@ void Hud::quad_into(QuadBatch& batch, Rgba colour, float cx, float cy, float hx,
         batch.sections.push_back(QuadBatch::Section{});
         section = &batch.sections.back();
         section->colour = colour;
+        section->z = z;
     }
     // Same counter-clockwise winding as PrimitiveSink::quad.
     const std::array<std::pair<float, float>, 4> corners{{{-hx, -hy}, {hx, -hy}, {hx, hy}, {-hx, hy}}};
@@ -646,6 +784,34 @@ void Hud::quad_into(QuadBatch& batch, Rgba colour, float cx, float cy, float hx,
     {
         section->xs.push_back(cx + corner.first);
         section->ys.push_back(cy + corner.second);
+    }
+    section->verts += 4;
+    section->indices += 6;
+}
+
+void Hud::quad_corners_into(QuadBatch& batch, Rgba colour, const float xs[4], const float ys[4], float z)
+{
+    QuadBatch::Section* section = nullptr;
+    for (QuadBatch::Section& existing : batch.sections)
+    {
+        if (existing.colour.r == colour.r && existing.colour.g == colour.g &&
+            existing.colour.b == colour.b && existing.colour.a == colour.a && existing.z == z)
+        {
+            section = &existing;
+            break;
+        }
+    }
+    if (section == nullptr)
+    {
+        batch.sections.push_back(QuadBatch::Section{});
+        section = &batch.sections.back();
+        section->colour = colour;
+        section->z = z;
+    }
+    for (int corner = 0; corner < 4; ++corner)
+    {
+        section->xs.push_back(xs[corner]);
+        section->ys.push_back(ys[corner]);
     }
     section->verts += 4;
     section->indices += 6;
@@ -663,13 +829,9 @@ void Hud::rebuild_batch(QuadBatch& batch)
     if (batch.node == nullptr)
     {
         batch.node = attach_node_->createChildSceneNode();
-        batch.node->setPosition(0.0f, 0.0f, 0.0f);
     }
-    if (batch.object != nullptr)
-    {
-        scene_->destroyManualObject(batch.object);
-        batch.object = nullptr;
-    }
+    batch.node->setPosition(batch.x, batch.y, 0.0f);
+    batch.node->setOrientation(Ogre::Quaternion(Ogre::Radian(batch.angle), Ogre::Vector3::UNIT_Z));
 
     Ogre::ManualObject* object = scene_->createManualObject(batch.name);
     object->setDynamic(true);
@@ -685,7 +847,8 @@ void Hud::rebuild_batch(QuadBatch& batch)
         {
             for (int corner = 0; corner < 4; ++corner)
             {
-                object->position(section.xs[quad + corner], section.ys[quad + corner], batch.z);
+                object->position(section.xs[quad + corner], section.ys[quad + corner],
+                                 batch.z + section.z);
                 object->normal(0.0f, 0.0f, 1.0f);
             }
             const uint32_t base = static_cast<uint32_t>(quad);
@@ -715,8 +878,242 @@ void Hud::clear_batch(QuadBatch& batch)
 }
 
 // ---------------------------------------------------------------------------
+// Persona-styled bars.
+// ---------------------------------------------------------------------------
+
+void Hud::layered_box_into(QuadBatch& batch, Rgba accent, Rgba inner, float x, float y, float w,
+                           float h, float border)
+{
+    // Four concentric boxes, each a little smaller and a little nearer, so the
+    // rims read as black outside, white inside, then the box's own colour.
+    quad_into(batch, kPersonaBlack, x, y, w * 0.5f, h * 0.5f, 0.0f);
+    quad_into(batch, kPersonaWhite, x, y, (w - border) * 0.5f, (h - border) * 0.5f, kBoxBorderZ);
+    quad_into(batch, accent, x, y, (w - 2.0f * border) * 0.5f, (h - 2.0f * border) * 0.5f,
+              kBoxAccentZ);
+    quad_into(batch, inner, x, y, (w - 3.0f * border) * 0.5f, (h - 3.0f * border) * 0.5f,
+              kBoxInnerZ);
+}
+
+void Hud::bar_frame_into(QuadBatch& batch, float cx, float cy, float hx, float hy, float shear)
+{
+    // Black outside, white inside, then the dark track the fill sits on. The
+    // three are concentric and shrink, so each one's rim shows around the next.
+    const float local[4][2] = {{-hx - shear * hy, -hy}, {hx - shear * hy, -hy},
+                               {hx + shear * hy, hy},   {-hx + shear * hy, hy}};
+    auto emit = [&](Rgba colour, float grow) {
+        float xs[4], ys[4];
+        for (int i = 0; i < 4; ++i)
+        {
+            xs[i] = cx + local[i][0] * (1.0f + grow / hx);
+            ys[i] = cy + local[i][1] * (1.0f + grow / hy);
+        }
+        quad_corners_into(batch, colour, xs, ys);
+    };
+    emit(kPersonaBlack, kBarBorder);
+    emit(kPersonaWhite, kBarBorder * 0.5f);
+    emit(kBarTrack, 0.0f);
+}
+
+void Hud::bar_fill_into(QuadBatch& batch, float cx, float cy, float hx, float hy, float shear,
+                        float fraction, Rgba colour, float inset, float z)
+{
+    const float clamped = std::max(0.0f, std::min(1.0f, fraction));
+    if (clamped <= 0.0f) return;
+    const float fill_hy = hy - inset;
+    if (fill_hy <= 0.0f) return;
+
+    // A parallelogram with the track's own shear, anchored at its left edge so
+    // its left side stays parallel to the track's.
+    const float fill_hx = hx * clamped;
+    const float fill_cx = cx - hx + fill_hx;
+    const float local[4][2] = {{-fill_hx - shear * fill_hy, -fill_hy},
+                               {fill_hx - shear * fill_hy, -fill_hy},
+                               {fill_hx + shear * fill_hy, fill_hy},
+                               {-fill_hx + shear * fill_hy, fill_hy}};
+    float xs[4], ys[4];
+    for (int i = 0; i < 4; ++i)
+    {
+        xs[i] = fill_cx + local[i][0];
+        ys[i] = cy + local[i][1];
+    }
+    quad_corners_into(batch, colour, xs, ys, z);
+}
+
+void Hud::hexagon_into(QuadBatch& batch, Rgba colour, float cx, float cy, float radius, float thickness,
+                       float shear)
+{
+    if (radius <= 0.0f || thickness <= 0.0f) return;
+    // Six corners of a flat-topped hexagon, each edge drawn as a thin quad.
+    float px[6], py[6];
+    for (int i = 0; i < 6; ++i)
+    {
+        const float a = static_cast<float>(i) * kPi / 3.0f;
+        px[i] = cx + std::cos(a) * radius + shear * std::sin(a) * radius;
+        py[i] = cy + std::sin(a) * radius;
+    }
+    for (int i = 0; i < 6; ++i)
+    {
+        const int next = (i + 1) % 6;
+        const float ax = px[i], ay = py[i];
+        const float bx = px[next], by = py[next];
+        // Inward normal of the edge, scaled to the ring's thickness.
+        const float ex = bx - ax, ey = by - ay;
+        const float len = std::sqrt(ex * ex + ey * ey);
+        if (len <= 0.0f) continue;
+        const float nx = -ey / len * thickness * 0.5f;
+        const float ny = ex / len * thickness * 0.5f;
+        const float xs[4] = {ax - nx, bx - nx, bx + nx, ax + nx};
+        const float ys[4] = {ay - ny, by - ny, by + ny, ay + ny};
+        quad_corners_into(batch, colour, xs, ys);
+    }
+}
+
+Rgba Hud::mana_gradient(float t)
+{
+    const float clamped = std::max(0.0f, std::min(1.0f, t));
+    return Rgba{kManaCobalt.r + (kManaViolet.r - kManaCobalt.r) * clamped,
+                kManaCobalt.g + (kManaViolet.g - kManaCobalt.g) * clamped,
+                kManaCobalt.b + (kManaViolet.b - kManaCobalt.b) * clamped,
+                1.0f};
+}
+
+// ---------------------------------------------------------------------------
 // Layouts.
 // ---------------------------------------------------------------------------
+
+void Hud::layout_xp_bar()
+{
+    clear_batch(xp_bar_);
+    if (xp_bar_visible_)
+    {
+        constexpr float hx = kXpBarWidth * 0.5f;
+        constexpr float hy = kXpBarHeight * 0.5f;
+        bar_frame_into(xp_bar_, kXpBarCentreX, kXpBarY, hx, hy, kXpBarShear);
+        if (xp_fill_visible_)
+            bar_fill_into(xp_bar_, kXpBarCentreX, kXpBarY, hx, hy, kXpBarShear, xp_fraction_,
+                          kHpGreen, kBarFillInset, kBarFillZ);
+        // The crimson accent: a tab on the bar's left end, which is what ties
+        // the XP bar to the status cluster's palette. It sits above the track,
+        // so it gets its own depth rather than relying on section order.
+        const float tab_hx = 0.45f;
+        const float tab_cx = kXpBarCentreX - hx + tab_hx;
+        const float local[4][2] = {{-tab_hx - kXpBarShear * hy, -hy},
+                                   {tab_hx - kXpBarShear * hy, -hy},
+                                   {tab_hx + kXpBarShear * hy, hy},
+                                   {-tab_hx + kXpBarShear * hy, hy}};
+        float xs[4], ys[4];
+        for (int i = 0; i < 4; ++i)
+        {
+            xs[i] = tab_cx + local[i][0];
+            ys[i] = kXpBarY + local[i][1];
+        }
+        quad_corners_into(xp_bar_, kCrimson, xs, ys, kBarDecalZ);
+    }
+    rebuild_batch(xp_bar_);
+}
+
+void Hud::layout_status_bars()
+{
+    clear_batch(status_);
+    clear_batch(status_decals_);
+    if (bars_.visible())
+    {
+        // Shield, stacked directly above health. It is the one bar that is
+        // absent for a race with no shield, so it is skipped rather than drawn
+        // empty.
+        if (bars_.shield_visible())
+        {
+            bar_frame_into(status_, 0.0f, kStatusShieldY, kStatusHalfWidth, kShieldBarHalfHeight,
+                           kBarShear);
+            bar_fill_into(status_, 0.0f, kStatusShieldY, kStatusHalfWidth, kShieldBarHalfHeight,
+                          kBarShear, bars_.shield_fraction(), kShieldCyan, kBarFillInset, kBarFillZ);
+            // One hexagonal chevron divider every kShieldSegmentPoints points
+            // of the bar's 100-point scale. They go above the fill they mark.
+            for (int point = kShieldSegmentPoints; point < 100; point += kShieldSegmentPoints)
+            {
+                const float fraction = static_cast<float>(point) / 100.0f;
+                const float x = -kStatusHalfWidth + 2.0f * kStatusHalfWidth * fraction;
+                hexagon_into(status_decals_, kPersonaWhite, x, kStatusShieldY, kChevronRadius,
+                             kChevronThickness, kBarShear);
+            }
+        }
+
+        // Health: the white ghost bar behind the fill, so a hit reads as the
+        // ghost draining away after its hold.
+        bar_frame_into(status_, 0.0f, 0.0f, kStatusHalfWidth, kHpBarHalfHeight, kBarShear);
+        bar_fill_into(status_, 0.0f, 0.0f, kStatusHalfWidth, kHpBarHalfHeight, kBarShear,
+                      bars_.ghost_fraction(), kPersonaWhite, kBarFillInset, kBarGhostZ);
+        bar_fill_into(status_, 0.0f, 0.0f, kStatusHalfWidth, kHpBarHalfHeight, kBarShear,
+                      bars_.hp_fraction(), kHpGreen, kBarFillInset, kBarFillZ);
+
+        // Mana, beneath health: a cobalt-to-violet gradient, or white while a
+        // dash the player could not pay for is being reported. The gradient is
+        // drawn as flat slices because the HUD's materials carry one colour
+        // each; 24 of them read as a smooth ramp.
+        bar_frame_into(status_, 0.0f, kStatusManaY, kStatusHalfWidth, kManaBarHalfHeight, kBarShear);
+        const float fraction = std::max(0.0f, std::min(1.0f, bars_.mana_fraction()));
+        if (fraction > 0.0f)
+        {
+            const float bar_hx = kStatusHalfWidth;
+            const float fill_hy = kManaBarHalfHeight - kBarFillInset;
+            const float left = -bar_hx;
+            const float span = 1.0f / static_cast<float>(kManaSlices);
+            for (int slice = 0; slice < kManaSlices; ++slice)
+            {
+                const float t0 = static_cast<float>(slice) * span;
+                if (t0 >= fraction) break;
+                const float t1 = std::min(t0 + span, fraction);
+                const float half = (t1 - t0) * bar_hx;
+                const float cx = left + (t0 + t1) * bar_hx;
+                const Rgba colour = bars_.mana_flashing() ? kPersonaWhite : mana_gradient(t0);
+                const float local[4][2] = {{-half - kBarShear * fill_hy, -fill_hy},
+                                           {half - kBarShear * fill_hy, -fill_hy},
+                                           {half + kBarShear * fill_hy, fill_hy},
+                                           {-half + kBarShear * fill_hy, fill_hy}};
+                float xs[4], ys[4];
+                for (int i = 0; i < 4; ++i)
+                {
+                    xs[i] = cx + local[i][0];
+                    ys[i] = kStatusManaY + local[i][1];
+                }
+                quad_corners_into(status_, colour, xs, ys, kBarFillZ);
+            }
+        }
+    }
+    rebuild_batch(status_);
+    rebuild_batch(status_decals_);
+}
+
+void Hud::layout_vitals()
+{
+    layout_xp_bar();
+    layout_status_bars();
+}
+
+bool Hud::vitals_dirty() const
+{
+    return bars_.visible() != laid_.status_visible || bars_.shield_visible() != laid_.shield_visible ||
+           bars_.mana_flashing() != laid_.flashing || xp_bar_visible_ != laid_.xp_visible ||
+           xp_fill_visible_ != laid_.xp_fill_visible || bars_.hp_fraction() != laid_.hp ||
+           bars_.ghost_fraction() != laid_.ghost || bars_.shield_fraction() != laid_.shield ||
+           bars_.mana_fraction() != laid_.mana || xp_fraction_ != laid_.xp;
+}
+
+void Hud::refresh_vitals()
+{
+    if (!initialised_ || !vitals_dirty()) return;
+    layout_vitals();
+    laid_.status_visible = bars_.visible();
+    laid_.shield_visible = bars_.shield_visible();
+    laid_.flashing = bars_.mana_flashing();
+    laid_.xp_visible = xp_bar_visible_;
+    laid_.xp_fill_visible = xp_fill_visible_;
+    laid_.hp = bars_.hp_fraction();
+    laid_.ghost = bars_.ghost_fraction();
+    laid_.shield = bars_.shield_fraction();
+    laid_.mana = bars_.mana_fraction();
+    laid_.xp = xp_fraction_;
+}
 
 void Hud::layout_tray(const Loadout& loadout)
 {
@@ -726,9 +1123,10 @@ void Hud::layout_tray(const Loadout& loadout)
     const Rgba kPipEmpty{0.15f, 0.16f, 0.20f, 0.9f};
     constexpr float kBorder = 0.25f;
 
+    // Jagged double border on every slot: black outside, white inside, then
+    // the slot's own colour and its dark interior.
     auto box = [&](Rgba colour, float x, float y, float w, float h) {
-        quad_into(tray_, colour, x, y, w * 0.5f, h * 0.5f);
-        quad_into(tray_, kInner, x, y, (w - 2.0f * kBorder) * 0.5f, (h - 2.0f * kBorder) * 0.5f);
+        layered_box_into(tray_, colour, kInner, x, y, w, h, kBorder);
     };
 
     for (size_t i = 0; i < 4; ++i)
@@ -876,9 +1274,10 @@ void Hud::layout_offer(const LevelUpOffer& offer)
     {
         const UpgradeOptionNet& option = offer.options[i];
         const Rgba accent = option.is_evo ? kGold : item_colour(option.item_id);
-        quad_into(modal_, accent, kCardX[i], kCardY, kCardWidth * 0.5f, kCardHeight * 0.5f);
-        quad_into(modal_, kCardInner, kCardX[i], kCardY, (kCardWidth - 0.9f) * 0.5f,
-                  (kCardHeight - 0.9f) * 0.5f);
+        // Black outer border, white inner border, then the card's accent and
+        // its interior — the same frame the HUD bars carry.
+        layered_box_into(modal_, accent, kCardInner, kCardX[i], kCardY, kCardWidth, kCardHeight,
+                         0.45f);
     }
     rebuild_batch(modal_);
 
@@ -971,7 +1370,7 @@ void Hud::layout_offer(const LevelUpOffer& offer)
         key.pixel = 0.32f;
         key.x = kCardX[i] - static_cast<float>(text_pixel_width(key.text)) * key.pixel * 0.5f;
         key.y = -6.6f;
-        key.colour = kWhite;
+        key.colour = kCrimson;
         card->lines.push_back(key);
 
         rebuild_layer(*card);
@@ -991,7 +1390,6 @@ void Hud::layout_offer(const LevelUpOffer& offer)
 
 void Hud::layout_game_over(const GameOverStats& stats)
 {
-    const Rgba kGold{1.00f, 0.80f, 0.30f, 1.0f};
     const Rgba kWhite{0.92f, 0.94f, 0.98f, 1.0f};
     const Rgba kDim{0.70f, 0.74f, 0.82f, 1.0f};
 
@@ -1002,7 +1400,7 @@ void Hud::layout_game_over(const GameOverStats& stats)
     title_line.pixel = 0.70f;
     title_line.x = -static_cast<float>(text_pixel_width(title_line.text)) * title_line.pixel * 0.5f;
     title_line.y = 10.5f;
-    title_line.colour = kGold;
+    title_line.colour = kCrimson;
     title->lines.push_back(title_line);
     rebuild_layer(*title);
 

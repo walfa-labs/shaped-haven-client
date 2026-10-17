@@ -150,9 +150,10 @@ on a restart.
 
 The pure parts of the run logic live in their own translation units so they can
 be tested without Ogre: `run_events` holds the restart boundary, the level-up
-offer gate and the restart gate, `hud_model` holds what the HUD should show
-for a `S2C_LOADOUT`, and `snapshot_state` holds the baseline machine the delta
-protocol rests on.
+offer gate and the restart gate, `hud_model` holds what the HUD should show —
+the XP bar fill and evolution rising edge for a `S2C_LOADOUT`, and the local
+player's vitals with the health ghost bar and mana-flash timers — and
+`snapshot_state` holds the baseline machine the delta protocol rests on.
 
 The character select is covered the same way: `character_catalog` pins the ten
 race rows and their stats and the four weapons, `character_select` holds the
@@ -217,10 +218,24 @@ either server:
 - **Run timer.** The HUD run clock (`TIME mm:ss`) is driven by the snapshot's
   `run_time_ms`, so it tracks the run even while deltas keep the entity state
   in sync.
+- **Persona-styled HUD.** The status cluster — health, shield and mana — is drawn
+  as sheared parallelograms with a black outer border and a white inner one, the
+  whole cluster turned -8 degrees about its own centre. The health bar carries a
+  white ghost bar behind its fill: a hit holds the ghost at the old value for
+  450 ms and then snaps it down, while healing snaps it up at once. The shield
+  bar sits above health, is absent for a race with no shield, and carries a
+  hexagonal chevron divider every 25 points of its 100-point scale. The mana bar
+  sits beneath health as a cobalt-to-violet gradient, drawn as 24 flat slices
+  because the HUD's materials carry one colour each, and flashes white for
+  200 ms when a dash is attempted without the mana to pay for it. The same frame
+  and the crimson accent (`#E60012`) are carried by the XP bar, the item tray
+  slots, the level-up cards and the modal panels. Every layer that has to sit
+  over another is given its own depth offset, because two coplanar quads have no
+  defined order between them.
 
 Measured on this machine (Release build, 1280x720):
 
-- The logic tests report **1215 checks, 0 failures** (Release and Debug). 158 of
+- The logic tests report **1304 checks, 0 failures** (Release and Debug). 158 of
   those are the character select's: the ten race rows against the server's
   table, the four weapons, the field and value rules, and the key script.
 - The character select, driven by `--key-script` and captured with

@@ -2,6 +2,7 @@
 
 #include "entity_frame.h"
 #include "game_math.h"
+#include "hud_model.h"
 #include "item_catalog.h"
 #include "levelup_format.h"
 #include "protocol.h"
@@ -21,11 +22,12 @@ namespace haven {
 
 class MeshFactory;
 
-/// The 2D overlay: XP bar, item tray, level-up modal, evolution banner and the
-/// game-over scoreboard. Everything is drawn from the same immediate-mode
-/// PrimitiveSink the combat batches use — text included, through the baked
-/// 5x7 font in hud_text — so the HUD is one more set of Manual Object
-/// sections rather than a second rendering path.
+/// The 2D overlay: the status cluster (health, shield, mana), the XP bar, the
+/// item tray, the level-up modal, the evolution banner, the main menu, the
+/// character select and the game-over scoreboard. Everything is drawn from the
+/// same immediate-mode PrimitiveSink the combat batches use — text included,
+/// through the baked 5x7 font in hud_text — so the HUD is one more set of
+/// Manual Object sections rather than a second rendering path.
 ///
 /// Layout is in world units of the fixed 80 x 45 orthographic viewport
 /// (x in [-40, 40], y in [-22.5, 22.5]); the camera keeps the action centred,
@@ -51,6 +53,14 @@ public:
     /// reference to a caller-owned local, so the HUD keeps its own copy
     /// rather than a pointer that dangles the moment the handler returns.
     std::optional<Loadout> loadout_;
+
+    /// The local player's vitals, from the newest snapshot's own player record.
+    /// Drives the health, shield and mana bars. Call once per frame.
+    void set_vitals(const Vitals& vitals);
+
+    /// The player tried to dash without the mana to pay for it: the mana bar
+    /// flashes white for BarAnimator::kManaFlashSeconds.
+    void signal_dash_denied();
 
     // Level-up modal.
     void show_offer(const LevelUpOffer& offer);
@@ -130,18 +140,32 @@ private:
     };
 
     /// One Manual Object for every coloured quad that is not a persistent
-    /// full-screen element: the item tray boxes and the modal cards. Rebuilt
-    /// wholesale whenever it changes, sectioned per colour like the batches.
-    /// `z` places the batch among the other HUD layers: quads of two batches at
-    /// the same z have no defined order between them, so a batch that must sit
-    /// over another is given a higher one.
+    /// full-screen element: the item tray boxes, the modal cards and the HUD
+    /// bars. Rebuilt wholesale whenever it changes, sectioned per colour like
+    /// the batches. `z` places the batch among the other HUD layers: quads of
+    /// two batches at the same z have no defined order between them, so a
+    /// batch that must sit over another is given a higher one.
     struct QuadBatch {
         Ogre::ManualObject* object = nullptr;
         Ogre::SceneNode* node = nullptr;
         std::string name;
         float z = 0.49f;
+        /// The batch node's origin and rotation, in the HUD's camera-local
+        /// space. Zero for the batches that live directly in that space; the
+        /// status cluster uses them to rotate its three bars about the
+        /// cluster's own centre, which is what keeps a rotated bar from
+        /// swinging off the edge of the viewport.
+        float x = 0.0f;
+        float y = 0.0f;
+        float angle = 0.0f;
         struct Section {
             Rgba colour;
+            /// The section's depth offset above the batch's own `z`. Zero is the
+            /// batch's z; a bar's layers pass an explicit one, because two
+            /// coplanar quads have no defined order between them and a layer
+            /// that has to sit over another cannot rely on which section
+            /// happens to be drawn last.
+            float z = 0.0f;
             uint32_t verts = 0;
             uint32_t indices = 0;
             std::vector<float> xs;  // 4 corners per quad
@@ -159,14 +183,49 @@ private:
     void destroy_layer(TextLayer*& ptr);
 
     // Quad batch.
-    void quad_into(QuadBatch& batch, Rgba colour, float cx, float cy, float hx, float hy);
+    void quad_into(QuadBatch& batch, Rgba colour, float cx, float cy, float hx, float hy, float z = 0.0f);
+    /// The same quad from four explicit corners, which is how the skewed bars
+    /// are emitted: their corners are not an axis-aligned rectangle. `z` is the
+    /// section's depth offset above the batch's own.
+    void quad_corners_into(QuadBatch& batch, Rgba colour, const float xs[4], const float ys[4],
+                           float z = 0.0f);
     void rebuild_batch(QuadBatch& batch);
     void clear_batch(QuadBatch& batch);
+
+    // Persona-styled bars. Every bar is a parallelogram — a rectangle sheared
+    // along x — carrying a black outer border, a white inner border and a dark
+    // track for its fill, and the whole status cluster is rotated about its
+    // own centre.
+    ///
+    /// One layered box: black outer border, white inner border, the box's own
+    /// colour, then its dark interior. `border` is the thickness of each rim.
+    void layered_box_into(QuadBatch& batch, Rgba accent, Rgba inner, float x, float y, float w,
+                          float h, float border);
+    /// One bar's frame: borders and track, with `hx`/`hy` the track's half
+    /// extents.
+    void bar_frame_into(QuadBatch& batch, float cx, float cy, float hx, float hy, float shear);
+    /// One bar's fill, anchored at the bar's left edge and covering `fraction`
+    /// of its width. `inset` pulls the fill in from the track so the white
+    /// border stays visible around it, and `z` is the section's depth offset.
+    void bar_fill_into(QuadBatch& batch, float cx, float cy, float hx, float hy, float shear,
+                       float fraction, Rgba colour, float inset, float z = 0.0f);
+    /// One hexagonal chevron divider, the shield bar's segment mark.
+    void hexagon_into(QuadBatch& batch, Rgba colour, float cx, float cy, float radius, float thickness,
+                      float shear);
+    /// The mana bar's cobalt-to-violet gradient at `t` along the bar.
+    static Rgba mana_gradient(float t);
 
     // Persistent elements.
     void build_persistent_elements();
     void layout_tray(const Loadout& loadout);
     void rebuild_hud_lines();
+
+    // The status cluster: XP bar, health, shield and mana.
+    void refresh_vitals();
+    bool vitals_dirty() const;
+    void layout_vitals();
+    void layout_xp_bar();
+    void layout_status_bars();
 
     // Modal, scoreboard and banner layout.
     void layout_offer(const LevelUpOffer& offer);
@@ -184,14 +243,28 @@ private:
     /// still following the camera's x/y.
     Ogre::SceneNode* attach_node_ = nullptr;
 
-    Ogre::Entity* xp_bg_ = nullptr;
-    Ogre::Entity* xp_fill_ = nullptr;
     Ogre::Entity* dim_ = nullptr;
     Ogre::Entity* panel_ = nullptr;
+    /// The panel's jagged double border: black outside, white inside, drawn
+    /// around `panel_` so the modals carry the same frame the bars do.
+    Ogre::Entity* panel_border_outer_ = nullptr;
+    Ogre::Entity* panel_border_inner_ = nullptr;
 
     QuadBatch tray_;
     QuadBatch modal_;
     QuadBatch menu_;
+    /// The XP bar: the one bar that is not rotated, because a bar spanning the
+    /// whole 80-unit viewport cannot be turned -8 degrees about its centre
+    /// without pushing its ends past the top and bottom of the 45-unit window.
+    /// It carries the same frame, fill and crimson accent as the others.
+    QuadBatch xp_bar_;
+    /// The three status bars, rotated about the cluster's centre: the shield
+    /// above health, the mana bar beneath it.
+    QuadBatch status_;
+    /// The shield bar's chevron dividers. A batch of their own because they sit
+    /// on the shield fill, and a divider drawn in the fill's own batch could
+    /// render behind it.
+    QuadBatch status_decals_;
     /// The character select's field boxes, and the highlights drawn over them.
     /// They are two batches because a highlight that shared a z with the box it
     /// marks could render behind it.
@@ -238,6 +311,37 @@ private:
     int select_race_ = 0;
     int select_weapon_ = 0;
     bool initialised_ = false;
+
+    /// The animated bar state behind the status cluster.
+    BarAnimator bars_;
+    /// The XP bar's own state, mirroring what the persistent quads used to
+    /// hold: the frame stays up through a run even when there is no fill to
+    /// draw on it.
+    bool xp_bar_visible_ = true;
+    bool xp_fill_visible_ = false;
+    float xp_fraction_ = 0.0f;
+
+    /// The frame the bars were last laid out from, so `refresh_vitals()` can
+    /// rebuild only when something actually moved. The sentinel values make
+    /// the first refresh always rebuild.
+    struct LaidOut {
+        bool status_visible = false;
+        bool shield_visible = false;
+        bool flashing = false;
+        bool xp_visible = false;
+        bool xp_fill_visible = false;
+        float hp = -1.0f;
+        float ghost = -1.0f;
+        float shield = -1.0f;
+        float mana = -1.0f;
+        float xp = -1.0f;
+    };
+    LaidOut laid_;
+
+    /// Positions and scales the panel and its border are laid out with, so the
+    /// three screens that show a panel cannot drift apart.
+    void set_panel(float half_width, float half_height, float centre_y);
+    void hide_panel();
 
     struct ColourLess {
         bool operator()(const std::array<float, 4>& a, const std::array<float, 4>& b) const { return a < b; }
