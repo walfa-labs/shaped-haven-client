@@ -303,7 +303,13 @@ namespace {
 // larger than the payload is caught the moment a record runs off the end
 // rather than by trusting the count up front. Returns false on a short read or
 // a kind byte outside 0..3.
-bool read_delta_record(ByteReader& r, uint8_t kind_byte, SnapshotDelta& out, bool spawned)
+//
+// For an updated record the caller has already read the separate `id` u32 that
+// heads it, and passes it as `external_id`; the record's own id field must
+// agree with it. PROTOCOL.md sends the id twice for an updated entity, and the
+// two disagreeing means the record and its key describe different entities —
+// applying it would write one entity's state under another's key.
+bool read_delta_record(ByteReader& r, uint8_t kind_byte, SnapshotDelta& out, bool spawned, uint32_t external_id)
 {
     const DeltaKind kind = static_cast<DeltaKind>(kind_byte);
     switch (kind)
@@ -314,6 +320,7 @@ bool read_delta_record(ByteReader& r, uint8_t kind_byte, SnapshotDelta& out, boo
             uint8_t vel_angle = 0;
             if (!r.u8(p.id) || !r.u8(p.state_flags) || !r.vec2(p.pos) || !r.u8(vel_angle) || !r.u8(p.hp_pct))
                 return false;
+            if (!spawned && static_cast<uint32_t>(p.id) != external_id) return false;
             p.vel_angle = decode_angle(vel_angle);
             (spawned ? out.spawned_players : out.updated_players).push_back(p);
             return true;
@@ -325,6 +332,7 @@ bool read_delta_record(ByteReader& r, uint8_t kind_byte, SnapshotDelta& out, boo
             if (!r.u32(e.id) || !r.u8(e.archetype) || !r.u8(e.elite_mask) || !r.vec2(e.pos) || !r.u8(vel_angle) ||
                 !r.u8(e.hp_pct))
                 return false;
+            if (!spawned && e.id != external_id) return false;
             e.vel_angle = decode_angle(vel_angle);
             (spawned ? out.spawned_enemies : out.updated_enemies).push_back(e);
             return true;
@@ -336,6 +344,7 @@ bool read_delta_record(ByteReader& r, uint8_t kind_byte, SnapshotDelta& out, boo
             if (!r.u32(p.id) || !r.u8(p.owner_id) || !r.u8(p.weapon_id) || !r.u8(p.shape) || !r.vec2(p.pos) ||
                 !r.u8(vel_angle))
                 return false;
+            if (!spawned && p.id != external_id) return false;
             p.vel_angle = decode_angle(vel_angle);
             (spawned ? out.spawned_projs : out.updated_projs).push_back(p);
             return true;
@@ -345,6 +354,7 @@ bool read_delta_record(ByteReader& r, uint8_t kind_byte, SnapshotDelta& out, boo
             GemNet g;
             if (!r.u32(g.id) || !r.vec2(g.pos) || !r.u16(g.xp_value) || !r.u8(g.magnet_target_id) || !r.skip(1))
                 return false;
+            if (!spawned && g.id != external_id) return false;
             (spawned ? out.spawned_gems : out.updated_gems).push_back(g);
             return true;
         }
@@ -385,9 +395,11 @@ bool decode_snapshot_delta(const uint8_t* payload, size_t len, SnapshotDelta& ou
     out.spawned_count = counts[0];
     out.updated_count = counts[1];
     out.destroyed_count = counts[2];
-    // counts[3] is reserved and must be 0; it is read above only to advance the
-    // reader, and a non-zero value is ignored so a future use of the field does
-    // not break this client.
+    // counts[3] is reserved, and PROTOCOL.md fixes it at zero. A non-zero value
+    // is not a field a future revision may reuse silently: the frozen layout
+    // says the header is 37 bytes with a zero there, so anything else is a
+    // header that disagrees with the format this client implements.
+    if (counts[3] != 0) return false;
 
     ByteReader r(payload + kSnapshotHeaderSize, len - kSnapshotHeaderSize);
 
@@ -395,14 +407,14 @@ bool decode_snapshot_delta(const uint8_t* payload, size_t len, SnapshotDelta& ou
     {
         uint8_t kind_byte = 0;
         if (!r.u8(kind_byte)) return false;
-        if (!read_delta_record(r, kind_byte, out, /*spawned=*/true)) return false;
+        if (!read_delta_record(r, kind_byte, out, /*spawned=*/true, 0)) return false;
     }
     for (uint16_t i = 0; i < out.updated_count; ++i)
     {
         uint8_t kind_byte = 0;
         uint32_t id = 0;
         if (!r.u8(kind_byte) || !r.u32(id)) return false;
-        if (!read_delta_record(r, kind_byte, out, /*spawned=*/false)) return false;
+        if (!read_delta_record(r, kind_byte, out, /*spawned=*/false, id)) return false;
     }
     if (!read_destroyed(r, out.destroyed_count, out)) return false;
 

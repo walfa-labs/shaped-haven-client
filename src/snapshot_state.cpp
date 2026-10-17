@@ -8,7 +8,7 @@ namespace {
 /// id. The style mapping is what the snapshot's arrays mean downstream: a gem's
 /// style is its XP bucket, an enemy's its archetype, a projectile's its weapon
 /// id.
-void upsert_player(std::unordered_map<uint32_t, EntityDrawItem>& held, const PlayerNet& p)
+void upsert_player(std::unordered_map<EntityKey, EntityDrawItem>& held, const PlayerNet& p)
 {
     EntityDrawItem item;
     item.key = interpolation_key(p.id, EntityKind::Player);
@@ -19,7 +19,7 @@ void upsert_player(std::unordered_map<uint32_t, EntityDrawItem>& held, const Pla
     held[item.key] = item;
 }
 
-void upsert_enemy(std::unordered_map<uint32_t, EntityDrawItem>& held, const EnemyNet& e)
+void upsert_enemy(std::unordered_map<EntityKey, EntityDrawItem>& held, const EnemyNet& e)
 {
     EntityDrawItem item;
     item.key = interpolation_key(e.id, EntityKind::Enemy);
@@ -32,7 +32,7 @@ void upsert_enemy(std::unordered_map<uint32_t, EntityDrawItem>& held, const Enem
     held[item.key] = item;
 }
 
-void upsert_proj(std::unordered_map<uint32_t, EntityDrawItem>& held, const ProjNet& p)
+void upsert_proj(std::unordered_map<EntityKey, EntityDrawItem>& held, const ProjNet& p)
 {
     EntityDrawItem item;
     item.key = interpolation_key(p.id, EntityKind::Projectile);
@@ -44,7 +44,7 @@ void upsert_proj(std::unordered_map<uint32_t, EntityDrawItem>& held, const ProjN
     held[item.key] = item;
 }
 
-void upsert_gem(std::unordered_map<uint32_t, EntityDrawItem>& held, const GemNet& g)
+void upsert_gem(std::unordered_map<EntityKey, EntityDrawItem>& held, const GemNet& g)
 {
     EntityDrawItem item;
     item.key = interpolation_key(g.id, EntityKind::Gem);
@@ -54,7 +54,7 @@ void upsert_gem(std::unordered_map<uint32_t, EntityDrawItem>& held, const GemNet
     held[item.key] = item;
 }
 
-void destroy_entity(std::unordered_map<uint32_t, EntityDrawItem>& held, EntityKind kind, uint32_t id)
+void destroy_entity(std::unordered_map<EntityKey, EntityDrawItem>& held, EntityKind kind, uint32_t id)
 {
     held.erase(interpolation_key(id, kind));
 }
@@ -83,8 +83,7 @@ bool SnapshotState::apply_delta(const SnapshotDelta& delta, uint32_t& new_baseli
     // A delta is applied on top of the held state only when its baseline_tick
     // is the tick that state is complete for. Anything else names a state this
     // client does not have, and applying it would corrupt the world.
-    if (!baseline_.has_value() || *baseline_ != delta.baseline_tick)
-        return false;
+    if (!matches_baseline(delta.baseline_tick)) return false;
 
     // Spawned and updated both upsert: an update for an id the held state does
     // not carry is the server telling us about an entity we are missing, and

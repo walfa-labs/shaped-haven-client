@@ -418,8 +418,8 @@ void collect_draw_items(const InterpolationBuffer& buffer, std::vector<EntityDra
     // cleared rather than replaced: a steady 1,000 entity load then reuses one
     // allocation instead of taking a fresh one every frame.
     items.clear();
-    const std::unordered_map<uint32_t, Vec2>& positions = buffer.latest_positions();
-    const std::unordered_map<uint32_t, EntityStyle>& styles = buffer.latest_styles();
+    const std::unordered_map<EntityKey, Vec2>& positions = buffer.latest_positions();
+    const std::unordered_map<EntityKey, EntityStyle>& styles = buffer.latest_styles();
     if (positions.empty() || styles.empty()) return;
 
     items.reserve(positions.size());

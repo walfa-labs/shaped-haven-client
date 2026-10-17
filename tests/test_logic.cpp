@@ -13,6 +13,7 @@
 #include "prediction.h"
 #include "protocol.h"
 #include "run_events.h"
+#include "snapshot_ingest.h"
 #include "snapshot_state.h"
 
 #include <algorithm>
@@ -512,6 +513,48 @@ void test_snapshot_delta_packet()
     haven::SnapshotDelta lying_delta{};
     expect(!haven::decode_snapshot_delta(lying.data(), lying.size(), lying_delta), "an inflated spawned count is rejected");
     expect(lying_delta.spawned_enemies.size() < 65535, "the inflated count never reached a resize");
+
+    // counts[3] is reserved and PROTOCOL.md fixes it at zero. A non-zero value
+    // is a header that disagrees with the frozen layout, not a field to ignore.
+    const size_t reserved_offset = spawned_count_offset + 6;
+    std::vector<uint8_t> nonzero_reserved = payload;
+    nonzero_reserved[reserved_offset] = 1;
+    haven::SnapshotDelta reserved_delta{};
+    expect(!haven::decode_snapshot_delta(nonzero_reserved.data(), nonzero_reserved.size(), reserved_delta),
+           "a non-zero reserved count is rejected");
+
+    // An updated record carries its id twice: the separate u32 that heads it
+    // and the record's own id field. They must agree, or the record describes a
+    // different entity from the one its key names. The updated array follows the
+    // 37 byte header and the two spawned records; its first (and only) record is
+    // the enemy, so its external id is 4 bytes past the kind byte.
+    const size_t updated_array_offset = haven::kSnapshotHeaderSize + (1 + haven::kPlayerRecordSize) +
+                                        (1 + haven::kEnemyRecordSize);
+    const size_t external_id_offset = updated_array_offset + 1;
+    const size_t record_id_offset = external_id_offset + 4;
+    expect(payload[external_id_offset] == 55 && payload[record_id_offset] == 55,
+           "the fixture's updated enemy carries the same id twice");
+
+    std::vector<uint8_t> id_mismatch = payload;
+    id_mismatch[record_id_offset] = 56;  // the record names a different enemy
+    haven::SnapshotDelta mismatch_delta{};
+    expect(!haven::decode_snapshot_delta(id_mismatch.data(), id_mismatch.size(), mismatch_delta),
+           "an updated record whose id disagrees with its key is rejected");
+    expect(mismatch_delta.updated_enemies.empty(), "a rejected updated record leaves nothing behind");
+
+    std::vector<uint8_t> both_new = payload;
+    for (size_t i = 0; i < 4; ++i)
+    {
+        both_new[external_id_offset + i] = 0;
+        both_new[record_id_offset + i] = 0;
+    }
+    both_new[external_id_offset] = 0x2A;
+    both_new[record_id_offset] = 0x2A;
+    haven::SnapshotDelta agreed{};
+    expect(haven::decode_snapshot_delta(both_new.data(), both_new.size(), agreed),
+           "an updated record whose ids agree decodes");
+    expect(agreed.updated_enemies.size() == 1 && agreed.updated_enemies[0].id == 0x2A,
+           "and its id is the shared one");
 }
 
 /// The phase-4 core: the client holds exactly one complete state, a delta is
@@ -584,7 +627,7 @@ void test_snapshot_state_baseline()
     // interpolation buffer.
     const haven::RenderSnapshot render = state.build_render(1234);
     expect(render.run_time_ms == 1234, "the render carries the run clock");
-    const uint32_t enemy_key = haven::interpolation_key(7, haven::EntityKind::Enemy);
+    const haven::EntityKey enemy_key = haven::interpolation_key(7, haven::EntityKind::Enemy);
     const auto style = render.styles.find(enemy_key);
     expect(style != render.styles.end(), "the updated enemy has a style");
     expect(style->second.elite_mask == (haven::kEliteVampiric | haven::kEliteHasteAura),
@@ -606,6 +649,137 @@ void test_snapshot_state_baseline()
     // reset returns the state to a fresh one, which is what a restart needs.
     state.reset();
     expect(!state.baseline().has_value() && state.size() == 0, "reset clears the baseline and every entity");
+}
+
+/// The verdict `handle_delta` consults before it lets a delta touch anything: a
+/// delta naming the held tick matches, anything else does not, and a client
+/// with no held state matches nothing.
+void test_snapshot_state_baseline_match()
+{
+    std::printf("snapshot state baseline match\n");
+    haven::SnapshotState state;
+    expect(!state.matches_baseline(0), "with no held state nothing matches, not even tick 0");
+
+    haven::SnapshotFull full{};
+    full.server_tick = 100;
+    state.apply_full(full);
+    expect(state.matches_baseline(100), "the held tick matches");
+    expect(!state.matches_baseline(99), "an older tick does not match");
+    expect(!state.matches_baseline(101), "a newer tick does not match");
+    expect(!state.matches_baseline(0), "and tick 0 — a full snapshot's marker — never matches");
+}
+
+/// PROTOCOL.md "Baseline rules": a delta the client refuses must change nothing
+/// at all. The run state and the acceptance verdict live in SnapshotIngest, and
+/// a refused delta must leave every field of it untouched — the tick, the run
+/// clock and the game state — and must not disarm the restart boundary.
+void test_snapshot_ingest_refuses_without_advancing()
+{
+    std::printf("snapshot ingest refuses a delta without advancing run state\n");
+    haven::SnapshotIngest ingest;
+
+    // A full snapshot always matches what the client holds, so it sets the run
+    // state.
+    expect(ingest.offer(600, 10000, haven::GameState::Running, /*baseline_ok=*/true),
+           "a full snapshot is accepted");
+    expect(ingest.server_tick() == 600, "the accepted tick is the run tick");
+    expect(ingest.run_time_ms() == 10000, "the accepted run clock is the run clock");
+    expect(ingest.game_state() == haven::GameState::Running, "the accepted state is the run state");
+
+    // A delta whose baseline is not the tick the client holds is refused, and it
+    // must not advance anything.
+    expect(!ingest.offer(660, 20000, haven::GameState::GameOver, /*baseline_ok=*/false),
+           "a refused delta is not accepted");
+    expect(ingest.server_tick() == 600, "a refused delta does not move the run tick");
+    expect(ingest.run_time_ms() == 10000, "a refused delta does not move the run clock");
+    expect(ingest.game_state() == haven::GameState::Running, "a refused delta does not move the game state");
+    expect(ingest.stale_snapshots() == 0, "and it is not counted as a stale snapshot");
+
+    // An applicable delta advances all three.
+    expect(ingest.offer(660, 12000, haven::GameState::LevelUpPause, /*baseline_ok=*/true),
+           "an applicable delta is accepted");
+    expect(ingest.server_tick() == 660 && ingest.run_time_ms() == 12000 &&
+               ingest.game_state() == haven::GameState::LevelUpPause,
+           "an accepted delta advances the run state");
+
+    // A refused delta must not disarm the restart boundary either: one offered
+    // while the boundary is armed must leave it armed, and only an accepted
+    // snapshot may disarm it.
+    ingest.begin_run(ingest.run_time_ms());
+    expect(ingest.server_tick() == 0 && ingest.run_time_ms() == 0, "begin_run clears the tick and the clock");
+    expect(!ingest.offer(10, 12000, haven::GameState::GameOver, /*baseline_ok=*/false),
+           "a refused delta during a restart is refused");
+    expect(!ingest.offer(11, 13000, haven::GameState::GameOver, /*baseline_ok=*/true),
+           "the boundary is still armed, so the dead run's tail is refused");
+    expect(ingest.stale_snapshots() == 1, "and the boundary rejection is counted as stale");
+    expect(ingest.offer(12, 0, haven::GameState::Running, /*baseline_ok=*/true),
+           "the new run's first snapshot is accepted and disarms the boundary");
+    expect(ingest.game_state() == haven::GameState::Running, "and its game state is the run's");
+}
+
+/// A refused acknowledgement send must not be forgotten: the tick stays owed
+/// until a send for it succeeds, and the newest request supersedes an older one.
+void test_ack_retry()
+{
+    std::printf("ack retry\n");
+    haven::AckRetry ack;
+    expect(!ack.owes(), "nothing is owed before a request");
+    expect(!ack.pending().has_value(), "and there is nothing to send");
+
+    ack.request(100);
+    expect(ack.owes() && ack.pending().has_value() && *ack.pending() == 100, "a request is owed");
+
+    // The send was refused (sent() was not called), so the tick is still owed
+    // and the caller can retry it.
+    expect(ack.owes() && *ack.pending() == 100, "a refused send leaves the tick owed");
+
+    // A newer snapshot supersedes it: the tick to acknowledge is the newest
+    // state the client holds.
+    ack.request(105);
+    expect(*ack.pending() == 105, "a newer request supersedes an older one");
+
+    ack.sent();
+    expect(!ack.owes(), "a successful send clears the debt");
+    expect(!ack.pending().has_value(), "and there is nothing left to send");
+}
+
+/// A full snapshot is the server's recovery path, and it is the one place the
+/// run clock can go backwards. A backward clock must not be left in the buffer,
+/// where sample() assumes the timestamps only rise; a phase-3 server's
+/// full-only stream has a rising clock and must keep interpolating.
+void test_full_snapshot_recovery_and_clock_reset()
+{
+    std::printf("full snapshot recovery and clock reset\n");
+    haven::InterpolationBuffer buffer;
+
+    haven::RenderSnapshot a;
+    a.run_time_ms = 5000;
+    a.positions = {{1, {0.0f, 0.0f}}};
+    haven::RenderSnapshot b;
+    b.run_time_ms = 5100;
+    b.positions = {{1, {10.0f, 0.0f}}};
+    buffer.push(a);
+    buffer.advance(0.100f);
+    buffer.push(b);
+    expect(buffer.size() == 2, "two snapshots are buffered");
+
+    // A recovery full snapshot with the clock still rising is just the newest
+    // state: the history stays, so interpolation keeps working.
+    haven::RenderSnapshot c;
+    c.run_time_ms = 5200;
+    c.positions = {{1, {20.0f, 0.0f}}};
+    buffer.push_replacing(c);
+    expect(buffer.size() == 3, "a rising recovery snapshot keeps the history");
+    expect(buffer.latest_time_ms() == 5200, "and becomes the newest");
+
+    // A full snapshot whose clock went backwards means the server restarted its
+    // clock: the history is dropped so the buffer stays monotonic.
+    haven::RenderSnapshot reset;
+    reset.run_time_ms = 0;
+    reset.positions = {{1, {0.0f, 0.0f}}};
+    buffer.push_replacing(reset);
+    expect(buffer.size() == 1, "a backward clock drops the history");
+    expect(buffer.latest_time_ms() == 0, "and the new clock is the only one left");
 }
 
 void test_interpolation_is_continuous_between_snapshots()
@@ -922,20 +1096,29 @@ void test_entity_keys()
     std::printf("entity keys\n");
     // An enemy and a projectile from separate server pools can share an id;
     // the namespaced keys must not collide, and the raw id survives.
-    const uint32_t enemy_key = haven::interpolation_key(5, haven::EntityKind::Enemy);
-    const uint32_t proj_key = haven::interpolation_key(5, haven::EntityKind::Projectile);
+    const haven::EntityKey enemy_key = haven::interpolation_key(5, haven::EntityKind::Enemy);
+    const haven::EntityKey proj_key = haven::interpolation_key(5, haven::EntityKind::Projectile);
     expect(enemy_key != proj_key, "enemy and projectile id 5 get different keys");
     expect(haven::key_kind(enemy_key) == haven::EntityKind::Enemy, "enemy key kind survives");
     expect(haven::key_kind(proj_key) == haven::EntityKind::Projectile, "projectile key kind survives");
     expect(haven::key_raw_id(enemy_key) == 5 && haven::key_raw_id(proj_key) == 5, "raw id survives");
-    const uint32_t player_key = haven::interpolation_key(2, haven::EntityKind::Player);
+    const haven::EntityKey player_key = haven::interpolation_key(2, haven::EntityKind::Player);
     expect(haven::key_kind(player_key) == haven::EntityKind::Player, "player key kind survives");
     expect(haven::key_raw_id(player_key) == 2, "player raw id survives");
-    // A large id is not truncated: the pools are far below 2^30 but the mask
-    // must not silently wrap one id onto another.
-    const uint32_t big = (1u << haven::kKindShift) - 1u;
-    expect(haven::key_raw_id(haven::interpolation_key(big, haven::EntityKind::Enemy)) == big,
-           "a 30 bit id is not truncated");
+
+    // The key is wide enough for the whole 32 bit id space, so no id is ever
+    // truncated onto another. A key that took its kind bits out of the id would
+    // fold these two together, and an endless run is where that would show up.
+    const uint32_t high = 1u << 30;
+    const haven::EntityKey high_key = haven::interpolation_key(high, haven::EntityKind::Enemy);
+    const haven::EntityKey low_key = haven::interpolation_key(0, haven::EntityKind::Enemy);
+    expect(high_key != low_key, "an id above 2^30 does not fold onto a smaller one");
+    expect(haven::key_raw_id(high_key) == high, "an id above 2^30 survives the key");
+    const uint32_t max_id = 0xFFFFFFFFu;
+    expect(haven::key_raw_id(haven::interpolation_key(max_id, haven::EntityKind::Gem)) == max_id,
+           "the largest id survives the key");
+    expect(haven::key_kind(haven::interpolation_key(max_id, haven::EntityKind::Gem)) == haven::EntityKind::Gem,
+           "and its kind is still recovered");
 }
 
 void test_circle_and_triangle_primitives()
@@ -2280,6 +2463,10 @@ int main()
     test_snapshot_decoder_validation();
     test_snapshot_delta_packet();
     test_snapshot_state_baseline();
+    test_snapshot_state_baseline_match();
+    test_snapshot_ingest_refuses_without_advancing();
+    test_ack_retry();
+    test_full_snapshot_recovery_and_clock_reset();
     test_sequence_numbers();
     test_input_history();
     test_prediction();

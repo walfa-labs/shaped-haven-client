@@ -37,6 +37,19 @@ public:
     /// returns true and sets `new_baseline` to the tick to acknowledge.
     bool apply_delta(const SnapshotDelta& delta, uint32_t& new_baseline);
 
+    /// Whether a delta naming `baseline_tick` is applicable to the held state.
+    ///
+    /// This is the same test `apply_delta` opens with, exposed so the caller can
+    /// reach the verdict *before* it lets a delta touch anything else.
+    /// PROTOCOL.md "Baseline rules" requires a refused delta to change nothing
+    /// at all — not the run clock, not the game-state gating, not prediction —
+    /// so `GameSession` consults this first and returns before ingesting the
+    /// delta's header or reconciling from its records.
+    bool matches_baseline(uint32_t baseline_tick) const
+    {
+        return baseline_.has_value() && *baseline_ == baseline_tick;
+    }
+
     /// The tick the held state is complete for, or nothing when the client has
     /// no baseline yet.
     std::optional<uint32_t> baseline() const { return baseline_; }
@@ -61,7 +74,7 @@ public:
 
 private:
     std::optional<uint32_t> baseline_;
-    std::unordered_map<uint32_t, EntityDrawItem> entities_;
+    std::unordered_map<EntityKey, EntityDrawItem> entities_;
 };
 
 }  // namespace haven

@@ -28,6 +28,7 @@ set(HAVEN_SOURCES
   src/protocol.cpp
   src/renderer.cpp
   src/run_events.cpp
+  src/snapshot_ingest.cpp
   src/snapshot_state.cpp)
 
 add_executable(shaped-haven-client src/main.cpp ${HAVEN_SOURCES})
@@ -67,6 +68,7 @@ add_executable(shaped-haven-client-tests tests/test_logic.cpp
   src/prediction.cpp
   src/protocol.cpp
   src/run_events.cpp
+  src/snapshot_ingest.cpp
   src/snapshot_state.cpp)
 
 target_include_directories(shaped-haven-client-tests PRIVATE src)

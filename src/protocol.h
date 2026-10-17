@@ -254,8 +254,9 @@ bool decode_snapshot_full(const uint8_t* payload, size_t len, SnapshotFull& out)
 /// Decodes a delta. The counts come off the wire, so they are validated as the
 /// records are read: every record is pulled through a ByteReader that checks
 /// the remaining length first, and the payload must be exactly consumed. A
-/// `kind` byte outside 0..3, or a payload that does not hold every record the
-/// counts declare, is rejected.
+/// `kind` byte outside 0..3, a payload that does not hold every record the
+/// counts declare, a non-zero reserved count, or an updated record whose own id
+/// disagrees with the `id` that heads it, is rejected.
 bool decode_snapshot_delta(const uint8_t* payload, size_t len, SnapshotDelta& out);
 
 /// S2C_LEVELUP_OFFER (0x84) — 14 byte payload: player_id u8, event_id u16,

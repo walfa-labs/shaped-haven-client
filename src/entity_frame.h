@@ -28,30 +28,38 @@ enum class EntityKind : uint8_t {
 };
 
 /// Key an entity is stored under in the interpolation buffer: the entity kind
-/// in the top two bits, the server's own id below it. Every server pool is
-/// orders of magnitude below 2^30 entries, so no id is ever truncated.
-constexpr uint32_t kKindShift = 30;
-constexpr uint32_t kKindMask = 0x3u << kKindShift;
-constexpr uint32_t kRawIdMask = (1u << kKindShift) - 1u;
+/// above the server's own id, so an id is never truncated and two entities of
+/// different kinds can never collide.
+///
+/// The key is 64 bits because the server's ids are 32. A 32 bit key would have
+/// to take its kind bits out of the id, and an id above that ceiling would wrap
+/// silently onto another entity's key — safe for the 20 minute benchmark, whose
+/// pools never approach it, but exactly the kind of collision an endless run
+/// would eventually reach. The key is wide enough that it cannot happen.
+using EntityKey = uint64_t;
 
-inline uint32_t interpolation_key(uint32_t entity_id, EntityKind kind)
+constexpr uint32_t kKindShift = 32;
+constexpr EntityKey kKindMask = static_cast<EntityKey>(0x3u) << kKindShift;
+constexpr EntityKey kRawIdMask = 0xFFFFFFFFull;
+
+inline EntityKey interpolation_key(uint32_t entity_id, EntityKind kind)
 {
-    return (static_cast<uint32_t>(kind) << kKindShift) | (entity_id & kRawIdMask);
+    return (static_cast<EntityKey>(kind) << kKindShift) | static_cast<EntityKey>(entity_id);
 }
 
-inline EntityKind key_kind(uint32_t key)
+inline EntityKind key_kind(EntityKey key)
 {
     return static_cast<EntityKind>((key & kKindMask) >> kKindShift);
 }
 
-inline uint32_t key_raw_id(uint32_t key)
+inline uint32_t key_raw_id(EntityKey key)
 {
-    return key & kRawIdMask;
+    return static_cast<uint32_t>(key & kRawIdMask);
 }
 
 /// Everything the renderer needs to draw one interpolated entity for one frame.
 struct EntityDrawItem {
-    uint32_t key = 0;
+    EntityKey key = 0;
     EntityKind kind = EntityKind::Player;
     Vec2 pos;
     float angle = 0.0f;  // facing, in radians (vel_angle decoded)

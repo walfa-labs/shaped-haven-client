@@ -27,8 +27,8 @@ struct EntityStyle {
 /// entity id (see interpolation_key).
 struct RenderSnapshot {
     uint32_t run_time_ms = 0;
-    std::unordered_map<uint32_t, Vec2> positions;
-    std::unordered_map<uint32_t, EntityStyle> styles;
+    std::unordered_map<EntityKey, Vec2> positions;
+    std::unordered_map<EntityKey, EntityStyle> styles;
 };
 
 /// Holds the newest snapshots and answers "where should entity `id` be drawn
@@ -53,16 +53,27 @@ public:
     /// Records a snapshot as arriving at the current render-clock time.
     void push(const RenderSnapshot& snapshot);
 
+    /// Records a snapshot that replaces the client's whole state — a full
+    /// snapshot, which is the server's recovery path when it has no usable
+    /// baseline for this client. A full snapshot is the one place the run clock
+    /// can move backwards, because the server restarts it with the run, and
+    /// sample() assumes the buffered timestamps only rise; a full snapshot
+    /// below the newest buffered one therefore means the clock reset, and the
+    /// history is dropped rather than left non-monotonic. A phase-3 server
+    /// sends only full snapshots, with a clock that keeps rising, so this does
+    /// not clear there and interpolation is unaffected.
+    void push_replacing(const RenderSnapshot& snapshot);
+
     /// Render timestamp carried by the newest snapshot.
     uint32_t latest_time_ms() const;
     size_t size() const { return snapshots_.size(); }
     void clear();
 
     /// Positions carried by the newest snapshot, keyed by namespaced entity id.
-    const std::unordered_map<uint32_t, Vec2>& latest_positions() const;
+    const std::unordered_map<EntityKey, Vec2>& latest_positions() const;
 
     /// Styles carried by the newest snapshot, keyed by the same ids.
-    const std::unordered_map<uint32_t, EntityStyle>& latest_styles() const;
+    const std::unordered_map<EntityKey, EntityStyle>& latest_styles() const;
 
     /// Render time expressed in snapshot (server) milliseconds: the newest
     /// snapshot's timestamp plus the wall time elapsed since it arrived, minus
@@ -72,18 +83,18 @@ public:
     /// Interpolates the position of `entity_id` at `render_time_ms()`. Returns
     /// false when the buffer does not span that time yet or the entity is
     /// unknown.
-    bool sample(uint32_t entity_id, Vec2& out) const;
+    bool sample(EntityKey entity_id, Vec2& out) const;
 
     /// Position of `entity_id` from the oldest buffered snapshot that carries
     /// it, i.e. where it was when it first appeared. Used to draw an entity the
     /// interpolation window does not bracket yet: holding it at its newest
     /// position instead would make it jump backwards once it becomes bracketed,
     /// because the window renders 100 ms in the past.
-    bool first_seen_position(uint32_t entity_id, Vec2& out) const;
+    bool first_seen_position(EntityKey entity_id, Vec2& out) const;
 
     /// Interpolates between two explicit snapshots; exposed for testing.
     static bool interpolate_between(const RenderSnapshot& a, const RenderSnapshot& b, int64_t t_render,
-                                    uint32_t entity_id, Vec2& out);
+                                    EntityKey entity_id, Vec2& out);
 
 private:
     struct Snapshot {

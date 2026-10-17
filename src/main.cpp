@@ -152,14 +152,15 @@ int main(int argc, char** argv)
                         "interp=%zu remotes=%zu enemies=%zu projs=%zu gems=%zu snaps=%u d=%u/%u acks=%u ir=%u "
                         "stale=%u staleoffers=%u "
                         "malformed=%u inputs=%u "
-                        "qdropped=%u prewelcome=%u disconnected=%u sendfail=%u reconciles=%u key=%d "
+                        "qdropped=%u prewelcome=%u disconnected=%u sendfail=%u ackretry=%u reconciles=%u key=%d "
                         "move=(%.2f,%.2f) state=%u level=%u xp=%u/%u choices=%u evos=%u restarts=%u upd_ms=%.3f\n",
                         frames, s.client_tick, s.server_tick, s.last_acked_seq, s.predicted.x, s.predicted.y,
                         s.last_prediction_error, s.interpolation_depth, s.remote_player_count, s.enemy_count,
                         s.projectile_count, s.gem_count, s.snapshots_received, s.deltas_applied, s.deltas_rejected,
                         s.acks_sent, s.interest_radius, s.stale_snapshots, s.stale_offers,
                         s.malformed_packets, s.inputs_sent, net.send_dropped(), s.pre_welcome_steps,
-                        s.disconnected_steps, s.send_failures, s.reconcile_count, input.last_key(), s.last_move.x,
+                        s.disconnected_steps, s.send_failures, s.ack_retries, s.reconcile_count, input.last_key(),
+                        s.last_move.x,
                         s.last_move.y, static_cast<unsigned>(s.game_state), static_cast<unsigned>(s.level),
                         static_cast<unsigned>(s.xp), static_cast<unsigned>(s.xp_next),
                         static_cast<unsigned>(s.choices_made), static_cast<unsigned>(s.evolutions_seen),

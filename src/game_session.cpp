@@ -76,6 +76,16 @@ void GameSession::update(float dt_seconds)
 
     drain_packets();
 
+    // Retry an acknowledgement the bounded queue refused on an earlier frame,
+    // so convergence does not depend on the first send happening to succeed.
+    flush_ack();
+
+    // The run state lives in the ingest, which a refused delta leaves alone;
+    // mirror it for the verbose log after the packets are in.
+    stats_.server_tick = ingest_.server_tick();
+    stats_.game_state = ingest_.game_state();
+    stats_.stale_snapshots = ingest_.stale_snapshots();
+
     // Input gating and HUD visibility follow the server's game_state, so a
     // missed S2C_LEVELUP_OFFER or S2C_GAME_OVER cannot leave the client in
     // the wrong mode.
@@ -93,7 +103,7 @@ void GameSession::update(float dt_seconds)
     renderer_.set_local_player(predictor_.position());
     update_entities();
     renderer_.follow_camera(predictor_.position());
-    hud_.set_run_time(run_time_ms_);
+    hud_.set_run_time(ingest_.run_time_ms());
     hud_.tick(dt_seconds);
 
     const float elapsed_ms = std::chrono::duration<float, std::milli>(std::chrono::steady_clock::now() -
@@ -213,7 +223,7 @@ void GameSession::handle_levelup_offer(const uint8_t* payload, size_t len)
     // modal goes up now and input freezes until the run resumes.
     pending_offer_ = offer;
     run_state_ = RunState::LevelUp;
-    offer_tick_ = stats_.server_tick;
+    offer_tick_ = ingest_.server_tick();
     script_mismatch_reported_ = false;
     hud_.show_offer(offer);
     std::printf("haven: level-up offer event=%u level=%u options=[%u %u %u] [%u %u %u] [%u %u %u]\n",
@@ -237,7 +247,7 @@ void GameSession::handle_game_over(const uint8_t* payload, size_t len)
 
     game_over_ = stats;
     run_state_ = RunState::GameOver;
-    game_over_tick_ = stats_.server_tick;
+    game_over_tick_ = ingest_.server_tick();
     script_mismatch_reported_ = false;
     std::printf("haven: game over after %u s, score %u, kills %u\n", static_cast<unsigned>(stats.seconds_survived),
                 static_cast<unsigned>(stats.score), static_cast<unsigned>(stats.kills));
@@ -286,11 +296,11 @@ void GameSession::apply_run_state()
     // at-or-below the dead run's final tick: the scoreboard would stay up and
     // input would stay frozen for the whole of the new run.
     const bool stale_after_offer = run_state_ == RunState::LevelUp && offer_tick_ != 0 &&
-                                   stats_.server_tick <= offer_tick_;
+                                   ingest_.server_tick() <= offer_tick_;
     const bool stale_after_game_over = run_state_ == RunState::GameOver && game_over_tick_ != 0 &&
-                                       stats_.server_tick <= game_over_tick_;
+                                       ingest_.server_tick() <= game_over_tick_;
 
-    if (stats_.game_state == GameState::Running && run_state_ != RunState::Running && !stale_after_offer &&
+    if (ingest_.game_state() == GameState::Running && run_state_ != RunState::Running && !stale_after_offer &&
         !stale_after_game_over)
     {
         pending_offer_.reset();
@@ -305,7 +315,7 @@ void GameSession::apply_run_state()
         hud_.hide_offer();
         hud_.hide_game_over();
     }
-    else if (stats_.game_state == GameState::GameOver && run_state_ != RunState::GameOver &&
+    else if (ingest_.game_state() == GameState::GameOver && run_state_ != RunState::GameOver &&
              !stale_after_offer)
     {
         run_state_ = RunState::GameOver;
@@ -395,9 +405,7 @@ void GameSession::maybe_restart()
     // report the run running again. Either is proof the boundary can disarm on;
     // see run_events.h. The tick counters below are reset with it because the
     // server restarts those too.
-    restart_boundary_.arm(run_time_ms_);
-    run_time_ms_ = 0;
-    stats_.server_tick = 0;
+    ingest_.begin_run(ingest_.run_time_ms());
     offer_tick_ = 0;
     game_over_tick_ = 0;
     pending_offer_.reset();
@@ -438,12 +446,15 @@ void GameSession::handle_snapshot(const uint8_t* payload, size_t len)
 
     // A full snapshot is the server's answer to a client with no usable
     // baseline: it replaces the held state outright and its tick becomes the
-    // new baseline the next delta is diffed against.
-    if (!ingest_header(snapshot.server_tick, snapshot.run_time_ms, snapshot.game_state)) return;
+    // new baseline the next delta is diffed against. A full snapshot always
+    // matches whatever the client holds, so the header is never refused for a
+    // baseline reason.
+    if (!ingest_header(snapshot.server_tick, snapshot.run_time_ms, snapshot.game_state, /*baseline_ok=*/true))
+        return;
 
     send_ack(snapshot_state_.apply_full(snapshot));
     reconcile_from(find_self_in(snapshot.players, stats_.player_id), snapshot.acked_seq);
-    push_render();
+    push_render(/*replacing=*/true);
 }
 
 void GameSession::handle_delta(const uint8_t* payload, size_t len)
@@ -459,78 +470,70 @@ void GameSession::handle_delta(const uint8_t* payload, size_t len)
     ++stats_.snapshots_received;
     ++stats_.snapshots_delta;
 
-    if (!ingest_header(delta.server_tick, delta.run_time_ms, delta.game_state)) return;
-
-    // A delta is applied on top of the held state only when its baseline_tick
-    // is the tick that state is complete for. One that names any other tick
-    // must not be applied: the client keeps acknowledging the state it does
-    // hold, and the server answers with a full snapshot.
-    uint32_t applied_baseline = 0;
-    const bool applicable = snapshot_state_.apply_delta(delta, applied_baseline);
-    if (applicable)
-    {
-        send_ack(applied_baseline);
-        ++stats_.deltas_applied;
-    }
-    else
+    // The baseline verdict comes first, before anything with a side effect.
+    // PROTOCOL.md "Baseline rules": a delta whose baseline_tick is not the tick
+    // the client holds must not advance any run state at all — not the HUD
+    // clock, not the game-state gating, not prediction. So the header is not
+    // ingested, nothing is reconciled and nothing is rendered; the client only
+    // re-acknowledges the tick it does hold, which is what corrects a drifted
+    // server model and stops it refusing forever.
+    if (!snapshot_state_.matches_baseline(delta.baseline_tick))
     {
         ++stats_.deltas_rejected;
         if (snapshot_state_.baseline().has_value()) send_ack(*snapshot_state_.baseline());
+        return;
     }
 
-    // The local player's authoritative position does not depend on the entity
-    // baseline, so reconcile from the snapshot's own record of us even when the
-    // delta itself is not applied.
+    if (!ingest_header(delta.server_tick, delta.run_time_ms, delta.game_state, /*baseline_ok=*/true)) return;
+
+    // The baseline matched, so the apply cannot fail; the tick it returns is
+    // the one to acknowledge.
+    uint32_t applied_baseline = 0;
+    snapshot_state_.apply_delta(delta, applied_baseline);
+    send_ack(applied_baseline);
+    ++stats_.deltas_applied;
+
+    // The delta was applied, so its own record of the local player is state the
+    // client now holds and the prediction may be folded onto it.
     const PlayerNet* self = find_self_in(delta.spawned_players, stats_.player_id);
     if (self == nullptr) self = find_self_in(delta.updated_players, stats_.player_id);
     reconcile_from(self, delta.acked_seq);
 
-    // Only an applied delta carries new world state, so only it refreshes the
-    // interpolation buffer; a refused delta leaves the render clock where it
-    // was until the full snapshot arrives.
-    if (applicable) push_render();
+    push_render(/*replacing=*/false);
 }
 
-bool GameSession::ingest_header(uint32_t server_tick, uint32_t run_time_ms, GameState game_state)
+bool GameSession::ingest_header(uint32_t server_tick, uint32_t run_time_ms, GameState game_state, bool baseline_ok)
 {
-    // Everything still in the socket when C2S_RESTART went out was sent after
-    // the last snapshot the client processed, so it carries the dead run's
-    // frozen clock and its game_over state. Only a snapshot that reports the
-    // run running again, or one below that clock, can be the new run's, and
-    // accepting the rest would repopulate interpolation with the dead run's
-    // entities and drag the prediction back to an old position. See
-    // run_events.h for why both signals are needed.
-    if (!restart_boundary_.accepts(run_time_ms, game_state))
-    {
-        ++stats_.stale_snapshots;
-        return false;
-    }
-
-    // Snapshots must otherwise arrive in order. A stale one carries an older
-    // authoritative position, and applying it would drag the prediction
-    // backwards.
-    if (stats_.server_tick != 0 && server_tick < stats_.server_tick)
-    {
-        ++stats_.stale_snapshots;
-        return false;
-    }
-
-    // Only a snapshot that passes both checks describes the run: a rejected
-    // one is a leftover from before the transition, and letting it set
-    // game_state or the run clock would undo that transition or put the dead
-    // run's clock back on the HUD.
-    stats_.server_tick = server_tick;
-    stats_.game_state = game_state;
-    run_time_ms_ = run_time_ms;
-    return true;
+    // The run state and the restart boundary both live in the ingest, and its
+    // offer() is the one place a snapshot header can move either. A refused
+    // delta (`baseline_ok` false) returns without touching them; see
+    // snapshot_ingest.h for why the ordering matters.
+    return ingest_.offer(server_tick, run_time_ms, game_state, baseline_ok);
 }
 
 void GameSession::send_ack(uint32_t tick)
 {
-    if (net_.send(encode_ack_snapshot(tick)))
+    ack_retry_.request(tick);
+    flush_ack();
+}
+
+void GameSession::flush_ack()
+{
+    const std::optional<uint32_t> tick = ack_retry_.pending();
+    if (!tick.has_value()) return;
+
+    if (net_.send(encode_ack_snapshot(*tick)))
+    {
+        ack_retry_.sent();
         ++stats_.acks_sent;
+    }
     else
-        ++stats_.send_failures;
+    {
+        // The bounded queue refused it. The tick stays pending so a later frame
+        // retries: a forgotten acknowledgement would leave the server's model
+        // of this client stuck on a tick it has already moved past.
+        ++stats_.ack_retries;
+    }
 }
 
 void GameSession::reconcile_from(const PlayerNet* self, const std::array<uint32_t, kMaxPlayers>& acked_seq)
@@ -551,14 +554,18 @@ void GameSession::reconcile_from(const PlayerNet* self, const std::array<uint32_
     ++stats_.reconcile_count;
 }
 
-void GameSession::push_render()
+void GameSession::push_render(bool replacing)
 {
     // The held state is the complete world within the interest radius, so it
     // is what goes into the interpolation buffer: an entity the server
     // destroyed is simply absent from the newest snapshot, and the draw-item
     // collection — which iterates the newest snapshot's positions — then does
     // not draw it. Nothing stale survives a destroy.
-    interpolation_.push(snapshot_state_.build_render(run_time_ms_));
+    const RenderSnapshot render = snapshot_state_.build_render(ingest_.run_time_ms());
+    if (replacing)
+        interpolation_.push_replacing(render);
+    else
+        interpolation_.push(render);
     stats_.interpolation_depth = interpolation_.size();
 }
 
@@ -591,7 +598,7 @@ void GameSession::update_entities()
         if (present_remotes_.find(id) == present_remotes_.end()) renderer_.remove_player(id);
     known_remotes_.swap(present_remotes_);
 
-    renderer_.render_entities(combat_items_, run_time_ms_);
+    renderer_.render_entities(combat_items_, ingest_.run_time_ms());
 
     size_t enemies = 0;
     size_t projectiles = 0;
